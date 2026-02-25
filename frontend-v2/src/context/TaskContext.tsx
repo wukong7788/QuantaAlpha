@@ -22,6 +22,8 @@ import {
   startBacktest as apiStartBacktest,
   getBacktestStatus,
   cancelBacktest as apiCancelBacktest,
+  getOfflineBacktestLatest,
+  getOfflineBacktestByMetricsFile,
   connectMiningWs,
   healthCheck,
 } from '@/services/api';
@@ -65,6 +67,7 @@ interface TaskContextValue {
   backtestTask: BacktestTask | null;
   backtestLogs: LogEntry[];
   startBacktestTask: (params: BacktestStartParams) => Promise<void>;
+  loadOfflineBacktestResult: (library?: string, configPath?: string, metricsFile?: string) => Promise<void>;
   stopBacktestTask: () => void;
 }
 
@@ -557,6 +560,28 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     [handleBacktestWsMessage],
   );
 
+  // Load existing offline backtest result from disk (no new task execution)
+  const loadOfflineBacktestResult = useCallback(
+    async (library?: string, configPath?: string, metricsFile?: string) => {
+      const resp = metricsFile
+        ? await getOfflineBacktestByMetricsFile(metricsFile, library, configPath)
+        : await getOfflineBacktestLatest(library, configPath);
+      if (!resp.success || !resp.data?.task) {
+        throw new Error(resp.error || 'Failed to load offline result');
+      }
+      // Stop any previous running channels to avoid mixing state
+      backtestWsRef.current?.close();
+      backtestWsRef.current = null;
+      if (backtestPollingRef.current) {
+        clearInterval(backtestPollingRef.current);
+        backtestPollingRef.current = null;
+      }
+      setBacktestTask(resp.data.task as unknown as BacktestTask);
+      setBacktestLogs((resp.data.task.logs || []).slice(-500));
+    },
+    [],
+  );
+
   // Stop backtest
   const stopBacktestTask = useCallback(async () => {
     if (!backtestTask) return;
@@ -592,6 +617,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     backtestTask,
     backtestLogs,
     startBacktestTask,
+    loadOfflineBacktestResult,
     stopBacktestTask,
   };
 

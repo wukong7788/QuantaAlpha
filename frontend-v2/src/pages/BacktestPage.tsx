@@ -22,8 +22,9 @@ import {
   listFactorLibraries,
   getCacheStatus,
   warmCache,
+  listOfflineBacktestRuns,
 } from '@/services/api';
-import type { CacheStatusResponse } from '@/services/api';
+import type { CacheStatusResponse, OfflineBacktestRunItem } from '@/services/api';
 import {
   AreaChart,
   Area,
@@ -33,7 +34,7 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from 'recharts';
-import { formatDate, formatNumber, formatPercent } from '@/utils';
+import { formatDate, formatPercent } from '@/utils';
 
 // ... (existing MetricCard component)
 
@@ -113,26 +114,13 @@ const CumulativeReturnChart: React.FC<{ data: { date: string; value: number }[] 
 
 import { useTaskContext } from '@/context/TaskContext';
 
-// ========================== Component ==========================
-
-// Helper component for metrics
-const MetricCard = ({ label, value, unit = '' }: { label: string; value?: number; unit?: string }) => (
-  <div className="bg-secondary/30 rounded-lg p-3">
-    <div className="text-xs text-muted-foreground mb-1">{label}</div>
-    <div className="text-lg font-bold font-mono">
-      {typeof value === 'number' 
-        ? `${formatNumber(value, 4)}${unit}`
-        : '--'}
-    </div>
-  </div>
-);
-
 export const BacktestPage: React.FC = () => {
   const {
     backendAvailable,
     backtestTask: task,
     backtestLogs: logs,
     startBacktestTask,
+    loadOfflineBacktestResult,
     stopBacktestTask,
   } = useTaskContext();
 
@@ -150,6 +138,10 @@ export const BacktestPage: React.FC = () => {
   const [cacheLoading, setCacheLoading] = useState(false);
   const [warmingCache, setWarmingCache] = useState(false);
   const [warmCacheResult, setWarmCacheResult] = useState<string | null>(null);
+  const [loadingOffline, setLoadingOffline] = useState(false);
+  const [offlineLoadResult, setOfflineLoadResult] = useState<string | null>(null);
+  const [offlineRuns, setOfflineRuns] = useState<OfflineBacktestRunItem[]>([]);
+  const [selectedOfflineMetricsFile, setSelectedOfflineMetricsFile] = useState('');
 
   // -- Load libraries (on mount + manual refresh) --
   const [libsLoading, setLibsLoading] = useState(false);
@@ -202,6 +194,17 @@ export const BacktestPage: React.FC = () => {
       } catch { /* ignore */ }
       setCacheLoading(false);
     })();
+    (async () => {
+      try {
+        const resp = await listOfflineBacktestRuns(selectedLibrary);
+        if (resp.success && resp.data) {
+          setOfflineRuns(resp.data.runs || []);
+          setSelectedOfflineMetricsFile('');
+        }
+      } catch {
+        setOfflineRuns([]);
+      }
+    })();
   }, [selectedLibrary]);
 
   // Auto-scroll logs
@@ -222,6 +225,25 @@ export const BacktestPage: React.FC = () => {
       console.error('Failed to start backtest:', err);
     } finally {
       setIsStarting(false);
+    }
+  };
+
+  // -- Load offline result --
+  const handleLoadOffline = async () => {
+    if (!selectedLibrary) return;
+    setLoadingOffline(true);
+    setOfflineLoadResult(null);
+    try {
+      await loadOfflineBacktestResult(
+        selectedLibrary,
+        undefined,
+        selectedOfflineMetricsFile || undefined
+      );
+      setOfflineLoadResult('已加载离线回测结果');
+    } catch (err: any) {
+      setOfflineLoadResult(`加载失败: ${err.message}`);
+    } finally {
+      setLoadingOffline(false);
     }
   };
 
@@ -494,25 +516,56 @@ export const BacktestPage: React.FC = () => {
           </div>
 
           {/* Start / Cancel Button */}
-          <div className="flex justify-end gap-3 pt-2">
+          <div className="flex flex-col md:flex-row md:items-center gap-3 pt-2">
+            {offlineLoadResult && (
+              <span className="text-xs text-muted-foreground md:mr-auto">{offlineLoadResult}</span>
+            )}
             {isRunning ? (
               <Button variant="outline" onClick={handleCancel}>
                 <Square className="h-4 w-4 mr-2" />
                 停止回测
               </Button>
             ) : (
-              <Button
-                variant="primary"
-                onClick={handleStart}
-                disabled={backendAvailable === false || !selectedLibrary || isStarting}
-              >
-                {isStarting ? (
-                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                ) : (
-                  <Play className="h-4 w-4 mr-2" />
-                )}
-                开始回测
-              </Button>
+              <>
+                <div className="w-full md:w-[360px]">
+                  <select
+                    value={selectedOfflineMetricsFile}
+                    onChange={(e) => setSelectedOfflineMetricsFile(e.target.value)}
+                    className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary"
+                  >
+                    <option value="">最新结果（默认）</option>
+                    {offlineRuns.map((run) => (
+                      <option key={run.metricsFile} value={run.metricsFile}>
+                        {run.metricsFile} · {new Date(run.mtime).toLocaleString()}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <Button
+                  variant="outline"
+                  onClick={handleLoadOffline}
+                  disabled={backendAvailable === false || !selectedLibrary || loadingOffline}
+                >
+                  {loadingOffline ? (
+                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  ) : (
+                    <FileText className="h-4 w-4 mr-2" />
+                  )}
+                  加载离线结果
+                </Button>
+                <Button
+                  variant="primary"
+                  onClick={handleStart}
+                  disabled={backendAvailable === false || !selectedLibrary || isStarting}
+                >
+                  {isStarting ? (
+                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  ) : (
+                    <Play className="h-4 w-4 mr-2" />
+                  )}
+                  开始回测
+                </Button>
+              </>
             )}
           </div>
         </CardContent>

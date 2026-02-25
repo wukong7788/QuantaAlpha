@@ -93,14 +93,12 @@
 ```bash
 git clone https://github.com/QuantaAlpha/QuantaAlpha.git
 cd QuantaAlpha
-conda create -n quantaalpha python=3.10
-conda activate quantaalpha
-# 以开发模式安装包
-SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0 pip install -e .
-
-# 安装额外依赖
-pip install -r requirements.txt
+# 推荐（无需 conda）：uv + Python 3.12
+uv venv --python 3.12 .venv
+uv pip install -e .
 ```
+
+> 仍可使用历史 conda 流程，但当前脚本已支持 `uv`/`.venv` 直接运行。
 
 ### 2. 配置环境变量
 
@@ -199,6 +197,19 @@ FACTOR_CoSTEER_DATA_FOLDER_DEBUG=/your/custom/path/factor_source_data_debug
 
 实验会自动挖掘、进化和验证 Alpha 因子，并将所有发现的因子保存到 `all_factors_library*.json`。
 
+### 4.1 最小烟测（快速验证）
+
+在全量运行前，建议先做一次快速环境验证：
+
+```bash
+./minirun.sh
+
+# 可选：自定义方向
+./minirun.sh "微观结构因子"
+```
+
+`minirun.sh` 使用 `configs/experiment_smoke.yaml`，默认 `STEP_N=3`（运行到 `factor_calculate`）。
+
 ### 5. 独立回测
 
 挖掘完成后，从因子库中组合因子进行全周期回测：
@@ -226,6 +237,43 @@ python -m quantaalpha.backtest.run_backtest \
 
 结果保存在 `configs/backtest.yaml` 中 `experiment.output_dir` 指定的目录。
 
+回测输出文件名已改为“因子数量 + 北京时间戳”，避免同名结果互相覆盖：
+
+- `<library_or_exp>_n<num_factors>_<YYYYMMDD_HHMMSS>_backtest_metrics.json`
+- `<library_or_exp>_n<num_factors>_<YYYYMMDD_HHMMSS>_cumulative_excess.csv`
+
+### 5.1 安全脚本（笔记本推荐）
+
+建议使用安全脚本执行独立回测，支持线程限制、缓存检查、日志落盘、交互式参数输入：
+
+```bash
+./scripts/run_backtest_safe.sh --interactive
+```
+
+常用参数：
+
+```bash
+# limited 模式 + Top50 custom 因子
+./scripts/run_backtest_safe.sh \
+  --library data/factorlib/all_factors_library_paper_reproduction_ds.json \
+  --mode limited \
+  --max-factors 50 \
+  --warm-cache
+
+# 不限制因子数量（max_factors = null）
+./scripts/run_backtest_safe.sh \
+  --library data/factorlib/all_factors_library_paper_reproduction_ds.json \
+  --max-factors all
+```
+
+说明：
+
+- `--max-factors <N|all|default>`
+  - `N`：仅回测 Top-N custom 因子
+  - `all`：不限制数量
+  - `default`：沿用配置文件中的 `factor_source.custom.max_factors`
+- 前端“独立回测”页面支持“加载离线结果”，可默认加载最新，也可在下拉框选择历史轮次。
+
 > 📘 需要帮助？请查阅完整的 **[用户指南](docs/user_guide.md)**，了解高级配置、实验复现和详细使用示例。
 
 ---
@@ -236,7 +284,6 @@ python -m quantaalpha.backtest.run_backtest \
 QuantaAlpha 提供基于 Web 的可视化界面，你可以在界面中完成全部工作流——无需命令行操作。
 
 ```bash
-conda activate quantaalpha
 cd frontend-v2
 bash start.sh
 # 访问 http://localhost:3000
@@ -248,6 +295,12 @@ bash start.sh
 - **📈 独立回测**：选择因子库，运行全周期回测并查看可视化结果
 
 ---
+
+## 说明
+
+- **macOS 因子执行**：已修复 Darwin 下因子数据链接逻辑，`daily_pv.h5` 可正确链接到工作目录。
+- **日志时区**：默认日志目录时间戳使用 **Asia/Shanghai（北京时间）**；若显式设置 `LOG_TRACE_PATH` 则以该值为准。
+- **本地大文件忽略**：`hf_data/cn_data.zip` 已加入 `.gitignore`。
 
 ## 💬 用户社区
 

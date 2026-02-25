@@ -30,23 +30,54 @@ else
 fi
 
 # =============================================================================
-# Activate conda environment
+# Resolve Python environment (prefer uv .venv, no conda dependency)
 # =============================================================================
-eval "$(conda shell.bash hook)" 2>/dev/null
-conda activate "${CONDA_ENV_NAME:-quantaalpha}" 2>/dev/null
+PYTHON_BIN=""
+PIP_BIN=""
+QA_BIN=""
 
-if [ $? -ne 0 ]; then
-    source activate "${CONDA_ENV_NAME:-quantaalpha}" 2>/dev/null
-fi
-
-if ! command -v quantaalpha &> /dev/null; then
-    echo "Error: quantaalpha command not found. Please install: pip install -e ."
+if [ -x "${SCRIPT_DIR}/.venv/bin/python" ]; then
+    PYTHON_BIN="${SCRIPT_DIR}/.venv/bin/python"
+    PIP_BIN="${SCRIPT_DIR}/.venv/bin/pip"
+    QA_BIN="${SCRIPT_DIR}/.venv/bin/quantaalpha"
+elif command -v uv >/dev/null 2>&1; then
+    echo "Info: .venv not found, creating with uv (Python 3.12)..."
+    uv venv --python 3.12 "${SCRIPT_DIR}/.venv" || {
+        echo "Error: failed to create .venv via uv"
+        exit 1
+    }
+    PYTHON_BIN="${SCRIPT_DIR}/.venv/bin/python"
+    PIP_BIN="${SCRIPT_DIR}/.venv/bin/pip"
+    QA_BIN="${SCRIPT_DIR}/.venv/bin/quantaalpha"
+else
+    echo "Error: no .venv found and uv is not installed."
+    echo "Please run: uv venv --python 3.12 .venv && uv pip install -e ."
     exit 1
 fi
 
-echo "Python: $(python --version)"
-echo "QuantaAlpha: $(which quantaalpha)"
+if [ ! -x "${QA_BIN}" ]; then
+    echo "Info: quantaalpha not found in .venv, installing project..."
+    "${PIP_BIN}" install -e . || {
+        echo "Error: failed to install quantaalpha into .venv"
+        exit 1
+    }
+fi
+
+if [ ! -x "${QA_BIN}" ]; then
+    echo "Error: quantaalpha command not found in .venv after install."
+    exit 1
+fi
+
+echo "Python: $("${PYTHON_BIN}" --version)"
+echo "QuantaAlpha: ${QA_BIN}"
 echo ""
+
+# =============================================================================
+# Compatibility env vars for rdagent (still expects conda fields internally)
+# =============================================================================
+export CONDA_DEFAULT_ENV="${CONDA_DEFAULT_ENV:-quantaalpha}"
+# Ensure factor code execution uses current .venv python instead of system python
+export FACTOR_CoSTEER_PYTHON_BIN="${FACTOR_CoSTEER_PYTHON_BIN:-${PYTHON_BIN}}"
 
 # =============================================================================
 # Experiment isolation
@@ -119,7 +150,7 @@ echo "Results: ${RESULTS_BASE}"
 echo "----------------------------------------"
 
 if [ -n "${STEP_N}" ]; then
-    quantaalpha mine --direction "${DIRECTION}" --step_n "${STEP_N}" --config_path "${CONFIG_PATH}"
+    "${QA_BIN}" mine --direction "${DIRECTION}" --step_n "${STEP_N}" --config_path "${CONFIG_PATH}"
 else
-    quantaalpha mine --direction "${DIRECTION}" --config_path "${CONFIG_PATH}"
+    "${QA_BIN}" mine --direction "${DIRECTION}" --config_path "${CONFIG_PATH}"
 fi

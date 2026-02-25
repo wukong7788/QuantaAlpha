@@ -104,14 +104,12 @@
 ```bash
 git clone https://github.com/QuantaAlpha/QuantaAlpha.git
 cd QuantaAlpha
-conda create -n quantaalpha python=3.10
-conda activate quantaalpha
-# Install the package in development mode
-SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0 pip install -e .
-
-# Install additional dependencies
-pip install -r requirements.txt
+# Recommended (no conda): uv + Python 3.12
+uv venv --python 3.12 .venv
+uv pip install -e .
 ```
+
+> Legacy conda workflow is still possible, but project scripts now support `uv`/`.venv` directly.
 
 ### 2. Configure Environment
 
@@ -209,6 +207,19 @@ FACTOR_CoSTEER_DATA_FOLDER_DEBUG=/your/custom/path/factor_source_data_debug
 
 The experiment will automatically mine, evolve, and validate alpha factors, and save all discovered factors to `all_factors_library*.json`.
 
+### 4.1 Minimal Smoke Run (Fast Validation)
+
+Use this to quickly validate environment/data/LLM connectivity before a full run:
+
+```bash
+./minirun.sh
+
+# optional custom direction
+./minirun.sh "Microstructure Factors"
+```
+
+`minirun.sh` uses `configs/experiment_smoke.yaml` and default `STEP_N=3` (runs to `factor_calculate`).
+
 ### 5. Independent Backtesting
 
 After mining, combine factors from the library for a full-period backtest:
@@ -236,6 +247,35 @@ python -m quantaalpha.backtest.run_backtest \
 
 Results are saved to the directory specified in `configs/backtest.yaml` (`experiment.output_dir`).
 
+Backtest output files are timestamped in Beijing time and include the actual factor count to avoid overwrite:
+
+- `<library_or_exp>_n<num_factors>_<YYYYMMDD_HHMMSS>_backtest_metrics.json`
+- `<library_or_exp>_n<num_factors>_<YYYYMMDD_HHMMSS>_cumulative_excess.csv`
+
+### 5.1 Safe Script (Recommended on laptops)
+
+Use the safer wrapper script for logging, thread control, cache checks, and interactive mode:
+
+```bash
+./scripts/run_backtest_safe.sh --interactive
+```
+
+Useful options:
+
+```bash
+# Run limited mode with top-50 custom factors
+./scripts/run_backtest_safe.sh \
+  --library data/factorlib/all_factors_library_paper_reproduction_ds.json \
+  --mode limited \
+  --max-factors 50 \
+  --warm-cache
+
+# Run without factor-count limit (config max_factors = null)
+./scripts/run_backtest_safe.sh \
+  --library data/factorlib/all_factors_library_paper_reproduction_ds.json \
+  --max-factors all
+```
+
 > 📘 Need help? Check our comprehensive **[User Guide](docs/user_guide.md)** for advanced configuration, experiment reproduction, and detailed usage examples.
 
 ---
@@ -245,7 +285,6 @@ Results are saved to the directory specified in `configs/backtest.yaml` (`experi
 QuantaAlpha provides a web-based dashboard where you can complete the entire workflow through a visual interface — no command line needed.
 
 ```bash
-conda activate quantaalpha
 cd frontend-v2
 bash start.sh
 # Visit http://localhost:3000
@@ -257,6 +296,12 @@ bash start.sh
 - **📈 Independent Backtest**: Select a factor library and run full-period backtests with visual results
 
 ---
+
+## Notes
+
+- **macOS factor execution**: symlink behavior for factor data files is fixed; `daily_pv.h5` is now correctly linked on Darwin.
+- **Log timezone**: default log folder timestamps use **Asia/Shanghai (UTC+8)** unless `LOG_TRACE_PATH` is explicitly set.
+- **Large local dataset file**: `hf_data/cn_data.zip` is ignored by git.
 
 <a id="windows-deploy"></a>
 ## 🪟 Windows Deployment

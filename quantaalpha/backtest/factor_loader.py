@@ -329,6 +329,8 @@ class FactorLoader:
         json_files = custom_config.get('json_files', [])
         quality_filter = custom_config.get('quality_filter')
         max_factors = custom_config.get('max_factors')
+        ranking_metric = custom_config.get('ranking_metric')
+        ranking_ascending = bool(custom_config.get('ranking_ascending', False))
         
         custom_factors = []
         
@@ -338,18 +340,37 @@ class FactorLoader:
                 logger.warning(f"  Factor library file not found: {json_file}")
                 continue
             
-            factors = self._parse_all_factors_from_json(file_path, quality_filter)
+            factors = self._parse_all_factors_from_json(
+                file_path,
+                quality_filter,
+                ranking_metric=ranking_metric,
+                ranking_ascending=ranking_ascending,
+            )
             custom_factors.extend(factors)
+
+        # If ranking metric is specified, sort globally before slicing max_factors.
+        if ranking_metric and custom_factors:
+            missing_score = float('inf') if ranking_ascending else float('-inf')
+            custom_factors.sort(
+                key=lambda x: x.get('_ranking_score', missing_score),
+                reverse=(not ranking_ascending),
+            )
         
         if max_factors and len(custom_factors) > max_factors:
             custom_factors = custom_factors[:max_factors]
+
+        # Internal helper field, should not leak downstream.
+        for f in custom_factors:
+            f.pop('_ranking_score', None)
         
         logger.debug(f"  Load custom factors: {len(custom_factors)} (custom calculator)")
         
         return {}, custom_factors
     
     def _parse_all_factors_from_json(self, file_path: Path, 
-                                     quality_filter: Optional[str] = None) -> List[Dict]:
+                                     quality_filter: Optional[str] = None,
+                                     ranking_metric: Optional[str] = None,
+                                     ranking_ascending: bool = False) -> List[Dict]:
         """Parse all factors from JSON; returns list of dicts with cache_location if present."""
         with open(file_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -357,6 +378,8 @@ class FactorLoader:
         factors = data.get('factors', {})
         result = []
         
+        missing_score = float('inf') if ranking_ascending else float('-inf')
+
         for factor_id, factor_info in factors.items():
             if quality_filter:
                 factor_quality = factor_info.get('quality', '')
@@ -375,12 +398,29 @@ class FactorLoader:
                 'factor_expression': factor_expr,
                 'factor_description': factor_info.get('factor_description', ''),
             }
+
+            if ranking_metric:
+                score = missing_score
+                bt = factor_info.get('backtest_results', {}) or {}
+                raw = bt.get(ranking_metric)
+                if raw is not None:
+                    try:
+                        score = float(raw)
+                    except Exception:
+                        score = missing_score
+                factor_dict['_ranking_score'] = score
             
             cache_location = factor_info.get('cache_location')
             if cache_location:
                 factor_dict['cache_location'] = cache_location
             
             result.append(factor_dict)
+
+        if ranking_metric and result:
+            result.sort(
+                key=lambda x: x.get('_ranking_score', missing_score),
+                reverse=(not ranking_ascending),
+            )
         
         return result
     
@@ -532,4 +572,3 @@ class FactorLoader:
                 'type': source_type,
                 'description': 'Unknown factor source'
             }
-

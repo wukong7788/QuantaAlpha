@@ -9,6 +9,7 @@ Postscripts:
 """
 
 import datetime
+import os
 import pickle
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -149,6 +150,49 @@ class LoopBase:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("wb") as f:
             pickle.dump(self, f)
+        self._dump_text_snapshot(path)
+
+    @staticmethod
+    def _env_truthy(name: str, default: str = "false") -> bool:
+        v = os.getenv(name, default)
+        return str(v).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _dump_text_snapshot(self, path: Path) -> None:
+        """
+        Optional text snapshot for easier manual inspection.
+        Controlled by env `SESSION_DUMP_TXT` (default: false).
+        """
+        if not self._env_truthy("SESSION_DUMP_TXT", "false"):
+            return
+
+        lines = []
+        lines.append("Loop Session Snapshot")
+        lines.append(f"saved_at_utc={datetime.datetime.now(datetime.timezone.utc).isoformat()}")
+        lines.append(f"loop_idx={self.loop_idx}")
+        lines.append(f"step_idx={self.step_idx}")
+        lines.append(f"steps={self.steps}")
+
+        if self.loop_prev_out:
+            lines.append("loop_prev_out:")
+            for k, v in self.loop_prev_out.items():
+                lines.append(f"  - {k}: {type(v).__name__}")
+        else:
+            lines.append("loop_prev_out: <empty>")
+
+        if self.loop_trace:
+            lines.append("loop_trace_summary:")
+            for li in sorted(self.loop_trace.keys()):
+                traces = self.loop_trace[li]
+                durations = [(t.end - t.start).total_seconds() for t in traces]
+                lines.append(
+                    f"  - loop={li}, steps={len(traces)}, total_sec={sum(durations):.2f}, "
+                    f"durations_sec={[round(x, 2) for x in durations]}"
+                )
+        else:
+            lines.append("loop_trace_summary: <empty>")
+
+        txt_path = Path(str(path) + ".txt")
+        txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     @classmethod
     def load(cls, path: str | Path):

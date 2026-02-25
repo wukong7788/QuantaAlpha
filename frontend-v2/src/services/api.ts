@@ -158,6 +158,40 @@ export async function cancelBacktest(taskId: string) {
   return request(`/api/v1/backtest/${taskId}`, { method: 'DELETE' });
 }
 
+export async function getOfflineBacktestLatest(library?: string, configPath?: string) {
+  const qs = new URLSearchParams();
+  if (library) qs.set('library', library);
+  if (configPath) qs.set('configPath', configPath);
+  return request<{ task: Task }>(`/api/v1/backtest-offline/latest?${qs.toString()}`);
+}
+
+export interface OfflineBacktestRunItem {
+  metricsFile: string;
+  mtime: string;
+  sizeBytes: number;
+}
+
+export async function listOfflineBacktestRuns(library?: string, configPath?: string) {
+  const qs = new URLSearchParams();
+  if (library) qs.set('library', library);
+  if (configPath) qs.set('configPath', configPath);
+  return request<{ runs: OfflineBacktestRunItem[]; outputDir: string }>(
+    `/api/v1/backtest-offline/runs?${qs.toString()}`
+  );
+}
+
+export async function getOfflineBacktestByMetricsFile(
+  metricsFile: string,
+  library?: string,
+  configPath?: string
+) {
+  const qs = new URLSearchParams();
+  qs.set('metricsFile', metricsFile);
+  if (library) qs.set('library', library);
+  if (configPath) qs.set('configPath', configPath);
+  return request<{ task: Task }>(`/api/v1/backtest-offline/latest?${qs.toString()}`);
+}
+
 // ========================== System Config API ==========================
 
 export async function getSystemConfig() {

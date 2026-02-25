@@ -5,7 +5,10 @@ Maps alphaagent.log to rdagent.log so all alphaagent.log imports work.
 Provides AlphaAgent-specific APIs: log_trace_path, set_trace_path.
 """
 
+import os
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from rdagent.log import rdagent_logger as _rdagent_logger
 from rdagent.log.utils import LogColors
 
@@ -41,5 +44,10 @@ class _AlphaAgentLoggerWrapper:
 
 
 logger = _AlphaAgentLoggerWrapper(_rdagent_logger)
+
+# Default to Beijing time log folder unless user explicitly sets LOG_TRACE_PATH.
+if not os.environ.get("LOG_TRACE_PATH"):
+    beijing_now = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d_%H-%M-%S-%f")
+    logger.set_trace_path(Path.cwd() / "log" / beijing_now)
 
 __all__ = ["logger", "LogColors"]

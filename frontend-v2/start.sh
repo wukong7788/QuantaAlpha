@@ -18,22 +18,41 @@ fi
 echo "✅ Node.js: $(node --version)"
 
 # =============================================================================
-# 激活 conda 环境（使用与主实验相同的 quantaalpha 环境）
+# 选择 Python 环境（优先使用 uv 创建的 .venv，不依赖 conda）
 # =============================================================================
-eval "$(conda shell.bash hook)" 2>/dev/null
-CONDA_ENV="${CONDA_ENV_NAME:-quantaalpha}"
-conda activate "${CONDA_ENV}" 2>/dev/null
-
-if [ $? -ne 0 ]; then
-    source activate "${CONDA_ENV}" 2>/dev/null
-fi
-
-if ! python -c "import quantaalpha" 2>/dev/null; then
-    echo "❌ 错误: quantaalpha 包未安装"
-    echo "请先运行: conda activate ${CONDA_ENV} && cd ${PROJECT_ROOT} && pip install -e ."
+PYTHON_BIN=""
+PIP_BIN=""
+if [ -x "${PROJECT_ROOT}/.venv/bin/python" ]; then
+    PYTHON_BIN="${PROJECT_ROOT}/.venv/bin/python"
+    PIP_BIN="${PROJECT_ROOT}/.venv/bin/pip"
+    echo "✅ 使用 Python 环境: ${PROJECT_ROOT}/.venv"
+elif command -v uv >/dev/null 2>&1; then
+    echo "⚠️  未找到 .venv，尝试使用 uv 创建..."
+    (
+        cd "${PROJECT_ROOT}" && \
+        uv venv --python 3.12 .venv && \
+        uv pip install -e .
+    )
+    if [ $? -ne 0 ] || [ ! -x "${PROJECT_ROOT}/.venv/bin/python" ]; then
+        echo "❌ 错误: uv 环境创建失败"
+        echo "请先运行: cd ${PROJECT_ROOT} && uv venv --python 3.12 .venv && uv pip install -e ."
+        exit 1
+    fi
+    PYTHON_BIN="${PROJECT_ROOT}/.venv/bin/python"
+    PIP_BIN="${PROJECT_ROOT}/.venv/bin/pip"
+    echo "✅ 使用 Python 环境: ${PROJECT_ROOT}/.venv"
+else
+    echo "❌ 错误: 未找到 .venv 且系统未安装 uv"
+    echo "请先安装 uv，并运行: cd ${PROJECT_ROOT} && uv venv --python 3.12 .venv && uv pip install -e ."
     exit 1
 fi
-echo "✅ Python: $(python --version) (conda env: ${CONDA_ENV})"
+
+if ! "${PYTHON_BIN}" -c "import quantaalpha" 2>/dev/null; then
+    echo "❌ 错误: quantaalpha 包未安装到 ${PROJECT_ROOT}/.venv"
+    echo "请先运行: cd ${PROJECT_ROOT} && uv pip install -e ."
+    exit 1
+fi
+echo "✅ Python: $("${PYTHON_BIN}" --version)"
 
 # =============================================================================
 # 加载 .env 配置
@@ -63,10 +82,10 @@ if [ ! -d "node_modules" ]; then
 fi
 
 # =============================================================================
-# 安装后端依赖（在 conda 环境中）
+# 安装后端依赖（在 .venv 环境中）
 # =============================================================================
 echo "📦 检查/安装后端 Python 依赖..."
-pip install -q fastapi uvicorn websockets python-multipart python-dotenv pyyaml 2>/dev/null || true
+"${PIP_BIN}" install -q fastapi uvicorn websockets python-multipart python-dotenv pyyaml 2>/dev/null || true
 echo "✅ 后端依赖就绪"
 
 # =============================================================================
@@ -101,7 +120,7 @@ else
 
     echo "🔧 启动后端服务 (端口 8000)..."
     cd "${SCRIPT_DIR}"
-    python backend/app.py &
+    "${PYTHON_BIN}" backend/app.py &
     BACKEND_PID=$!
 
     # 等待后端启动

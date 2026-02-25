@@ -811,6 +811,179 @@ async def get_backtest_status(task_id: str):
     return ApiResponse(success=True, data={"task": tasks[task_id]})
 
 
+@app.get("/api/v1/backtest-offline/latest", response_model=ApiResponse)
+async def get_offline_backtest_latest(
+    library: Optional[str] = Query(None, description="Factor library filename, e.g. all_factors_library_xxx.json"),
+    configPath: Optional[str] = Query(None, description="Backtest config path, defaults to configs/backtest.yaml"),
+    metricsFile: Optional[str] = Query(None, description="Exact metrics filename under output dir"),
+):
+    """Load the latest offline backtest result from disk and return it in task-like payload."""
+    try:
+        config_path = configPath or str(PROJECT_ROOT / "configs" / "backtest.yaml")
+        with open(config_path, "r", encoding="utf-8") as f:
+            bt_config = yaml.safe_load(f) or {}
+        output_dir_raw = bt_config.get("experiment", {}).get(
+            "output_dir", "data/results/backtest_v2_results"
+        )
+        output_dir = Path(output_dir_raw)
+        if not output_dir.is_absolute():
+            output_dir = PROJECT_ROOT / output_dir
+        if not output_dir.exists():
+            raise HTTPException(status_code=404, detail=f"Backtest output dir not found: {output_dir}")
+
+        # Priority:
+        # 1) If metricsFile provided, use exact file
+        # 2) If library provided, try "<library_stem>_backtest_metrics.json" then
+        #    "<library_stem>_*_backtest_metrics.json" (timestamped files)
+        # 3) Fallback to latest "*_backtest_metrics.json"
+        metrics_files: List[str] = []
+        if metricsFile:
+            selected = output_dir / Path(metricsFile).name
+            if selected.exists():
+                metrics_files = [str(selected)]
+            else:
+                raise HTTPException(status_code=404, detail=f"Metrics file not found: {selected}")
+
+        if (not metrics_files) and library:
+            stem = Path(library).stem
+            expected = output_dir / f"{stem}_backtest_metrics.json"
+            if expected.exists():
+                metrics_files = [str(expected)]
+            else:
+                prefixed = sorted(
+                    glob.glob(str(output_dir / f"{stem}_*_backtest_metrics.json")),
+                    key=os.path.getmtime,
+                    reverse=True,
+                )
+                if prefixed:
+                    metrics_files = prefixed
+
+        if not metrics_files:
+            if library:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No backtest metrics found for library: {library}",
+                )
+            metrics_files = sorted(
+                glob.glob(str(output_dir / "*_backtest_metrics.json")),
+                key=os.path.getmtime,
+                reverse=True,
+            )
+
+        if not metrics_files:
+            raise HTTPException(status_code=404, detail=f"No backtest metrics found in: {output_dir}")
+
+        metrics_path = metrics_files[0]
+        with open(metrics_path, "r", encoding="utf-8") as f:
+            metrics_data = json.load(f)
+
+        inner_metrics = metrics_data.get("metrics", {})
+        flat = {**inner_metrics}
+        for key in ("experiment_name", "factor_source", "num_factors", "config", "elapsed_seconds"):
+            if key in metrics_data:
+                flat[f"__{key}"] = metrics_data[key]
+
+        csv_path = metrics_path.replace("_backtest_metrics.json", "_cumulative_excess.csv")
+        if os.path.exists(csv_path):
+            import pandas as pd
+            df = pd.read_csv(csv_path)
+            if "date" in df.columns and "cumulative_excess_return" in df.columns:
+                flat["cumulative_curve"] = [
+                    {"date": r["date"], "value": r["cumulative_excess_return"]}
+                    for r in df[["date", "cumulative_excess_return"]].to_dict("records")
+                ]
+
+        pseudo_task = {
+            "taskId": f"offline-{Path(metrics_path).stem}",
+            "status": "completed",
+            "type": "backtest",
+            "config": {
+                "factorJson": library,
+                "factorSource": metrics_data.get("factor_source", "custom"),
+                "configPath": config_path,
+                "offline": True,
+                "metricsPath": metrics_path,
+            },
+            "progress": {
+                "phase": "completed",
+                "currentRound": 1,
+                "totalRounds": 1,
+                "progress": 100,
+                "message": "已加载离线回测结果",
+                "timestamp": _now(),
+            },
+            "logs": [],
+            "metrics": flat,
+            "createdAt": datetime.fromtimestamp(os.path.getmtime(metrics_path)).isoformat(),
+            "updatedAt": _now(),
+        }
+        return ApiResponse(
+            success=True,
+            data={"task": pseudo_task},
+            message=f"已加载离线结果: {Path(metrics_path).name}",
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load offline backtest result: {e}")
+
+
+@app.get("/api/v1/backtest-offline/runs", response_model=ApiResponse)
+async def list_offline_backtest_runs(
+    library: Optional[str] = Query(None, description="Factor library filename, e.g. all_factors_library_xxx.json"),
+    configPath: Optional[str] = Query(None, description="Backtest config path, defaults to configs/backtest.yaml"),
+):
+    """List available offline backtest metrics files under the configured output directory."""
+    try:
+        config_path = configPath or str(PROJECT_ROOT / "configs" / "backtest.yaml")
+        with open(config_path, "r", encoding="utf-8") as f:
+            bt_config = yaml.safe_load(f) or {}
+        output_dir_raw = bt_config.get("experiment", {}).get(
+            "output_dir", "data/results/backtest_v2_results"
+        )
+        output_dir = Path(output_dir_raw)
+        if not output_dir.is_absolute():
+            output_dir = PROJECT_ROOT / output_dir
+        if not output_dir.exists():
+            raise HTTPException(status_code=404, detail=f"Backtest output dir not found: {output_dir}")
+
+        pattern = "*_backtest_metrics.json"
+        if library:
+            stem = Path(library).stem
+            files_exact = glob.glob(str(output_dir / f"{stem}_backtest_metrics.json"))
+            files_prefixed = glob.glob(str(output_dir / f"{stem}_*_backtest_metrics.json"))
+            files = sorted(
+                list(set(files_exact + files_prefixed)),
+                key=os.path.getmtime,
+                reverse=True,
+            )
+        else:
+            files = sorted(
+                glob.glob(str(output_dir / pattern)),
+                key=os.path.getmtime,
+                reverse=True,
+            )
+
+        runs = []
+        for p in files:
+            pp = Path(p)
+            runs.append({
+                "metricsFile": pp.name,
+                "mtime": datetime.fromtimestamp(pp.stat().st_mtime).isoformat(),
+                "sizeBytes": pp.stat().st_size,
+            })
+
+        return ApiResponse(
+            success=True,
+            data={"runs": runs, "outputDir": str(output_dir)},
+            message=f"找到 {len(runs)} 个离线结果",
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list offline backtest runs: {e}")
+
+
 @app.delete("/api/v1/backtest/{task_id}", response_model=ApiResponse)
 async def cancel_backtest(task_id: str):
     """Cancel a running backtest task."""
@@ -1038,11 +1211,19 @@ def _load_backtest_results(task: Dict[str, Any]):
             output_dir = PROJECT_ROOT / output_dir
         output_dir_str = str(output_dir)
 
-        # Look for most recent metrics JSON
-        metrics_files = sorted(
-            glob.glob(os.path.join(output_dir_str, "*_backtest_metrics.json")),
-            key=os.path.getmtime, reverse=True,
-        )
+        # Look for most recent metrics JSON. Prefer files matching the current factor library.
+        factor_json = (task.get("config", {}) or {}).get("factorJson")
+        metrics_files: List[str] = []
+        if factor_json:
+            stem = Path(factor_json).stem
+            exact = glob.glob(os.path.join(output_dir_str, f"{stem}_backtest_metrics.json"))
+            prefixed = glob.glob(os.path.join(output_dir_str, f"{stem}_*_backtest_metrics.json"))
+            metrics_files = sorted(list(set(exact + prefixed)), key=os.path.getmtime, reverse=True)
+        if not metrics_files:
+            metrics_files = sorted(
+                glob.glob(os.path.join(output_dir_str, "*_backtest_metrics.json")),
+                key=os.path.getmtime, reverse=True,
+            )
         if metrics_files:
             with open(metrics_files[0], "r") as f:
                 metrics_data = json.load(f)

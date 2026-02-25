@@ -8,6 +8,8 @@ import json
 import logging
 import sys
 import time
+import warnings
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 
@@ -24,10 +26,120 @@ logger = logging.getLogger(__name__)
 class BacktestRunner:
     """Backtest executor."""
 
+    _DATETIME_LEVEL_ALIASES = {"datetime", "date", "dt", "time", "timestamp"}
+    _INSTRUMENT_LEVEL_ALIASES = {"instrument", "stock", "ticker", "symbol", "code"}
+
     def __init__(self, config_path: str):
         self.config_path = Path(config_path)
         self.config = self._load_config()
         self._qlib_initialized = False
+        self._result_file_prefix: Optional[str] = None
+
+    @staticmethod
+    def _beijing_timestamp() -> str:
+        """Return timestamp string in Asia/Shanghai (UTC+8)."""
+        bj_tz = timezone(timedelta(hours=8))
+        return datetime.now(bj_tz).strftime("%Y%m%d_%H%M%S")
+
+    @staticmethod
+    def _datetime_parse_ratio(values: pd.Index, sample_size: int = 1024) -> float:
+        """Return ratio of entries parseable as datetime (sampled for speed)."""
+        if len(values) == 0:
+            return 0.0
+        if pd.api.types.is_datetime64_any_dtype(values):
+            return 1.0
+
+        sample = values[:sample_size] if len(values) > sample_size else values
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            parsed = pd.to_datetime(sample, errors="coerce")
+        return float(pd.Series(parsed).notna().mean())
+
+    @classmethod
+    def _detect_dt_inst_levels(cls, index: pd.MultiIndex) -> Optional[Tuple[int, int]]:
+        """Detect datetime and instrument levels without weak guessing."""
+        if not isinstance(index, pd.MultiIndex) or index.nlevels < 2:
+            return None
+
+        names = [
+            str(name).strip().lower() if name is not None else None
+            for name in index.names[:2]
+        ]
+        dt_levels = [i for i, name in enumerate(names) if name in cls._DATETIME_LEVEL_ALIASES]
+        inst_levels = [i for i, name in enumerate(names) if name in cls._INSTRUMENT_LEVEL_ALIASES]
+        if len(dt_levels) == 1:
+            dt_level = dt_levels[0]
+            return dt_level, 1 - dt_level
+        if len(inst_levels) == 1:
+            inst_level = inst_levels[0]
+            return 1 - inst_level, inst_level
+
+        l0 = index.get_level_values(0)
+        l1 = index.get_level_values(1)
+        l0_dt_dtype = pd.api.types.is_datetime64_any_dtype(l0)
+        l1_dt_dtype = pd.api.types.is_datetime64_any_dtype(l1)
+        if l0_dt_dtype != l1_dt_dtype:
+            dt_level = 0 if l0_dt_dtype else 1
+            return dt_level, 1 - dt_level
+
+        # Strict fallback for object/object indexes: only accept near-certain separation.
+        l0_ratio = cls._datetime_parse_ratio(l0)
+        l1_ratio = cls._datetime_parse_ratio(l1)
+        if l0_ratio >= 0.98 and l1_ratio <= 0.02:
+            return 0, 1
+        if l1_ratio >= 0.98 and l0_ratio <= 0.02:
+            return 1, 0
+        return None
+
+    @classmethod
+    def _normalize_dt_inst_index(cls, obj: Any, name: str = "obj") -> Any:
+        """
+        Normalize index to MultiIndex(datetime, instrument) for Series/DataFrame.
+        If levels are ambiguous, keep original index to avoid silent misalignment.
+        """
+        if not isinstance(obj, (pd.Series, pd.DataFrame)):
+            return obj
+        if not isinstance(obj.index, pd.MultiIndex):
+            return obj
+        if obj.index.nlevels < 2:
+            return obj
+
+        levels = cls._detect_dt_inst_levels(obj.index)
+        if levels is None:
+            logger.warning(
+                "  %s index normalization skipped: ambiguous datetime/instrument levels (names=%s)",
+                name,
+                list(obj.index.names),
+            )
+            return obj
+
+        dt_level, inst_level = levels
+        dt_raw = obj.index.get_level_values(dt_level)
+        if pd.api.types.is_datetime64_any_dtype(dt_raw):
+            dt_vals = dt_raw
+        else:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                dt_vals = pd.to_datetime(dt_raw, errors="coerce")
+            nat_ratio = float(pd.Series(dt_vals).isna().mean()) if len(dt_vals) else 0.0
+            if nat_ratio > 0.0:
+                logger.warning(
+                    "  %s index normalization skipped: datetime level has %.2f%% invalid values",
+                    name,
+                    nat_ratio * 100,
+                )
+                return obj
+
+        inst_vals = obj.index.get_level_values(inst_level).astype(str)
+        new_index = pd.MultiIndex.from_arrays(
+            [dt_vals, inst_vals],
+            names=["datetime", "instrument"],
+        )
+        normalized = obj.copy()
+        normalized.index = new_index
+        normalized = normalized.sort_index()
+        logger.debug("  %s index normalized to (datetime, instrument), rows=%d", name, len(normalized))
+        return normalized
 
     def _load_config(self) -> Dict:
         with open(self.config_path, 'r', encoding='utf-8') as f:
@@ -90,12 +202,16 @@ class BacktestRunner:
         dataset = self._create_dataset(factor_expressions, computed_factors)
         print("[3/4] Dataset created")
 
-        metrics = self._train_and_backtest(dataset, exp_name, rec_name, output_name=output_name)
+        total_factors = len(factor_expressions) + len(custom_factors)
+        base_output_name = output_name or exp_name
+        self._result_file_prefix = f"{base_output_name}_n{total_factors}_{self._beijing_timestamp()}"
+
+        metrics = self._train_and_backtest(dataset, exp_name, rec_name, output_name=self._result_file_prefix)
         total_time = time.time() - start_time_total
         self._print_results(metrics, total_time)
         self._save_results(metrics, exp_name, factor_source or self.config['factor_source']['type'], 
-                          len(factor_expressions) + len(custom_factors), total_time,
-                          output_name=output_name)
+                          total_factors, total_time,
+                          output_name=self._result_file_prefix, summary_name=base_output_name)
         
         return metrics
     
@@ -507,18 +623,40 @@ class BacktestRunner:
             
             # Generate prediction
             pred = model.predict(dataset)
+            pred = self._normalize_dt_inst_index(pred, "pred")
             logger.debug(f"  Pred shape: {pred.shape}")
             
             # Save prediction
-            sr = SignalRecord(recorder=R.get_recorder(), model=model, dataset=dataset)
+            recorder = R.get_recorder()
+            sr = SignalRecord(recorder=recorder, model=model, dataset=dataset)
             sr.generate()
             
             # Compute IC metrics
+            ic_pred_series = None
+            ic_label_df = None
             try:
+                # Normalize artifacts used by SigAnaRecord to avoid index-level-name mismatch.
+                try:
+                    saved_pred = recorder.load_object("pred.pkl")
+                    if isinstance(saved_pred, pd.DataFrame) and not saved_pred.empty:
+                        col = "score" if "score" in saved_pred.columns else saved_pred.columns[0]
+                        ic_pred_series = self._normalize_dt_inst_index(saved_pred[col], "pred_for_ic")
+                        saved_pred = ic_pred_series.to_frame("score")
+                        recorder.save_objects(**{"pred.pkl": saved_pred})
+                    elif isinstance(saved_pred, pd.Series):
+                        ic_pred_series = self._normalize_dt_inst_index(saved_pred, "pred_for_ic")
+                        recorder.save_objects(**{"pred.pkl": ic_pred_series.to_frame("score")})
+
+                    saved_label = recorder.load_object("label.pkl")
+                    if isinstance(saved_label, pd.DataFrame) and not saved_label.empty:
+                        ic_label_df = self._normalize_dt_inst_index(saved_label, "label_for_ic")
+                        recorder.save_objects(**{"label.pkl": ic_label_df})
+                except Exception as prep_err:
+                    logger.warning(f"IC artifact normalization skipped: {prep_err}")
+
                 sar = SigAnaRecord(recorder=R.get_recorder(), ana_long_short=False, ann_scaler=252)
                 sar.generate()
                 
-                recorder = R.get_recorder()
                 try:
                     ic_series = recorder.load_object("sig_analysis/ic.pkl")
                     ric_series = recorder.load_object("sig_analysis/ric.pkl")
@@ -536,7 +674,36 @@ class BacktestRunner:
                 except Exception as e:
                     logger.warning(f"Could not read IC result: {e}")
             except Exception as e:
-                logger.warning(f"IC analysis failed: {e}")
+                logger.warning(f"IC analysis failed: {e}, fallback to manual calc_ic")
+                try:
+                    from qlib.contrib.eva.alpha import calc_ic
+
+                    if ic_pred_series is None:
+                        ic_pred_series = self._normalize_dt_inst_index(pred, "pred_fallback_ic")
+                    if ic_label_df is None:
+                        ic_label_df = SignalRecord.generate_label(dataset)
+                        ic_label_df = self._normalize_dt_inst_index(ic_label_df, "label_fallback_ic")
+
+                    if isinstance(ic_label_df, pd.DataFrame) and not ic_label_df.empty and isinstance(ic_pred_series, pd.Series):
+                        label_series = ic_label_df.iloc[:, 0]
+                        ic_series, ric_series = calc_ic(ic_pred_series, label_series)
+
+                        if isinstance(ic_series, pd.Series) and len(ic_series) > 0:
+                            metrics['IC'] = float(ic_series.mean())
+                            metrics['ICIR'] = float(ic_series.mean() / ic_series.std()) if ic_series.std() > 0 else 0.0
+                        if isinstance(ric_series, pd.Series) and len(ric_series) > 0:
+                            metrics['Rank IC'] = float(ric_series.mean())
+                            metrics['Rank ICIR'] = float(ric_series.mean() / ric_series.std()) if ric_series.std() > 0 else 0.0
+
+                        recorder.save_objects(
+                            artifact_path="sig_analysis",
+                            **{"ic.pkl": ic_series, "ric.pkl": ric_series},
+                        )
+
+                        print(f"  IC={metrics.get('IC', 0):.6f}, ICIR={metrics.get('ICIR', 0):.6f}, "
+                              f"Rank IC={metrics.get('Rank IC', 0):.6f}, Rank ICIR={metrics.get('Rank ICIR', 0):.6f}")
+                except Exception as fallback_err:
+                    logger.warning(f"Manual IC fallback failed: {fallback_err}")
             # Portfolio backtest
             try:
                 bt_start = time.time()
@@ -567,11 +734,9 @@ class BacktestRunner:
                     if invalid_count > 0:
                         logger.debug(f"  Found {invalid_count} zero/NaN price records")
                         if isinstance(pred, pd.Series):
+                            invalid_mask = self._normalize_dt_inst_index(invalid_mask.astype(bool), "price_invalid_mask")
                             invalid_indices = invalid_mask[invalid_mask].index
-                            invalid_set = set()
-                            for idx in invalid_indices:
-                                instrument, datetime = idx
-                                invalid_set.add((datetime, instrument))
+                            invalid_set = set(invalid_indices)
                             
                             filtered_count = 0
                             for idx in pred.index:
@@ -692,9 +857,10 @@ class BacktestRunner:
         print(f"Total time: {total_time:.1f}s")
         print(f"{'='*50}")
     
-    def _save_results(self, metrics: Dict, exp_name: str, 
+    def _save_results(self, metrics: Dict, exp_name: str,
                      factor_source: str, num_factors: int, elapsed: float,
-                     output_name: Optional[str] = None):
+                     output_name: Optional[str] = None,
+                     summary_name: Optional[str] = None):
         """Save results."""
         output_dir = Path(self.config['experiment'].get('output_dir', './backtest_v2_results'))
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -739,7 +905,8 @@ class BacktestRunner:
             calmar_ratio = ann_ret / abs(mdd)
         
         summary_entry = {
-            "name": output_name or exp_name,
+            "name": summary_name or exp_name,
+            "result_file": output_file,
             "num_factors": num_factors,
             "IC": metrics.get('IC'),
             "ICIR": metrics.get('ICIR'),

@@ -202,7 +202,18 @@ backtest:
 
 ## 输出结果
 
-回测完成后，结果保存在 `backtest_v2_results/backtest_metrics.json`：
+回测完成后，结果保存在配置项 `experiment.output_dir` 指定目录（默认 `data/results/backtest_v2_results`）。
+
+结果文件名格式：
+
+- `<library_or_exp>_n<num_factors>_<YYYYMMDD_HHMMSS>_backtest_metrics.json`
+- `<library_or_exp>_n<num_factors>_<YYYYMMDD_HHMMSS>_cumulative_excess.csv`
+
+例如：
+
+- `all_factors_library_paper_reproduction_ds_n50_20260225_233015_backtest_metrics.json`
+
+指标 JSON 内容示例：
 
 ```json
 {
@@ -282,4 +293,3 @@ factor_source:
 ## 许可证
 
 MIT License
-
