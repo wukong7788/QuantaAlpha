@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 import threading
+from datetime import datetime, timezone
+import os
 
 from quantaalpha.log import logger
 from .trajectory import StrategyTrajectory, TrajectoryPool, RoundPhase
@@ -874,8 +876,13 @@ class EvolutionController:
         
         return valid[:top_n]
     
-    def save_state(self, path: Path):
-        """Save controller state to disk."""
+    def save_state(self, path: Path, extra_state: dict[str, Any] | None = None):
+        """Save controller state to disk.
+
+        Args:
+            path: State file path.
+            extra_state: Optional extra fields to persist (for run-level metadata).
+        """
         import json
         
         state = {
@@ -893,8 +900,29 @@ class EvolutionController:
                 "crossover_enabled": self.config.crossover_enabled,
                 "crossover_size": self.config.crossover_size,
                 "crossover_n": self.config.crossover_n,
-            }
+                "prefer_diverse_crossover": self.config.prefer_diverse_crossover,
+                "parent_selection_strategy": self.config.parent_selection_strategy,
+                "top_percent_threshold": self.config.top_percent_threshold,
+                "parallel_enabled": self.config.parallel_enabled,
+            },
+            "meta": {
+                "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+                "experiment_id": os.getenv("EXPERIMENT_ID", ""),
+                "log_trace_path": os.getenv("LOG_TRACE_PATH", str(path.parent)),
+                "workspace_path": os.getenv("WORKSPACE_PATH", ""),
+                "pickle_cache_path": os.getenv("PICKLE_CACHE_FOLDER_PATH_STR", ""),
+            },
         }
+        if isinstance(extra_state, dict):
+            for k, v in extra_state.items():
+                if (
+                    k in {"config", "meta"}
+                    and isinstance(v, dict)
+                    and isinstance(state.get(k), dict)
+                ):
+                    state[k].update(v)
+                else:
+                    state[k] = v
         
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
@@ -902,13 +930,13 @@ class EvolutionController:
         
         logger.info(f"Saved evolution state to {path}")
     
-    def load_state(self, path: Path):
-        """Load controller state from disk."""
+    def load_state(self, path: Path) -> dict[str, Any] | None:
+        """Load controller state from disk and return parsed state dict."""
         import json
         
         if not path.exists():
             logger.warning(f"State file not found: {path}")
-            return
+            return None
         
         with open(path, "r", encoding="utf-8") as f:
             state = json.load(f)
@@ -933,4 +961,4 @@ class EvolutionController:
             self._prepare_crossover_groups()
         
         logger.info(f"Loaded evolution state from {path}")
-
+        return state

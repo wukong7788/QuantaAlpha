@@ -1,0 +1,74 @@
+workflow:
+  name: "a_share_etf_rotation_codex"
+  rounds: 4
+  num_directions: 8
+  mutation_enabled: true
+  crossover_enabled: true
+  keep_top_ratio: 0.30
+
+data:
+  universe_file: "data/etf_rotation/universe/etf_pool.csv"
+  bars_file: "data/etf_rotation/data/etf_ohlcv.parquet"
+  benchmark: "000300.SH"
+  train_start: "2018-01-01"
+  test_end: "2025-12-31"
+
+portfolio:
+  rebalance_freq: "W"
+  max_holdings: 5
+  weight_cap_per_etf: 0.35
+  allow_cash: true
+  turnover_cap: 0.35
+
+costs:
+  buy_cost_bps: 5
+  sell_cost_bps: 15
+  slippage_bps: 5
+
+quality_gate:
+  complexity:
+    max_operators: 8
+    max_lookback_days: 120
+    max_free_parameters: 6
+  redundancy:
+    max_signal_corr: 0.90
+  tradability:
+    max_expected_turnover: 0.45
+    min_listing_days: 120
+
+evaluation:
+  walk_forward:
+    train_years: 3
+    valid_years: 1
+    step_months: 6
+  required_metrics:
+    - "ir_net"
+    - "calmar"
+    - "oos_stability"
+    - "monthly_win_rate"
+    - "max_drawdown"
+    - "turnover"
+  score_weights:
+    ir_net: 0.30
+    calmar: 0.20
+    oos_stability: 0.15
+    monthly_win_rate: 0.15
+    max_drawdown: -0.10
+    turnover: -0.10
+
+artifacts:
+  root_dir: "data/etf_rotation"
+  round_dir_pattern: "round_{k}"
+  save_files:
+    - "directions.json"
+    - "signals_raw.json"
+    - "signals_filtered.json"
+    - "backtest_metrics.csv"
+    - "leaderboard.csv"
+    - "feedback.json"
+    - "next_round_seed.json"
+
+codex:
+  overwrite_history: false
+  require_explain_on_drop: true
+  fail_fast: false

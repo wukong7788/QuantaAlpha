@@ -67,7 +67,7 @@ evolution:
   # Crossover: number of parents selected per crossover operation
   crossover_size: 2
   # Crossover: number of combinations per round (parallelism after crossover)
-  crossover_n: 2
+  crossover_n: 10
 
   # Parallel execution within each evolution phase
   # true: original round = all n directions in parallel; mutation/crossover rounds = all tasks in parallel

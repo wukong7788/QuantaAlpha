@@ -20,6 +20,23 @@ Core code paths:
 - Backtest: `quantaalpha/backtest/`
 - Web UI: `frontend-v2/`
 
+## Specs Sync Policy
+
+- Contract/spec source: `SPECS.md` (project behavior contract, not just notes).
+- When to update `SPECS.md`:
+  - CLI/script options change (add/remove/rename/default behavior), e.g. `run.sh`, `scripts/run_backtest_safe.sh`.
+  - Workflow semantics change (resume/relay logic, cache policy, filtering/ranking rules).
+  - Output contract changes (file naming, API fields, metadata schema).
+- Rule of thumb:
+  - If a user or downstream tool can observe changed behavior, update `SPECS.md` in the same PR/commit.
+  - If change is internal-only refactor with no behavior change, `SPECS.md` update is optional.
+- Recurring pitfall (must avoid):
+  - Code logic gets updated but docs keep old semantics. This is treated as an incomplete change.
+- Mandatory doc-sync gate after behavior changes:
+  - Update `SPECS.md` plus user-facing docs (`README.md`/`README_CN.md`/`docs/PAPER_REPRODUCTION_GUIDE.md`) and `CHANGELOG.md` in the same task.
+  - Run a keyword grep for changed flags/terms (e.g. `--relay`, `--resume`, `BOB`, `low-disk`) to catch stale wording.
+  - If intentionally skipping doc updates, explicitly state why (internal-only change) in the final summary.
+
 ## Local Runtime (current)
 
 Use `uv + .venv` (no conda required).
@@ -45,8 +62,55 @@ uv pip install -e .
 ```
 
 - Uses `configs/experiment_smoke.yaml`
-- Default `STEP_N=3`
+- Default `STEP_N=5` (full 5-step)
 - Can send Telegram notification on finish
+
+## Interactive Script Index (3-5 steps only)
+
+Scope: human-facing entry scripts used in day-to-day operation.
+
+### 1) Main experiment: `run.sh`
+
+1. Confirm `.env` + `.venv` are ready.
+2. Run `./run.sh "方向" "suffix"` (low-disk is ON by default; optional flags: `--no-low-disk`, `--relay`, `--resume`).
+3. Check printed `EXPERIMENT_ID`, `WORKSPACE_PATH`, and log output.
+4. Relay/resume semantics (`--relay` and `--resume` are mutually exclusive): first relay leg uses chunk (`QUANTA_RELAY_CHUNK_ROUNDS`, default 5), later leg auto-finishes to `max_rounds`; `--resume` requires existing `evolution_state.json` and fails fast if missing.
+5. Naming safety: for a new run, change both `EXPERIMENT_ID` and library suffix together; reusing suffix appends/overwrites in the same `all_factors_library_<suffix>.json`.
+
+### 2) Smoke pipeline: `minirun.sh`
+
+1. Confirm `.env` and required `daily_pv.h5` files exist.
+2. Run `./minirun.sh` (optional: `STEP_N=5 ./minirun.sh`).
+3. Read manifest under `log/minirun_manifests/` for artifact paths.
+4. Use Telegram summary for quick success/failure signal.
+
+### 3) Offline/safe backtest: `scripts/run_backtest_safe.sh`
+
+1. Start wizard with `./scripts/run_backtest_safe.sh --interactive` (or pass `--library ...` directly).
+2. In wizard step 1, choose one concrete experiment library / `BOB` / `VIEW` (horizontal compare).
+3. Script applies defaults automatically (BOB defaults: `grade=sa`, `top=50`) and starts without extra confirm.
+4. Check run summary and logs under `log/backtest_manual/` (BOB `auto` metric resolves one global metric before ranking and writes `metric_resolved`; temp files are cleaned up on normal/early exit).
+
+### 4) Safe cleanup: `scripts/safe_cleanup.sh` (wrapper of `scripts/safe_cleanup.py`)
+
+1. Run without args for interactive wizard, or pass explicit cleanup flags.
+2. Start with dry-run (default) and review deletion plan.
+3. Execute with `--apply --yes` only after confirming reclaim targets.
+4. Recheck workspace/pickle/log directories after cleanup.
+
+### 5) Frontend stack startup: `frontend-v2/start.sh`
+
+1. Run `./frontend-v2/start.sh`.
+2. Script auto-checks Node, `.venv`, backend deps, and `.env`.
+3. Script reuses healthy services or starts backend (`8000`) + frontend (`3000`).
+4. Open `http://localhost:3000`; use `Ctrl+C` to stop processes started by this script.
+
+### 6) Result comparison: `scripts/view_results.sh`
+
+1. Run `./scripts/view_results.sh` (interactive) or pass `--pick 1,2,3`.
+2. Select experiment snapshots and/or BOB entries for side-by-side comparison.
+3. Script compares existing `*_backtest_metrics.json` directly (no recompute).
+4. Check built-in overwrite risk warning (`legacy` vs `timestamped` naming).
 
 ## Environment Variables That Matter
 

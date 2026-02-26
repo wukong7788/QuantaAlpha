@@ -1,5 +1,36 @@
 # Changelog
 
+## 2026-02-26
+
+### Added
+- Added true relay mode entry in `run.sh`:
+  - `--relay` (fixed `LOG_TRACE_PATH` + resume intent)
+  - `QUANTA_ENABLE_RELAY=1` wiring in launcher
+- Added strict resume entry in `run.sh`:
+  - `--resume` (mutually exclusive with `--relay`, continue to target rounds)
+- Added relay resume source logging:
+  - `Relay resume source: previous_experiment_id=..., state_saved_at_utc=..., previous_log_trace_path=...`
+
+### Changed
+- Extended `evolution_state.json` persistence with:
+  - run metadata (`meta.*`)
+  - evolution config snapshot (including selection/parallel flags)
+  - persisted planning `directions`
+- Changed relay checkpoint writes to include `directions` at task-level checkpoints.
+- Clarified relay scheduling semantics in run-control metadata and startup logs:
+  - `relay`: `first_leg_chunk_then_finish`
+  - `resume`: `resume_to_target`
+- Changed `run.sh` default to low-disk mode ON; added `--no-low-disk` to disable it explicitly.
+
+### Fixed
+- Fixed relay direction drift risk by restoring saved planning `directions` on resume.
+- Fixed silent resume-with-different-config risk by adding strict config mismatch checks (fail-fast by default).
+- Fixed unsafe legacy resume path (in-progress state without `directions`) by blocking resume unless explicitly forced with `QUANTA_FORCE_RELAY_RESUME=1`.
+- Fixed false-resume behavior: `--resume` now fails fast when `evolution_state.json` is missing (no implicit round-0 restart).
+- Fixed BOB `--bob-metric auto` mixed-scale ranking by resolving one global metric before scoring all factors.
+- Fixed temporary file cleanup gap in `scripts/run_backtest_safe.sh` by installing cleanup trap before early-exit branches.
+- Fixed `scripts/preflight_check.py` relative config path resolution so `uv run preflight_check.py ... --config configs/*.yaml` works from both repo root and `scripts/` directory.
+
 ## 2026-02-25
 
 ### Added

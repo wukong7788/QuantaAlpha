@@ -53,6 +53,21 @@ class FactorLibraryManager:
         with open(self.library_path, "w", encoding="utf-8") as f:
             json.dump(self.data, f, ensure_ascii=False, indent=2, default=str)
 
+    @staticmethod
+    def _env_truthy(name: str, default: str = "false") -> bool:
+        return str(os.getenv(name, default)).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _safe_remove_result_h5(h5_file: Path) -> None:
+        """Remove result.h5 in low-disk mode after cache sync."""
+        if not h5_file.exists() or h5_file.name != "result.h5":
+            return
+        try:
+            h5_file.unlink()
+            logger.debug(f"Low disk mode: removed {h5_file}")
+        except Exception as e:
+            logger.debug(f"Low disk mode: failed to remove {h5_file}: {e}")
+
     def add_factors_from_experiment(
         self,
         experiment,
@@ -155,6 +170,10 @@ class FactorLibraryManager:
         """Sync factor values from result.h5 to MD5 cache dir (.pkl). Returns True on success."""
         cache_dir = Path(cache_dir or DEFAULT_FACTOR_CACHE_DIR)
         h5_file = Path(h5_path)
+        purge_h5 = FactorLibraryManager._env_truthy(
+            "QUANTA_LOW_DISK_PURGE_H5",
+            "true" if FactorLibraryManager._env_truthy("QUANTA_LOW_DISK_MODE", "false") else "false",
+        )
 
         if not h5_file.exists():
             return False
@@ -163,6 +182,8 @@ class FactorLibraryManager:
         pkl_file = cache_dir / f"{md5_key}.pkl"
 
         if pkl_file.exists():
+            if purge_h5:
+                FactorLibraryManager._safe_remove_result_h5(h5_file)
             return True
 
         try:
@@ -170,6 +191,8 @@ class FactorLibraryManager:
             result = pd.read_hdf(str(h5_file))
             result.to_pickle(pkl_file)
             logger.debug(f"Synced factor cache -> {pkl_file.name}")
+            if purge_h5:
+                FactorLibraryManager._safe_remove_result_h5(h5_file)
             return True
         except Exception as e:
             logger.debug(f"Sync factor cache failed [{h5_path}]: {e}")

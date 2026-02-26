@@ -79,6 +79,15 @@ class QlibFactorRunner(CachedRunner[QlibFactorExperiment]):
         Generate the experiment by processing and combining factor data,
         then passing the combined data to Docker or local environment for backtest results.
         """
+        low_disk_mode = str(os.getenv("QUANTA_LOW_DISK_MODE", "0")).lower() in ("1", "true", "yes", "on")
+        low_disk_float32 = str(
+            os.getenv("QUANTA_LOW_DISK_FLOAT32", "true" if low_disk_mode else "false")
+        ).lower() in ("1", "true", "yes", "on")
+        low_disk_purge_parquet = str(
+            os.getenv("QUANTA_LOW_DISK_PURGE_PARQUET", "true" if low_disk_mode else "false")
+        ).lower() in ("1", "true", "yes", "on")
+        parquet_compression = os.getenv("QUANTA_PARQUET_COMPRESSION", "zstd" if low_disk_mode else "snappy")
+        parquet_path = None
         
         if exp.based_experiments and exp.based_experiments[-1].result is None:
             exp.based_experiments[-1] = self.develop(exp.based_experiments[-1], use_local=use_local)
@@ -150,6 +159,11 @@ class QlibFactorRunner(CachedRunner[QlibFactorExperiment]):
             # Sort and nest the combined factors under 'feature'
             combined_factors = combined_factors.sort_index()
             combined_factors = combined_factors.loc[:, ~combined_factors.columns.duplicated(keep="last")]
+            if low_disk_float32:
+                try:
+                    combined_factors = combined_factors.astype("float32", copy=False)
+                except Exception as e:
+                    logger.warning(f"Failed to cast combined factors to float32: {e}")
             new_columns = pd.MultiIndex.from_product([["feature"], combined_factors.columns])
             combined_factors.columns = new_columns
             
@@ -157,7 +171,17 @@ class QlibFactorRunner(CachedRunner[QlibFactorExperiment]):
 
             # Save the combined factors to the workspace (parquet format for qlib compatibility)
             parquet_path = exp.experiment_workspace.workspace_path / "combined_factors_df.parquet"
-            combined_factors.to_parquet(parquet_path, engine="pyarrow")
+            try:
+                combined_factors.to_parquet(
+                    parquet_path,
+                    engine="pyarrow",
+                    compression=parquet_compression,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to save parquet with compression={parquet_compression}: {e}; fallback to default."
+                )
+                combined_factors.to_parquet(parquet_path, engine="pyarrow")
             logger.info(f"Saved combined factors to {parquet_path}")
 
 
@@ -185,6 +209,13 @@ class QlibFactorRunner(CachedRunner[QlibFactorExperiment]):
                 logger.info(f"Execution log: {result_tuple[1][:500]}...")
         
         exp.result = result
+
+        if low_disk_purge_parquet and parquet_path and parquet_path.exists():
+            try:
+                parquet_path.unlink()
+                logger.info(f"Low disk mode: removed temporary parquet {parquet_path}")
+            except Exception as e:
+                logger.warning(f"Low disk mode: failed to remove parquet {parquet_path}: {e}")
 
         return exp
 

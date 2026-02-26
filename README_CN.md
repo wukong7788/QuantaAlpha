@@ -193,7 +193,24 @@ FACTOR_CoSTEER_DATA_FOLDER_DEBUG=/your/custom/path/factor_source_data_debug
 
 # 示例：指定因子库后缀
 ./run.sh "微观结构因子" "exp_micro"
+
+# 示例：低磁盘模式（笔记本推荐）
+./run.sh --low-disk "价量因子挖掘" "exp_lowdisk"
+
+# 示例：真接力模式（重启后安全续跑）
+EXPERIMENT_ID="paper_repro_r2" ./run.sh --relay "价量因子挖掘" "paper_reproduction_r2"
+
+# 示例：严格续跑模式（必须已有接力状态）
+EXPERIMENT_ID="paper_repro_r2" ./run.sh --resume "价量因子挖掘" "paper_reproduction_r2"
 ```
+
+`run.sh` 现在默认开启 low-disk 模式。如需关闭，请显式加 `--no-low-disk`。
+
+命名安全提示（重要）：
+
+- 全新一轮实验时，`EXPERIMENT_ID` 与因子库后缀必须一起换（例如 `paper_repro_r2` + `paper_reproduction_r2`）。
+- 复用同一个 `EXPERIMENT_ID` 表示继续同一条 workspace/cache/log 轨迹。
+- 复用同一个后缀会继续写入同一个 `data/factorlib/all_factors_library_<suffix>.json`，可能混入历史因子。
 
 实验会自动挖掘、进化和验证 Alpha 因子，并将所有发现的因子保存到 `all_factors_library*.json`。
 
@@ -208,7 +225,51 @@ FACTOR_CoSTEER_DATA_FOLDER_DEBUG=/your/custom/path/factor_source_data_debug
 ./minirun.sh "微观结构因子"
 ```
 
-`minirun.sh` 使用 `configs/experiment_smoke.yaml`，默认 `STEP_N=3`（运行到 `factor_calculate`）。
+`minirun.sh` 使用 `configs/experiment_smoke.yaml`，默认 `STEP_N=5`（完整跑完一轮 5-step）。
+
+### 4.2 接力模式 `--relay`（独立入口）
+
+`--relay` 和 `--resume` 是两个独立模式（互斥），不是同一个模式的前后阶段。
+
+`--relay` 用于“分段接力”：
+
+- 首段按 `QUANTA_RELAY_CHUNK_ROUNDS`（默认 5）运行
+- 后续再次执行 `--relay` 会自动补齐到 `max_rounds`
+
+```bash
+# 首段接力（默认先跑 5 轮）
+EXPERIMENT_ID="paper_repro_r2" ./run.sh --relay "价量因子挖掘" "paper_reproduction_r2" 2>&1 | tee run_output_r2.log
+
+# 第二次接力（自动补齐到 max_rounds）
+EXPERIMENT_ID="paper_repro_r2" ./run.sh --relay "价量因子挖掘" "paper_reproduction_r2" 2>&1 | tee -a run_output_r2.log
+```
+
+### 4.3 续跑模式 `--resume`（独立入口）
+
+`--resume` 用于“严格从已有状态直接续到目标轮次”，不会使用接力分段策略。
+
+```bash
+EXPERIMENT_ID="paper_repro_r2" ./run.sh --resume "价量因子挖掘" "paper_reproduction_r2" 2>&1 | tee -a run_output_r2.log
+```
+
+规则：
+
+- 必须存在 `evolution_state.json`
+- 若状态文件缺失，会直接失败退出（不会从 round 0 静默新跑）
+
+### 4.4 防跑偏与可追溯保护
+
+- 将 planning 生成的 `directions` 持久化到 `evolution_state.json`，续跑优先恢复，避免方向漂移。
+- 续跑前校验“保存配置 vs 当前配置”，不一致默认直接失败退出。
+- 每完成一个演化任务就做一次 checkpoint，减少中断损失。
+- 日志会明确打印恢复来源：
+  - `Relay resume source: previous_experiment_id=..., state_saved_at_utc=..., previous_log_trace_path=...`
+
+强制续跑（仅紧急/人工确认场景）：
+
+```bash
+QUANTA_FORCE_RELAY_RESUME=1 EXPERIMENT_ID="paper_repro_r2" ./run.sh --relay "价量因子挖掘" "paper_reproduction_r2"
+```
 
 ### 5. 独立回测
 
@@ -265,6 +326,11 @@ python -m quantaalpha.backtest.run_backtest \
   --library data/factorlib/all_factors_library_paper_reproduction_ds.json \
   --max-factors all
 ```
+
+补充说明：
+
+- BOB 模式下 `--bob-metric auto` 现在会先为本次运行确定一个全局主指标，再统一排序（不再混用不同量纲）。
+- 脚本产生的临时文件会在正常退出和异常中断时都自动清理。
 
 说明：
 
