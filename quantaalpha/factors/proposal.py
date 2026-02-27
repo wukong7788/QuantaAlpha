@@ -15,9 +15,12 @@ import os
 import pandas as pd
 from quantaalpha.log import logger
 from quantaalpha.factors.regulator.factor_regulator import FactorRegulator
+from quantaalpha.core.exception import FactorEmptyError
 
-DEFAULT_HISTORY_LIMIT = 6
+DEFAULT_HISTORY_LIMIT = 4
 MIN_HISTORY_LIMIT = 1
+MAX_RETRY_SUMMARY_ITEMS = 3
+MAX_RETRY_BAD_EXAMPLE_CHARS = 180
 
 
 def render_hypothesis_and_feedback(prompt_dict, trace: Trace, history_limit: int = DEFAULT_HISTORY_LIMIT) -> str:
@@ -48,6 +51,30 @@ def is_input_length_error(error_msg: str) -> bool:
     ]
     error_str = str(error_msg).lower()
     return any(indicator.lower() in error_str for indicator in error_indicators)
+
+
+def build_retry_summary(retry_items: list[dict[str, str]]) -> str:
+    """Build compact retry feedback to avoid prompt bloat on repeated failures."""
+    if not retry_items:
+        return ""
+
+    recent_items = retry_items[-MAX_RETRY_SUMMARY_ITEMS:]
+    lines = []
+    for idx, item in enumerate(reversed(recent_items), 1):
+        bad_example = (item.get("bad_example") or "").strip()
+        if len(bad_example) > MAX_RETRY_BAD_EXAMPLE_CHARS:
+            bad_example = bad_example[:MAX_RETRY_BAD_EXAMPLE_CHARS] + "..."
+        lines.append(
+            f"{idx}. error_type={item.get('error_type', 'unknown')}; "
+            f"fix={item.get('fix_instruction', '')}; "
+            f"counter_example={bad_example}"
+        )
+
+    return (
+        "Recent failed attempts summary (latest first):\n"
+        + "\n".join(lines)
+        + "\nRegenerate strictly following the fixes above."
+    )
 
 
 QlibFactorHypothesis = Hypothesis
@@ -336,7 +363,14 @@ class EmptyHypothesisGen(FactorHypothesisGen):
 
 
 class AlphaAgentHypothesis2FactorExpression(FactorHypothesis2Experiment):
-    def __init__(self, *args, consistency_enabled: bool = False, **kwargs):
+    def __init__(
+        self,
+        *args,
+        consistency_enabled: bool = False,
+        max_construct_failures_per_branch: int = 2,
+        max_json_parse_failures_per_branch: int = 2,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         # Initialize FactorRegulator with config settings
         from quantaalpha.factors.coder.config import FACTOR_COSTEER_SETTINGS
@@ -344,6 +378,8 @@ class AlphaAgentHypothesis2FactorExpression(FactorHypothesis2Experiment):
             factor_zoo_path=FACTOR_COSTEER_SETTINGS.factor_zoo_path,
             duplication_threshold=FACTOR_COSTEER_SETTINGS.duplication_threshold
         )
+        self.max_construct_failures_per_branch = max(1, int(max_construct_failures_per_branch))
+        self.max_json_parse_failures_per_branch = max(1, int(max_json_parse_failures_per_branch))
         
         # Initialize consistency checker if enabled
         self.consistency_enabled = consistency_enabled
@@ -432,9 +468,42 @@ class AlphaAgentHypothesis2FactorExpression(FactorHypothesis2Experiment):
             )
         )
         
-        # Detect duplicated sub-expressions
+        # Detect duplicated sub-expressions and expression style violations.
         flag = False
         expression_duplication_prompt = None
+        retry_summary_items: list[dict[str, str]] = []
+        construct_failures = 0
+        json_parse_failures = 0
+
+        def _append_retry_feedback(
+            error_type: str,
+            fix_instruction: str,
+            bad_example: str,
+        ) -> None:
+            nonlocal expression_duplication_prompt, user_prompt
+            retry_summary_items.append(
+                {
+                    "error_type": error_type,
+                    "fix_instruction": fix_instruction,
+                    "bad_example": bad_example,
+                }
+            )
+            expression_duplication_prompt = build_retry_summary(retry_summary_items)
+
+            user_prompt = (
+                Environment(undefined=StrictUndefined)
+                .from_string(qa_prompt_dict["hypothesis2experiment"]["user_prompt"])
+                .render(
+                    targets=self.targets,
+                    target_hypothesis=context["target_hypothesis"],
+                    hypothesis_and_feedback=context["hypothesis_and_feedback"],
+                    function_lib_description=context["function_lib_description"],
+                    target_list=context["target_list"],
+                    RAG=context["RAG"],
+                    expression_duplication=expression_duplication_prompt,
+                )
+            )
+
         while True:
             if flag:
                 break
@@ -442,11 +511,20 @@ class AlphaAgentHypothesis2FactorExpression(FactorHypothesis2Experiment):
             resp = APIBackend().build_messages_and_create_chat_completion(user_prompt, system_prompt, json_mode=json_flag)
             try:
                 response_dict = robust_json_parse(resp)
+                json_parse_failures = 0
             except json.JSONDecodeError as e:
-                logger.warning(f"JSON parse failed: {e}, retrying...")
+                json_parse_failures += 1
+                logger.warning(
+                    f"JSON parse failed ({json_parse_failures}/{self.max_json_parse_failures_per_branch}): {e}, retrying..."
+                )
+                if json_parse_failures >= self.max_json_parse_failures_per_branch:
+                    raise FactorEmptyError(
+                        "construct_stop_loss: JSON parse failure budget exceeded"
+                    )
                 continue
             proposed_names = []
             proposed_exprs = []
+            retry_required = False
             
             for i, factor_name in enumerate(response_dict):
                 factor_data = response_dict.get(factor_name, {})
@@ -456,14 +534,35 @@ class AlphaAgentHypothesis2FactorExpression(FactorHypothesis2Experiment):
                 description = factor_data.get("description", "")
                 formulation = factor_data.get("formulation", "")
                 variables = factor_data.get("variables", {})
-                
+
+                style_ok, style_feedback = self.factor_regulator.validate_expression_style(expr)
+                if not style_ok:
+                    logger.warning(f"Expression style validation failed: {style_feedback}. expr={expr}")
+                    _append_retry_feedback(
+                        error_type="expression_style",
+                        fix_instruction=style_feedback,
+                        bad_example=expr,
+                    )
+                    retry_required = True
+                    break
+
                 # Check if expression is parsable
                 if not self.factor_regulator.is_parsable(expr):
                     logger.info(f"Failed to parse expr: {expr}, retrying...")
+                    _append_retry_feedback(
+                        error_type="syntax_error",
+                        fix_instruction=(
+                            "Expression parsing failed. Use only allowed functions, operators '+ - * /', "
+                            "and consistently '$'-prefixed base variables."
+                        ),
+                        bad_example=expr,
+                    )
+                    retry_required = True
                     break
                 
                 success, eval_dict = self.factor_regulator.evaluate(expr)
                 if not success:
+                    retry_required = True
                     break
                 
                 # Consistency check (if enabled)
@@ -484,13 +583,36 @@ class AlphaAgentHypothesis2FactorExpression(FactorHypothesis2Experiment):
                             expr = results["corrected_expression"]
                             factor_data["expression"] = expr
                             response_dict[factor_name] = factor_data
-                            
+
+                            style_ok, style_feedback = self.factor_regulator.validate_expression_style(expr)
+                            if not style_ok:
+                                logger.warning(
+                                    f"Corrected expression style validation failed: {style_feedback}. expr={expr}"
+                                )
+                                _append_retry_feedback(
+                                    error_type="expression_style",
+                                    fix_instruction=style_feedback,
+                                    bad_example=expr,
+                                )
+                                retry_required = True
+                                break
+
                             # Re-check corrected expression
                             if not self.factor_regulator.is_parsable(expr):
                                 logger.warning(f"Corrected expression could not be parsed: {expr}")
+                                _append_retry_feedback(
+                                    error_type="syntax_error",
+                                    fix_instruction=(
+                                        "Corrected expression is still unparsable. Use canonical operator form "
+                                        "and '$'-prefixed base variables only."
+                                    ),
+                                    bad_example=expr,
+                                )
+                                retry_required = True
                                 break
                             success, eval_dict = self.factor_regulator.evaluate(expr)
                             if not success:
+                                retry_required = True
                                 break
                         
                         if not passed:
@@ -500,56 +622,33 @@ class AlphaAgentHypothesis2FactorExpression(FactorHypothesis2Experiment):
                 
                 # If expression has problems, regenerate with feedback
                 if not self.factor_regulator.is_expression_acceptable(eval_dict):
-                    # Calculate ratios for feedback
-                    num_all_nodes = eval_dict['num_all_nodes']
-                    free_args_ratio = float(eval_dict['num_free_args']) / float(num_all_nodes) if num_all_nodes > 0 else 0.0
-                    unique_vars_ratio = float(eval_dict['num_unique_vars']) / float(num_all_nodes) if num_all_nodes > 0 else 0.0
-                    
                     # Get symbol length and base features count for complexity feedback
                     symbol_length = eval_dict.get('symbol_length', 0)
                     num_base_features = eval_dict.get('num_base_features', 0)
                     symbol_length_threshold = self.factor_regulator.symbol_length_threshold
                     base_features_threshold = self.factor_regulator.base_features_threshold
-                    
-                    feedback_item = (
-                            Environment(undefined=StrictUndefined)
-                            .from_string(qa_prompt_dict["expression_duplication"])
-                            .render(
-                                prev_expression=expr,
-                                duplicated_subtree_size=eval_dict['duplicated_subtree_size'],
-                            duplication_threshold=self.factor_regulator.duplication_threshold,
-                            duplicated_subtree=eval_dict.get('duplicated_subtree', ''),
-                            matched_alpha=eval_dict.get('matched_alpha', ''),
-                            free_args_ratio=free_args_ratio,
-                            num_free_args=eval_dict['num_free_args'],
-                            unique_vars_ratio=unique_vars_ratio,
-                            num_unique_vars=eval_dict['num_unique_vars'],
-                            num_all_nodes=num_all_nodes,
-                            symbol_length=symbol_length,
-                            symbol_length_threshold=symbol_length_threshold,
-                            num_base_features=num_base_features,
-                            base_features_threshold=base_features_threshold
-                            )
-                        )
-                    
-                    if expression_duplication_prompt is not None:
-                        expression_duplication_prompt = '\n\n'.join([expression_duplication_prompt, feedback_item])
-                    else:
-                        expression_duplication_prompt = feedback_item
-                    
-                    user_prompt = (
-                        Environment(undefined=StrictUndefined)
-                        .from_string(qa_prompt_dict["hypothesis2experiment"]["user_prompt"])
-                        .render(
-                            targets=self.targets,
-                            target_hypothesis=context["target_hypothesis"],
-                            hypothesis_and_feedback=context["hypothesis_and_feedback"],
-                            function_lib_description=context["function_lib_description"],
-                            target_list=context["target_list"],
-                            RAG=context["RAG"], 
-                            expression_duplication=expression_duplication_prompt
-                        )
+
+                    fix_instruction = (
+                        "Expression quality gate failed. Reduce duplicated subtree size, control free args ratio, "
+                        "and keep symbol/base-feature complexity within thresholds."
                     )
+                    if symbol_length > symbol_length_threshold:
+                        fix_instruction += f" symbol_length={symbol_length} exceeds threshold={symbol_length_threshold}."
+                    if num_base_features > base_features_threshold:
+                        fix_instruction += (
+                            f" base_features={num_base_features} exceeds threshold={base_features_threshold}."
+                        )
+                    if eval_dict["duplicated_subtree_size"] > self.factor_regulator.duplication_threshold:
+                        fix_instruction += (
+                            " duplicated subtree is too large relative to duplication threshold."
+                        )
+
+                    _append_retry_feedback(
+                        error_type="quality_gate",
+                        fix_instruction=fix_instruction,
+                        bad_example=expr,
+                    )
+                    retry_required = True
                     break
                 else:
                     proposed_names.append(factor_name)
@@ -558,13 +657,36 @@ class AlphaAgentHypothesis2FactorExpression(FactorHypothesis2Experiment):
                         flag = True
                     else:
                         continue
+
+            if not flag and not retry_required:
+                _append_retry_feedback(
+                    error_type="empty_or_invalid_output",
+                    fix_instruction=(
+                        "Returned JSON has no valid factor entries. "
+                        "Provide at least one factor with non-empty expression/description/formulation."
+                    ),
+                    bad_example=str(response_dict),
+                )
+                retry_required = True
+
+            if retry_required:
+                construct_failures += 1
+                logger.warning(
+                    "Construct failure budget usage: "
+                    f"{construct_failures}/{self.max_construct_failures_per_branch}"
+                )
+                if construct_failures >= self.max_construct_failures_per_branch:
+                    raise FactorEmptyError(
+                        "construct_stop_loss: construct failure budget exceeded"
+                    )
+            elif flag:
+                construct_failures = 0
         
 
         # Add valid factors to the factor regulator
         self.factor_regulator.add_factor(proposed_names, proposed_exprs)
-                
-                
-        return self.convert_response(resp, trace)
+
+        return self.convert_response(json.dumps(response_dict, ensure_ascii=False), trace)
     
 
     def convert_response(self, response: str, trace: Trace) -> FactorExperiment:

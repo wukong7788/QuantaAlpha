@@ -9,6 +9,7 @@ from quantaalpha.factors.coder.factor_ast import (
     calculate_symbol_length, count_base_features
 )
 from quantaalpha.factors.coder.expr_parser import parse_expression
+from quantaalpha.factors.regulator.expression_style import validate_expression_style as validate_expr_style
 
 class FactorRegulator(Evaluator):
     """
@@ -38,7 +39,7 @@ class FactorRegulator(Evaluator):
         self.symbol_length_threshold = symbol_length_threshold
         self.base_features_threshold = base_features_threshold
         self.new_factors = []
-        
+
     
         
     def is_parsable(self, expression: str) -> bool:
@@ -51,12 +52,20 @@ class FactorRegulator(Evaluator):
         Returns:
             bool: True if the expression can be parsed, False otherwise.
         """
+        if not isinstance(expression, str) or not expression.strip():
+            logger.warning("Failed to parse expression: empty or non-string expression")
+            return False
+
+        expression = expression.strip()
         try:
             parse_expression(expression)
             return True
         except Exception as e:
             logger.error(f"Failed to parse expression: {expression}. Error: {str(e)}")
             return False
+
+    def validate_expression_style(self, expression: str) -> Tuple[bool, str]:
+        return validate_expr_style(expression)
         
     def evaluate(self, expression: str) -> Tuple[int, str, Optional[str]]:
         """
@@ -71,6 +80,11 @@ class FactorRegulator(Evaluator):
                 - duplicated_subtree (str): The duplicated subtree expression
                 - matched_alpha (str or None): Name of the matched alpha if available
         """
+        if not isinstance(expression, str) or not expression.strip():
+            logger.error("Failed to evaluate expression: empty or non-string expression")
+            return False, None
+
+        expression = expression.strip()
         try:
             # Check for duplication
             duplicated_subtree_size, duplicated_subtree, matched_alpha = match_alphazoo(

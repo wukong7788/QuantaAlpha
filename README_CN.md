@@ -212,6 +212,33 @@ EXPERIMENT_ID="paper_repro_r2" ./run.sh --resume "价量因子挖掘" "paper_rep
 - 复用同一个 `EXPERIMENT_ID` 表示继续同一条 workspace/cache/log 轨迹。
 - 复用同一个后缀会继续写入同一个 `data/factorlib/all_factors_library_<suffix>.json`，可能混入历史因子。
 
+受控并行建议（8 核笔记本）：
+
+- 设为 `evolution.parallel_enabled: true`
+- 设为 `evolution.max_parallel_workers: 2`（稳定后可逐步调到 `3~4`）
+- 这样会限制每个 phase 的并发 worker，避免一次性拉起全部任务。
+- 设为 `evolution.max_empty_retries: 1`，限制空分支重试次数。
+
+预计算 cheap gate + 构造止损：
+
+- `quality_gate.cheap_filter_enabled: true`：在 calculate/backtest 前拦截静态不合格表达式。
+- `quality_gate.cheap_filter_require_acceptable: true`：仅保留 regulator 判定可接受的表达式。
+- `quality_gate.max_construct_failures_per_branch: 2`：限制分支连续构造失败预算。
+- `quality_gate.max_json_parse_failures_per_branch: 2`：限制分支 JSON 解析失败预算。
+
+LLM 运行时稳态（优化新增选项，不是原始基线默认项）：
+
+- `llm.json_mode_response_format: json_object`：在 `json_mode=true` 调用启用协议层 JSON 输出约束。
+- `llm.json_mode_json_schema: ""`：可按 provider 能力配置 JSON Schema 字符串。
+- `llm.json_mode_temperature: 0.0` 与 `llm.freeform_temperature: 0.5`：结构化调用与自由文本调用分层控温。
+- `llm.request_timeout_s: 60.0`、`llm.retry_backoff: exponential`、`llm.retry_jitter: true`、`llm.retry_max_wait_seconds: 30.0`：降低尾延迟与卡顿空耗。
+- `llm.failover_base_urls: []`：可选备用链路，在连续失败时切换 endpoint。
+
+跨轮次 exact 去重（只减重复计算，不放宽质量门）：
+
+- 在 `factor_calculate/factor_backtest` 前，若表达式在因子库或 trajectory 已出现则直接跳过。
+- 跳过原因写入 `skip_reason=duplicate_exact`，便于 doctor/报告统计。
+
 实验会自动挖掘、进化和验证 Alpha 因子，并将所有发现的因子保存到 `all_factors_library*.json`。
 
 ### 4.1 最小烟测（快速验证）
@@ -269,6 +296,35 @@ EXPERIMENT_ID="paper_repro_r2" ./run.sh --resume "价量因子挖掘" "paper_rep
 
 ```bash
 QUANTA_FORCE_RELAY_RESUME=1 EXPERIMENT_ID="paper_repro_r2" ./run.sh --relay "价量因子挖掘" "paper_reproduction_r2"
+```
+
+### 4.5 运行进度 Workflow（Codex）
+
+用这个 workflow 查看**当前** `run.sh` 进度：
+- 活跃进程（`run.sh` / `quantaalpha mine`）
+- 最新 phase / round / direction
+- 当前步骤（`factor_propose` 到 `feedback`）
+- 已产出因子（来自 `trajectory_pool.json`）
+- doctor 诊断摘要（报错信号 + 失败原因统计）
+
+受限/沙箱环境提示（含部分 Codex 运行时）：
+- 进程扫描可能因权限受限出现“未检测到活跃进程”的误报。
+- 若进度字段持续更新但进程状态显示未运行，请在宿主终端用 `ps` 复核。
+
+注意：这里的 `round` 指的是 **controller 的 phase-round**（每跑完一个 phase 才会 `round += 1`），不是“一个 epoch=original+mutation+crossover”。详细术语对齐见 `docs/PAPER_REPRODUCTION_GUIDE.md` 的“术语与层级”小节。
+
+```bash
+# 单次快照（自动识别最新日志根目录）
+./scripts/run_doctor.sh
+
+# 持续刷新查看
+./scripts/run_doctor.sh --watch 8
+
+# 一次性 doctor 报告
+./scripts/run_doctor.sh
+
+# 指定实验链路
+./scripts/run_doctor.sh --experiment-id paper_repro_r2
 ```
 
 ### 5. 独立回测

@@ -204,3 +204,58 @@ class LoopBase:
         max_loop = max(session.loop_trace.keys())
         logger.storage.truncate(time=session.loop_trace[max_loop][-1].end)
         return session
+
+
+def count_steps_done(session: "LoopBase") -> int:
+    """
+    Return total executed steps for a session.
+
+    LoopBase maintains:
+    - loop_idx: number of fully completed loops
+    - step_idx: index of the next step to execute within the current loop
+    """
+    try:
+        steps_per_loop = len(getattr(session, "steps", []) or [])
+    except Exception:
+        steps_per_loop = 0
+    if steps_per_loop <= 0:
+        return 0
+    try:
+        loop_idx = int(getattr(session, "loop_idx", 0) or 0)
+    except Exception:
+        loop_idx = 0
+    try:
+        step_idx = int(getattr(session, "step_idx", 0) or 0)
+    except Exception:
+        step_idx = 0
+    return max(0, loop_idx) * steps_per_loop + max(0, step_idx)
+
+
+def find_latest_session_snapshot(trace_path: str | Path) -> Path | None:
+    """
+    Find the latest workflow session snapshot under <trace_path>/__session__/**.
+
+    Returns:
+        Path to a pickle snapshot file, or None if no snapshot exists.
+    """
+    base = Path(trace_path) / "__session__"
+    if not base.exists() or not base.is_dir():
+        return None
+
+    best: Path | None = None
+    best_mtime = -1.0
+    for root, _dirs, files in os.walk(base):
+        for fn in files:
+            if fn.endswith(".txt"):
+                continue
+            fp = Path(root) / fn
+            try:
+                if not fp.is_file():
+                    continue
+                mtime = fp.stat().st_mtime
+            except Exception:
+                continue
+            if mtime > best_mtime:
+                best = fp
+                best_mtime = mtime
+    return best

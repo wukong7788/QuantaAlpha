@@ -99,6 +99,8 @@ function_lib_description: |-
   - **MIN(A, B)**: Minimum value between A and B.
   - **INV(A)**: Reciprocal (1/x) of each element in sequence A.
   - **FLOOR(A)**: Floor of each element in sequence A.
+  - Arithmetic style constraint: never use parser-internal forms `ADD/SUBTRACT/MULTIPLY/DIVIDE`; use operators `+`, `-`, `*`, `/` directly.
+  - Variable naming constraint: base fields must use `$` prefix consistently (for example `$volume`, never bare `volume`).
   
   ### **Conditional and Logical Functions**
   - **COUNT(C, n)**: Count of samples satisfying condition C in the past n periods. Here, C is a logical expression, e.g., `$close > $open`.
@@ -479,3 +481,9 @@ expression_duplication: |-
     - Target: Use at most {{ base_features_threshold }} distinct base features. Reusing the same feature multiple times is acceptable.
   {% endif %}
 
+expression_style_feedback: |-
+  - Proposed Expression: {{ prev_expression }}
+  - Expression Style Check Failed: {{ style_feedback }}
+  - Rewrite requirements:
+    - Use operators `+`, `-`, `*`, `/` (do NOT use `ADD/SUBTRACT/MULTIPLY/DIVIDE`).
+    - Use only `$`-prefixed base variables (`$open`, `$close`, `$high`, `$low`, `$volume`, `$return`).

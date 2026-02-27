@@ -427,10 +427,8 @@ function_lib_description: |-
   - **MAX(A, B)**: Pair-wise maximum value between A and B.
   - **MIN(A, B)**: Pair-wise minimum value between A and B.
   - **INV(A)**: Reciprocal (1/x) of each element in sequence A.
-  - **ADD(A, B)**: Add A and B element-wise.
-  - **SUBTRACT(A, B)**: Subtract B from A element-wise.
-  - **MULTIPLY(A, B)**: Multiply A and B element-wise.
-  - **DIVIDE(A, B)**: Divide A by B element-wise.
+  - Arithmetic style constraint: never use parser-internal forms `ADD/SUBTRACT/MULTIPLY/DIVIDE`; use operators `+`, `-`, `*`, `/` directly.
+  - Variable naming constraint: base fields must use `$` prefix consistently (for example `$volume`, never bare `volume`).
   - **AND(A, B)**: Logical AND operation between A and B.
   - **OR(A, B)**: Logical OR operation between A and B.
 
@@ -453,4 +451,3 @@ function_lib_description: |-
   - **BB_MIDDLE(A, n)**: Middle Bollinger Band, calculated as the n-period simple moving average of sequence A.
   - **BB_UPPER(A, n)**: Upper Bollinger Band, calculated as middle band plus two standard deviations of sequence A over n periods.
   - **BB_LOWER(A, n)**: Lower Bollinger Band, calculated as middle band minus two standard deviations of sequence A over n periods.
-

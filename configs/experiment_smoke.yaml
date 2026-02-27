@@ -23,6 +23,8 @@ evolution:
   crossover_size: 2
   crossover_n: 1
   parallel_enabled: false
+  max_parallel_workers: 2
+  max_empty_retries: 1
   prefer_diverse_crossover: false
   parent_selection_strategy: best
   top_percent_threshold: 0.3
@@ -35,6 +37,10 @@ quality_gate:
   redundancy_enabled: true
   consistency_strict_mode: false
   max_correction_attempts: 1
+  cheap_filter_enabled: true
+  cheap_filter_require_acceptable: true
+  max_construct_failures_per_branch: 2
+  max_json_parse_failures_per_branch: 2
 
 factor:
   factors_per_hypothesis: 1
@@ -54,10 +60,21 @@ backtest:
     config_name: conf_baseline.yaml
 
 llm:
+  # [Optimization Added, not original baseline defaults]
+  # Keep smoke and main config semantics aligned.
   factor_mining_timeout: 999999
   max_retries: 3
   retry_delay: 1.0
   json_mode_strict: true
+  json_mode_temperature: 0.0
+  freeform_temperature: 0.5
+  json_mode_response_format: json_object
+  json_mode_json_schema: ""
+  request_timeout_s: 60.0
+  retry_backoff: exponential
+  retry_jitter: true
+  retry_max_wait_seconds: 30.0
+  failover_base_urls: []
 
 logging:
   level: INFO

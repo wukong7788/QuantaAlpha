@@ -74,6 +74,13 @@ evolution:
   # false: tasks run sequentially
   parallel_enabled: false
 
+  # Maximum workers when parallel_enabled=true (null means no cap and may start all tasks at once)
+  # Recommended on 8-core laptop: 2~4
+  max_parallel_workers: 2
+
+  # Retry budget when a branch produces zero valid factors
+  max_empty_retries: 1
+
   # Prefer diverse crossover combinations (different directions/phases) vs random parent selection
   prefer_diverse_crossover: true
 
@@ -118,6 +125,14 @@ quality_gate:
   # Max correction attempts when inconsistency is found
   max_correction_attempts: 3
 
+  # Cheap static filter before calculate/backtest (style/parse/quality checks)
+  cheap_filter_enabled: true
+  cheap_filter_require_acceptable: true
+
+  # Stop-loss budgets in construct stage per branch
+  max_construct_failures_per_branch: 2
+  max_json_parse_failures_per_branch: 2
+
 
 # ============================================================
 # FACTOR GENERATION CONFIGURATION
@@ -156,10 +171,23 @@ backtest:
 # Controls LLM API behavior
 # ============================================================
 llm:
+  # [Optimization Added, not original baseline defaults]
+  # Notes:
+  # - These options are introduced for second-round performance optimization.
+  # - They are optional runtime controls and can be turned off/adjusted for strict baseline reproduction.
   factor_mining_timeout: 999999
   max_retries: 3
   retry_delay: 1.0
   json_mode_strict: true
+  json_mode_temperature: 0.0
+  freeform_temperature: 0.5
+  json_mode_response_format: json_object
+  json_mode_json_schema: ""
+  request_timeout_s: 60.0
+  retry_backoff: exponential
+  retry_jitter: true
+  retry_max_wait_seconds: 30.0
+  failover_base_urls: []
 
 
 # ============================================================

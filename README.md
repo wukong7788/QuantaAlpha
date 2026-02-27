@@ -222,6 +222,33 @@ Naming safety (important):
 - Reusing `EXPERIMENT_ID` means you continue the same workspace/cache/log lineage.
 - Reusing library suffix writes to the same `data/factorlib/all_factors_library_<suffix>.json`, which can mix with old factors.
 
+Controlled parallelism (recommended on 8-core laptop):
+
+- Set `evolution.parallel_enabled: true`
+- Set `evolution.max_parallel_workers: 2` (then tune to `3~4` after stability check)
+- This caps per-phase workers and avoids launching all evolution tasks at once.
+- Set `evolution.max_empty_retries: 1` to limit empty-branch retries.
+
+Pre-calc cheap gate + construct stop-loss:
+
+- `quality_gate.cheap_filter_enabled: true` rejects invalid expressions before calculate/backtest.
+- `quality_gate.cheap_filter_require_acceptable: true` keeps only regulator-acceptable expressions.
+- `quality_gate.max_construct_failures_per_branch: 2` caps repeated construct failures.
+- `quality_gate.max_json_parse_failures_per_branch: 2` caps repeated JSON parse failures in construct.
+
+LLM runtime hardening (optimization-added options, not original baseline defaults):
+
+- `llm.json_mode_response_format: json_object` enables protocol-level JSON output in `json_mode=true`.
+- `llm.json_mode_json_schema: ""` can be set to a JSON Schema string when provider supports schema mode.
+- `llm.json_mode_temperature: 0.0` and `llm.freeform_temperature: 0.5` split temperature by structured vs freeform calls.
+- `llm.request_timeout_s: 60.0`, `llm.retry_backoff: exponential`, `llm.retry_jitter: true`, `llm.retry_max_wait_seconds: 30.0` stabilize tail latency.
+- `llm.failover_base_urls: []` enables optional endpoint failover for consecutive failures.
+
+Cross-round exact dedup (compute-saving, no quality gate relaxation):
+
+- Before `factor_calculate/factor_backtest`, repeated expressions are skipped by library + trajectory seen set.
+- Skip reason is recorded as `skip_reason=duplicate_exact` for doctor/report diagnostics.
+
 The experiment will automatically mine, evolve, and validate alpha factors, and save all discovered factors to `all_factors_library*.json`.
 
 ### 4.1 Minimal Smoke Run (Fast Validation)
@@ -279,6 +306,33 @@ Force override (only for emergency/manual recovery):
 
 ```bash
 QUANTA_FORCE_RELAY_RESUME=1 EXPERIMENT_ID="paper_repro_r2" ./run.sh --relay "Price-Volume Factor Mining" "paper_reproduction_r2"
+```
+
+### 4.5 Run Progress Workflow (Codex)
+
+Use this workflow to inspect the **current** `run.sh` progress:
+- active process (`run.sh` / `quantaalpha mine`)
+- latest phase/round/direction
+- current step (`factor_propose` ... `feedback`)
+- generated factors from `trajectory_pool.json`
+- doctor diagnostics (error signals + failed decision reasons)
+
+Note on restricted/sandboxed environments (including some Codex runtimes):
+- process scan may be permission-limited and show a false negative for active processes.
+- if progress fields continue updating but process status shows inactive, verify with a direct terminal `ps` check in your host shell.
+
+```bash
+# one-shot snapshot (auto-detect latest log root)
+./scripts/run_doctor.sh
+
+# continuous watch
+./scripts/run_doctor.sh --watch 8
+
+# one-shot doctor report
+./scripts/run_doctor.sh
+
+# bind to one experiment lineage explicitly
+./scripts/run_doctor.sh --experiment-id paper_repro_r2
 ```
 
 ### 5. Independent Backtesting

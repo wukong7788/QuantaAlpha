@@ -20,6 +20,17 @@ Core code paths:
 - Backtest: `quantaalpha/backtest/`
 - Web UI: `frontend-v2/`
 
+## Terminology (Round/Direction/Task/Step)
+
+These terms are easy to mix up during paper reproduction and performance optimization. Use this hierarchy:
+
+1. Experiment: one `run.sh` execution (bound to an `EXPERIMENT_ID`).
+2. Direction: one planned exploration direction text (count = `planning.num_directions`).
+3. Round + Phase: controller **phase-round** (round increments after finishing one phase), not “epoch=original+mutation+crossover”.
+4. Task: one branch task identified by `(phase, round_idx, direction_id)` and stored under `{phase}_{round}_{direction}` log dir.
+5. Step: the fixed 5-step loop inside a task: `factor_propose -> factor_construct -> factor_calculate -> factor_backtest -> feedback`.
+6. Attempt: empty-factor retry count for a task (count = `evolution.max_empty_retries` + 1 attempts total).
+
 ## Specs Sync Policy
 
 - Contract/spec source: `SPECS.md` (project behavior contract, not just notes).
@@ -37,9 +48,22 @@ Core code paths:
   - Run a keyword grep for changed flags/terms (e.g. `--relay`, `--resume`, `BOB`, `low-disk`) to catch stale wording.
   - If intentionally skipping doc updates, explicitly state why (internal-only change) in the final summary.
 
+## Agent Execution Principles
+
+- Do not add compatibility aliases by default. Avoid duplicated entry scripts/docs that create long-term confusion.
+- Prefer one canonical entrypoint and one canonical documentation path for each workflow.
+- Use first-principles reasoning: keep the simplest structure that satisfies the real user goal.
+- If requirements are ambiguous, ask the user for clarification before implementing structural changes.
+- If the user is brainstorming or "just want to discuss options", provide a concrete proposal first and do not start modifying code/files until the user explicitly asks to implement.
+
 ## Local Runtime (current)
 
 Use `uv + .venv` (no conda required).
+
+Environment policy:
+- Use `uv` as the primary environment/package manager.
+- Prefer the project-local interpreter and tools under `./.venv` first.
+- Avoid system/global Python or mixed environments unless explicitly requested.
 
 ### Setup
 
@@ -75,7 +99,9 @@ Scope: human-facing entry scripts used in day-to-day operation.
 2. Run `./run.sh "方向" "suffix"` (low-disk is ON by default; optional flags: `--no-low-disk`, `--relay`, `--resume`).
 3. Check printed `EXPERIMENT_ID`, `WORKSPACE_PATH`, and log output.
 4. Relay/resume semantics (`--relay` and `--resume` are mutually exclusive): first relay leg uses chunk (`QUANTA_RELAY_CHUNK_ROUNDS`, default 5), later leg auto-finishes to `max_rounds`; `--resume` requires existing `evolution_state.json` and fails fast if missing.
-5. Naming safety: for a new run, change both `EXPERIMENT_ID` and library suffix together; reusing suffix appends/overwrites in the same `all_factors_library_<suffix>.json`.
+5. Round terminology: `evolution.max_rounds` uses **phase-round** (each phase completion increments `round`), not “epoch=original+mutation+crossover”.
+6. Fine-grained resume: on restart via `--relay/--resume`, each task directory will resume from the latest `__session__` snapshot and continue from the next unfinished step (within the 5-step loop). If the task enters an “empty-factor retry attempt”, it will re-run fresh (not resume the previous attempt).
+7. Naming safety: for a new run, change both `EXPERIMENT_ID` and library suffix together; reusing suffix appends/overwrites in the same `all_factors_library_<suffix>.json`.
 
 ### 2) Smoke pipeline: `minirun.sh`
 
@@ -112,6 +138,14 @@ Scope: human-facing entry scripts used in day-to-day operation.
 3. Script compares existing `*_backtest_metrics.json` directly (no recompute).
 4. Check built-in overwrite risk warning (`legacy` vs `timestamped` naming).
 
+### 7) Run progress doctor (terminal entry): `scripts/run_doctor.sh`
+
+1. Run `./scripts/run_doctor.sh` for one-shot snapshot (auto-detect latest run log).
+2. Run `./scripts/run_doctor.sh --watch 8` for live refresh.
+3. Run `./scripts/run_doctor.sh` for one-shot progress + log diagnostics Markdown report.
+4. Use `./scripts/run_doctor.sh --experiment-id <id>` to bind to one experiment lineage.
+5. Output includes active process, phase/round/direction, current step, generated factor summary, and doctor diagnostics.
+
 ## Environment Variables That Matter
 
 From root `.env`:
@@ -147,6 +181,7 @@ Qlib data path must contain:
 - Log root: `log/<timestamp>/`
 - Session snapshots: `log/<timestamp>/__session__/...`
 - Snapshots are pickle by default.
+- `__session__` snapshots are used for task-level step resume in relay/resume mode (continue from the next unfinished step after a restart).
 - If `SESSION_DUMP_TXT=true`, `.txt` summaries are also written next to snapshot files.
 - Timestamp default is Asia/Shanghai unless `LOG_TRACE_PATH` is explicitly set.
 

@@ -28,17 +28,65 @@
       enabled: true
       num_directions: 10   # 从默认的 2 改为论文标准 10
     ```
-2.  **演化回合数补全（5个 Epoch 合计 11 轮）**：
+2.  **演化回合数补全（phase-round 合计 11 轮：1 original + 5 mutation + 5 crossover）**：
     找到 `evolution` 配置区，将最大回合次数提高：
     ```yaml
     evolution:
       enabled: true
       mutation_enabled: true
       crossover_enabled: true
-      max_rounds: 11       # 从默认的 3 改为论文标准 11（首发 1 轮 + 5x交替的突变/交叉=10）
+      max_rounds: 11       # 从默认的 3 改为论文标准 11（注意：这里的 round 是 phase-round，不是 epoch）
+    ```
+3.  **受控并行（避免一次性拉满机器）**：
+    ```yaml
+    evolution:
+      parallel_enabled: true
+      max_parallel_workers: 2   # 8 核机器建议从 2 起步，稳定后再升到 3~4
+      max_empty_retries: 1
+    quality_gate:
+      cheap_filter_enabled: true
+      max_construct_failures_per_branch: 2
+      max_json_parse_failures_per_branch: 2
     ```
 
 > *注意：其它默认配置如基于 Alpha158 模板生成的因子过滤规则、测试回合数据集划分（2016-2020 训练，2021 验证），以及独立回测阶段配置（2022-2025 样本外测试）等均不需要变动。*
+
+### 2.0 术语与层级（强烈建议先对齐这段）
+
+QuantaAlpha 的演化流程中，“round/direction/task/step”很容易混淆。以下是**层级、顺序、数量**（以当前默认复现配置为例：`planning.num_directions=10`, `evolution.max_rounds=11`, `steps_per_loop=5`, `evolution.crossover_n=10`, `evolution.max_empty_retries=1`）：
+
+1. **Experiment（一次实验）**
+   - 你启动一次 `./run.sh ...`（绑定一个 `EXPERIMENT_ID`）就是 1 个 experiment。
+
+2. **Direction（探索方向）**
+   - 数量：`planning.num_directions=10`
+   - 含义：planning 生成的 10 条“研究方向文本”（主要驱动 original/mutation 的提示）。
+
+3. **Round + Phase（演化轮次与阶段）**
+   - `evolution.max_rounds=11` 的 `round_idx` 取值 `0..10`。
+   - 重要：这里的 **round 是 controller 的 phase-round**，即每跑完一个 phase（original/mutation/crossover）才会 `round += 1`，并不是“一个 epoch=original+mutation+crossover”。
+   - 当 `mutation_enabled=true && crossover_enabled=true` 时，phase 顺序通常是：
+     - `round 0 = original`
+     - `round 1 = mutation`
+     - `round 2 = crossover`
+     - `round 3 = mutation`
+     - `round 4 = crossover`
+     - ...交替直到 `round 10`
+   - 因此 11 个 round 通常对应：`1 次 original + 5 次 mutation + 5 次 crossover`。
+
+4. **Task（一个分支任务）**
+   - task 的标识是 `(phase, round_idx, direction_id)`，日志目录名是：`{phase}_{round:02d}_{direction_id:02d}`（例：`crossover_06_03`）。
+   - 数量（典型值）：
+     - `original`：每个 direction 1 个 task，通常是 `10`。
+     - `mutation`：每个“父轨迹”1 个 task，第一次 mutation 通常也是 `≈10`（后续取决于上一轮产出轨迹数）。
+     - `crossover`：由 `evolution.crossover_n` 控制，通常是 `≤10`（候选不足会更少）。
+
+5. **Step（task 内固定 5 步）**
+   - 顺序固定：`factor_propose -> factor_construct -> factor_calculate -> factor_backtest -> feedback`
+
+6. **Attempt（空因子重试，task 的子层级）**
+   - 若某个 task 产出 `factor_count=0`，会触发空分支重试。
+   - `evolution.max_empty_retries=1` 表示每个 task 最多跑 `2` 次 attempt（第一次 + 1 次重试）。
 
 ### 2.1 建议：先做配置预检（仅告警，不阻断）
 
@@ -53,6 +101,30 @@ python scripts/preflight_check.py experiment --config configs/experiment.yaml
 - `evolution.crossover_n` 过低导致分支快速塌缩
 - `factor.*` 段落与主流程接线不一致（仅提示，不改行为）
 - `quality_gate` 中部分开关当前未完整透传（仅提示）
+
+### 2.2 第二轮优化新增配置（可选，非论文原始基线默认）
+
+如果你的目标是“提速且不降质量”，可开启以下 `llm.*` 运行时选项（均已在 `configs/experiment.yaml` 提供）：
+
+```yaml
+llm:
+  # [Optimization Added, not original baseline defaults]
+  json_mode_temperature: 0.0
+  freeform_temperature: 0.5
+  json_mode_response_format: json_object
+  json_mode_json_schema: ""
+  request_timeout_s: 60.0
+  retry_backoff: exponential
+  retry_jitter: true
+  retry_max_wait_seconds: 30.0
+  failover_base_urls: []
+```
+
+说明：
+
+- 这些选项用于降低 JSON 解析失败与网络尾延迟，不改变因子质量门定义。
+- 若需严格贴近“原始基线设置”，可将这些新增选项回退到默认逻辑或关闭。
+- 当前版本还增加了跨轮次 exact 去重：`factor_calculate/factor_backtest` 前若命中历史已见表达式，会标记 `skip_reason=duplicate_exact` 并跳过重复计算。
 
 ---
 
@@ -70,6 +142,21 @@ EXPERIMENT_ID="paper_repro_r2" ./run.sh --relay "Price-Volume Factor Mining" "pa
 *   **第二个参数 (`"paper_reproduction_r2"`)**: 自定义后缀。这会使得最终融合产生的优秀因子池命名为 `all_factors_library_paper_reproduction_r2.json` 以便留存。
 *   **low-disk 默认开启**：当前 `run.sh` 默认启用 low-disk；若你要关闭可加 `--no-low-disk`。
 *   **命名安全（避免覆盖/混库）**：新一轮实验请同时更换 `EXPERIMENT_ID` 与后缀；复用后缀会写入同一个因子库 JSON，可能混入历史因子。
+
+### 3.1 运行中进度查看（Codex Workflow）
+
+```bash
+# 单次快照
+./scripts/run_doctor.sh --experiment-id paper_repro_r2
+
+# 持续刷新
+./scripts/run_doctor.sh --experiment-id paper_repro_r2 --watch 8
+
+# 单次 doctor 诊断报告（进度 + 报错汇总）
+./scripts/run_doctor.sh --experiment-id paper_repro_r2
+```
+
+该 workflow 会读取 `evolution_state.json`、`trajectory_pool.json`、任务 `__session__` 快照，以及执行日志 pickle 事件，汇总当前轮次/步骤、已产出因子与报错诊断信息。
 
 ---
 
@@ -106,6 +193,19 @@ EXPERIMENT_ID="paper_repro_r2" ./run.sh --resume "Price-Volume Factor Mining" "p
 
 - 必须存在 `evolution_state.json`
 - 若状态文件不存在，会**直接失败退出**（不会从 round 0 隐式新开）
+
+补充：**task 内细粒度续跑（step 级）**
+
+- 从当前版本开始，`--resume/--relay` 在进入某个 task 时，会优先读取该 task 日志目录下最新的 `__session__` pickle 快照，并从未完成的 step 继续执行。
+- 粒度是“step 完成后落盘”。如果中断发生在某个 step 的执行中（例如 `factor_backtest` 过程中被杀掉），续跑会从该 step 重新执行（但不会重跑更早的已完成 step）。
+
+建议：**为了复现稳定性，尽量在“非 LLM 阶段”暂停**
+
+- 5-step 顺序是：`factor_propose(LLM) -> factor_construct(LLM) -> factor_calculate -> factor_backtest -> feedback(LLM)`
+- 如果你的目标是“已生成的因子表达式不漂移”（复现更稳定）：
+  - 建议在 `factor_calculate` 或 `factor_backtest` 阶段暂停/中断（此时表达式已由 construct 决定，续跑不需要重新生成表达式）。
+- 如果你的目标是“后续演化路径也尽量不漂移”（下一轮生成也更一致）：
+  - 更严格地建议在 `feedback` 完成之后再暂停（否则续跑可能会重新跑一次 LLM feedback，影响下一轮候选生成）。
 
 ### 4.3 防跑偏保护（两种模式共用）
 

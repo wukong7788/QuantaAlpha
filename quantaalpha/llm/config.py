@@ -14,7 +14,10 @@ from quantaalpha.core.conf import ExtendedBaseSettings
 class LLMSettings(ExtendedBaseSettings):
     log_llm_chat_content: bool = True
     max_retry: int = 30
-    retry_wait_seconds: int = 15
+    retry_wait_seconds: float = 15.0
+    retry_backoff: str = "fixed"  # fixed | exponential
+    retry_jitter: bool = False
+    retry_max_wait_seconds: float = 60.0
     dump_chat_cache: bool = False
     use_chat_cache: bool = False
     dump_embedding_cache: bool = False
@@ -32,6 +35,11 @@ class LLMSettings(ExtendedBaseSettings):
     reasoning_model: str = ""
     chat_max_tokens: int = 3000
     chat_temperature: float = 0.5
+    freeform_temperature: float | None = None
+    json_mode_temperature: float = 0.0
+    json_mode_strict: bool = True
+    json_mode_response_format: str = "json_object"  # none | json_object | json_schema
+    json_mode_json_schema: str = ""  # JSON string when json_mode_response_format=json_schema
     chat_stream: bool = True
     chat_seed: int | None = None
     chat_frequency_penalty: float = 0.0
@@ -47,6 +55,8 @@ class LLMSettings(ExtendedBaseSettings):
     embedding_batch_wait_seconds: float = 2.0
     embedding_api_key: str = ""
     embedding_base_url: str = ""
+    request_timeout_s: float = 60.0
+    failover_base_urls: str | list[str] = ""
 
     # Azure (optional)
     use_azure: bool = False

@@ -348,6 +348,7 @@ class APIBackend:
         use_embedding_cache: bool | None = None,
         dump_embedding_cache: bool | None = None,
     ) -> None:
+        self.request_timeout_s = float(getattr(LLM_SETTINGS, "request_timeout_s", 60.0) or 60.0)
         if LLM_SETTINGS.use_llama2:
             self.generator = Llama.build(
                 ckpt_dir=LLM_SETTINGS.llama2_ckpt_dir,
@@ -487,8 +488,16 @@ class APIBackend:
                         azure_endpoint=self.embedding_api_base,
                     )
             else:
-                self.chat_client = openai.OpenAI(api_key=self.chat_api_key, base_url=self.base_url)
-                self.embedding_client = openai.OpenAI(api_key=self.embedding_api_key, base_url=self.embedding_base_url)
+                self.chat_client = openai.OpenAI(
+                    api_key=self.chat_api_key,
+                    base_url=self.base_url,
+                    timeout=self.request_timeout_s,
+                )
+                self.embedding_client = openai.OpenAI(
+                    api_key=self.embedding_api_key,
+                    base_url=self.embedding_base_url,
+                    timeout=self.request_timeout_s,
+                )
 
         self.dump_chat_cache = LLM_SETTINGS.dump_chat_cache if dump_chat_cache is None else dump_chat_cache
         self.use_chat_cache = LLM_SETTINGS.use_chat_cache if use_chat_cache is None else use_chat_cache
@@ -506,6 +515,120 @@ class APIBackend:
         self.use_llama2 = LLM_SETTINGS.use_llama2
         self.use_gcr_endpoint = LLM_SETTINGS.use_gcr_endpoint
         self.retry_wait_seconds = LLM_SETTINGS.retry_wait_seconds
+        self.retry_backoff = str(getattr(LLM_SETTINGS, "retry_backoff", "fixed") or "fixed").strip().lower()
+        self.retry_jitter = bool(getattr(LLM_SETTINGS, "retry_jitter", False))
+        self.retry_max_wait_seconds = float(getattr(LLM_SETTINGS, "retry_max_wait_seconds", 60.0) or 60.0)
+
+        self._chat_base_url_chain = self._build_chat_base_url_chain()
+        self._active_chat_base_url_idx = 0
+
+    @staticmethod
+    def _parse_base_url_list(raw_value: Any) -> list[str]:
+        if raw_value is None:
+            return []
+        if isinstance(raw_value, list):
+            return [str(x).strip() for x in raw_value if str(x).strip()]
+        text = str(raw_value).strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    return [str(x).strip() for x in parsed if str(x).strip()]
+            except Exception:
+                pass
+        return [x.strip() for x in text.split(",") if x.strip()]
+
+    def _build_chat_base_url_chain(self) -> list[str]:
+        # Only OpenAI(base_url) mode supports failover switching here.
+        if getattr(self, "use_azure", False) or self.use_llama2 or self.use_gcr_endpoint:
+            return []
+
+        chain: list[str] = []
+        primary = str(getattr(self, "base_url", "") or "").strip()
+        if primary:
+            chain.append(primary)
+
+        failover_raw = getattr(LLM_SETTINGS, "failover_base_urls", "")
+        for url in self._parse_base_url_list(failover_raw):
+            if url and url not in chain:
+                chain.append(url)
+        return chain
+
+    def _switch_next_chat_base_url(self, reason: str) -> bool:
+        chain = getattr(self, "_chat_base_url_chain", [])
+        if len(chain) <= 1:
+            return False
+
+        current_idx = int(getattr(self, "_active_chat_base_url_idx", 0) or 0)
+        next_idx = (current_idx + 1) % len(chain)
+        if next_idx == current_idx:
+            return False
+
+        next_base_url = chain[next_idx]
+        try:
+            self.chat_client = openai.OpenAI(
+                api_key=self.chat_api_key,
+                base_url=next_base_url,
+                timeout=self.request_timeout_s,
+            )
+        except Exception as switch_err:  # noqa: BLE001
+            logger.warning(
+                json.dumps(
+                    {
+                        "event": "llm_transport",
+                        "issue": "failover_switch_failed",
+                        "reason": reason,
+                        "target_base_url": next_base_url,
+                        "error": str(switch_err),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return False
+
+        self._active_chat_base_url_idx = next_idx
+        self.base_url = next_base_url
+        logger.warning(
+            json.dumps(
+                {
+                    "event": "llm_transport",
+                    "issue": "failover_switched",
+                    "reason": reason,
+                    "active_base_url": next_base_url,
+                    "index": next_idx,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return True
+
+    def _compute_retry_sleep_seconds(self, attempt_index: int) -> float:
+        # attempt_index starts from 0 on first retry.
+        base = float(getattr(self, "retry_wait_seconds", LLM_SETTINGS.retry_wait_seconds) or 0.0)
+        mode = str(getattr(self, "retry_backoff", "fixed") or "fixed").strip().lower()
+        max_wait = float(getattr(self, "retry_max_wait_seconds", 60.0) or 60.0)
+
+        if mode == "exponential":
+            delay = min(max_wait, base * (2 ** max(0, attempt_index)))
+        else:
+            delay = base
+
+        if bool(getattr(self, "retry_jitter", False)) and delay > 0:
+            delay = random.uniform(delay * 0.5, delay * 1.5)
+        return max(0.0, delay)
+
+    @staticmethod
+    def _should_failover_on_exception(err: Exception) -> bool:
+        """Only transport-like failures should trigger endpoint failover."""
+        transport_types: list[type] = []
+        for type_name in ("APIConnectionError", "APITimeoutError", "RateLimitError", "InternalServerError"):
+            err_type = getattr(openai, type_name, None)
+            if isinstance(err_type, type):
+                transport_types.append(err_type)
+        transport_tuple = tuple(transport_types) + (TimeoutError, ConnectionError, OSError)
+        return isinstance(err, transport_tuple)
 
     def _get_encoder(self):
         """
@@ -638,6 +761,89 @@ class APIBackend:
             return response + new_response
         return response
 
+    def _expect_json_response(self, kwargs: dict[str, Any]) -> bool:
+        """Whether current call expects JSON-compatible output."""
+        return bool(kwargs.get("json_mode"))
+
+    def _log_json_issue(self, issue: str, stage: str, **extra: Any) -> None:
+        payload = {
+            "event": "llm_json_response_issue",
+            "issue": issue,
+            "stage": stage,
+        }
+        payload.update(extra)
+        try:
+            logger.warning(json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            logger.warning(f"{issue} at {stage}: {extra}")
+
+    def _retry_json_only_once(self, kwargs: dict[str, Any], attempt_idx: int) -> str | None:
+        """One immediate follow-up retry forcing strict JSON-only output."""
+        messages = kwargs.get("messages")
+        if not isinstance(messages, list) or len(messages) == 0:
+            self._log_json_issue("json_only_retry_skipped", "followup", reason="missing_messages")
+            return None
+
+        retry_messages = deepcopy(messages)
+        retry_messages.append(
+            {
+                "role": "user",
+                "content": "Return exactly one valid JSON object only. No markdown, no explanation, no code fence.",
+            }
+        )
+
+        retry_kwargs = dict(kwargs)
+        retry_kwargs["messages"] = retry_messages
+        retry_kwargs["add_json_in_prompt"] = True
+        if retry_kwargs.get("seed") is None and LLM_SETTINGS.use_auto_chat_cache_seed_gen:
+            retry_kwargs["seed"] = LLM_CACHE_SEED_GEN.get_next_seed()
+
+        try:
+            retry_resp = self._create_chat_completion_auto_continue(**retry_kwargs)
+        except Exception as retry_err:  # noqa: BLE001
+            self._log_json_issue(
+                "json_only_retry_exception",
+                "followup",
+                attempt=attempt_idx,
+                error=str(retry_err),
+            )
+            return None
+
+        retry_text = (retry_resp or "").strip()
+        if not retry_text:
+            self._log_json_issue(
+                "json_only_retry_empty",
+                "followup",
+                attempt=attempt_idx,
+            )
+            return None
+
+        try:
+            robust_json_parse(retry_text)
+        except json.JSONDecodeError as retry_parse_err:
+            self._log_json_issue(
+                "json_only_retry_parse_failed",
+                "followup",
+                attempt=attempt_idx,
+                error=str(retry_parse_err),
+                response_length=len(retry_text),
+            )
+            return None
+
+        logger.info(
+            json.dumps(
+                {
+                    "event": "llm_json_response_issue",
+                    "issue": "json_only_retry_success",
+                    "stage": "followup",
+                    "attempt": attempt_idx,
+                    "response_length": len(retry_text),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return retry_text
+
     def _try_create_chat_completion_or_embedding(
         self,
         max_retry: int = 10,
@@ -654,7 +860,30 @@ class APIBackend:
                 if embedding:
                     return self._create_embedding_inner_function(**kwargs)
                 if chat_completion:
-                    return self._create_chat_completion_auto_continue(**kwargs)
+                    resp = self._create_chat_completion_auto_continue(**kwargs)
+                    if not self._expect_json_response(kwargs):
+                        return resp
+
+                    normalized_resp = (resp or "").strip()
+                    if not normalized_resp:
+                        self._log_json_issue("empty_response", "initial", attempt=i + 1)
+                        raise ValueError("Empty JSON response from LLM")
+
+                    try:
+                        robust_json_parse(normalized_resp)
+                        return normalized_resp
+                    except json.JSONDecodeError as parse_err:
+                        self._log_json_issue(
+                            "json_parse_failed",
+                            "initial",
+                            attempt=i + 1,
+                            error=str(parse_err),
+                            response_length=len(normalized_resp),
+                        )
+                        followup_resp = self._retry_json_only_once(kwargs, attempt_idx=i + 1)
+                        if followup_resp is not None:
+                            return followup_resp
+                        raise
             except openai.BadRequestError as e:  # noqa: PERF203
                 logger.warning(e)
                 logger.warning(f"Retrying {i+1}th time...")
@@ -666,12 +895,14 @@ class APIBackend:
                     ]
                 # Wait before retry to avoid rate limit
                 if i < max_retry - 1:
-                    time.sleep(self.retry_wait_seconds)
+                    time.sleep(self._compute_retry_sleep_seconds(i))
             except Exception as e:  # noqa: BLE001
                 logger.warning(e)
                 logger.warning(f"Retrying {i+1}th time...")
                 if i < max_retry - 1:
-                    time.sleep(self.retry_wait_seconds)
+                    if chat_completion and self._should_failover_on_exception(e):
+                        self._switch_next_chat_base_url(reason=type(e).__name__)
+                    time.sleep(self._compute_retry_sleep_seconds(i))
         error_message = f"Failed to create chat completion after {max_retry} retries."
         raise RuntimeError(error_message)
 
@@ -709,11 +940,13 @@ class APIBackend:
                     response = self.embedding_client.embeddings.create(
                         model=self.embedding_model,
                         input=sliced_filtered_input_content_list,
+                        timeout=self.request_timeout_s,
                     )
                 else:
                     response = self.embedding_client.embeddings.create(
                         model=self.embedding_model,
                         input=sliced_filtered_input_content_list,
+                        timeout=self.request_timeout_s,
                     )
                 for index, data in enumerate(response.data):
                     content_to_embedding_dict[sliced_filtered_input_content_list[index]] = data.embedding
@@ -785,7 +1018,14 @@ class APIBackend:
                 return cache_result, None
 
         if temperature is None:
-            temperature = LLM_SETTINGS.chat_temperature
+            if json_mode:
+                temperature = LLM_SETTINGS.json_mode_temperature
+            else:
+                temperature = (
+                    LLM_SETTINGS.freeform_temperature
+                    if LLM_SETTINGS.freeform_temperature is not None
+                    else LLM_SETTINGS.chat_temperature
+                )
         if max_tokens is None:
             max_tokens = LLM_SETTINGS.chat_max_tokens
         if frequency_penalty is None:
@@ -801,9 +1041,8 @@ class APIBackend:
         else:
             tag = inspect.stack()[4].function
             
-        if reasoning_flag:
+        if reasoning_flag and self.reasoning_model:
             model = self.reasoning_model
-            json_mode = None
         else:
             model = self.chat_model_map.get(tag, self.chat_model)
 
@@ -848,6 +1087,7 @@ class APIBackend:
                 seed=self.chat_seed,
                 frequency_penalty=frequency_penalty,
                 presence_penalty=presence_penalty,
+                timeout=float(getattr(self, "request_timeout_s", LLM_SETTINGS.request_timeout_s)),
             )
             
             if json_mode:
@@ -856,7 +1096,37 @@ class APIBackend:
                         message["content"] = message["content"] + "\nPlease respond in json format."
                         if message["role"] == "system":
                             break
-                kwargs["response_format"] = {"type": "json_object"}
+                response_format_mode = str(
+                    getattr(LLM_SETTINGS, "json_mode_response_format", "json_object") or "json_object"
+                ).strip().lower()
+                if LLM_SETTINGS.json_mode_strict and response_format_mode != "none":
+                    if response_format_mode == "json_schema":
+                        schema_raw = getattr(LLM_SETTINGS, "json_mode_json_schema", "")
+                        schema_obj = None
+                        if isinstance(schema_raw, str) and schema_raw.strip():
+                            try:
+                                schema_obj = json.loads(schema_raw)
+                            except Exception:
+                                schema_obj = None
+                        elif isinstance(schema_raw, dict):
+                            schema_obj = schema_raw
+
+                        if isinstance(schema_obj, dict):
+                            kwargs["response_format"] = {
+                                "type": "json_schema",
+                                "json_schema": {
+                                    "name": "qa_response",
+                                    "schema": schema_obj,
+                                    "strict": True,
+                                },
+                            }
+                        else:
+                            logger.warning(
+                                "json_mode_response_format=json_schema but json_mode_json_schema invalid; fallback to json_object."
+                            )
+                            kwargs["response_format"] = {"type": "json_object"}
+                    else:
+                        kwargs["response_format"] = {"type": "json_object"}
             response = self.chat_client.chat.completions.create(**kwargs)
 
             
@@ -894,11 +1164,39 @@ class APIBackend:
                         ),
                         tag="llm_messages",
                     )
-            if json_mode or reasoning_flag:
+            if json_mode:
                 # Extract JSON part
                 json_start = resp.find('{')
-                json_end = resp.rfind('}') + 1
-                resp = resp[json_start:json_end]
+                json_end = resp.rfind('}')
+                if json_start != -1 and json_end != -1 and json_end >= json_start:
+                    resp = resp[json_start:json_end + 1]
+                else:
+                    resp = resp.strip()
+                    logger.warning(
+                        json.dumps(
+                            {
+                                "event": "llm_json_response_issue",
+                                "issue": "json_boundary_missing",
+                                "stage": "inner_parse",
+                                "response_length": len(resp),
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                if not resp.strip():
+                    logger.warning(
+                        json.dumps(
+                            {
+                                "event": "llm_json_response_issue",
+                                "issue": "empty_response",
+                                "stage": "inner_parse",
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                    if self.dump_chat_cache:
+                        self.cache.chat_set(input_content_json, resp)
+                    return resp, finish_reason
                 # Try parse JSON; on failure try to fix
                 try:
                     json.loads(resp)
@@ -922,7 +1220,18 @@ class APIBackend:
                         resp = fixed_resp
                         logger.info("Fixed JSON format issues")
                     except json.JSONDecodeError as e2:
-                        logger.warning(f"JSON fix failed: {e2}, using raw response")
+                        logger.warning(
+                            json.dumps(
+                                {
+                                    "event": "llm_json_response_issue",
+                                    "issue": "json_fix_failed",
+                                    "stage": "inner_parse",
+                                    "error": str(e2),
+                                    "response_length": len(resp),
+                                },
+                                ensure_ascii=False,
+                            )
+                        )
         if self.dump_chat_cache:
             self.cache.chat_set(input_content_json, resp)
         return resp, finish_reason

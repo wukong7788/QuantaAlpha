@@ -5,6 +5,8 @@ Model workflow with session control.
 import time
 import pandas as pd
 from typing import Any
+import json
+import os
 
 from quantaalpha.pipeline.settings import BaseFacSetting
 from quantaalpha.core.developer import Developer
@@ -37,6 +39,8 @@ from quantaalpha.log import logger
 from functools import wraps
 
 # Decorator: check stop_event before invoking the function
+
+STOP_EVENT: threading.Event | None = None
 
 def stop_event_check(func):
     @wraps(func)
@@ -85,6 +89,8 @@ class AlphaAgentLoop(LoopBase, metaclass=LoopMeta):
             self._last_hypothesis = None
             self._last_experiment = None
             self._last_feedback = None
+            self._last_skip_reason = None
+            self._seen_expressions_cache: set[str] | None = None
             
             logger.info(f"Initialized AlphaAgentLoop, backtest in {'local' if use_local else 'Docker'}")
             if potential_direction:
@@ -95,9 +101,22 @@ class AlphaAgentLoop(LoopBase, metaclass=LoopMeta):
             consistency_enabled = self.quality_gate_config.get("consistency_enabled", False)
             complexity_enabled = self.quality_gate_config.get("complexity_enabled", True)
             redundancy_enabled = self.quality_gate_config.get("redundancy_enabled", True)
+            cheap_filter_enabled = self.quality_gate_config.get("cheap_filter_enabled", True)
+            cheap_filter_require_acceptable = self.quality_gate_config.get("cheap_filter_require_acceptable", True)
+            max_construct_failures_per_branch = self.quality_gate_config.get(
+                "max_construct_failures_per_branch",
+                2,
+            )
+            max_json_parse_failures_per_branch = self.quality_gate_config.get(
+                "max_json_parse_failures_per_branch",
+                2,
+            )
+            self.cheap_filter_enabled = bool(cheap_filter_enabled)
+            self.cheap_filter_require_acceptable = bool(cheap_filter_require_acceptable)
             logger.info(f"Quality gate: consistency={'on' if consistency_enabled else 'off'}, "
                        f"complexity={'on' if complexity_enabled else 'off'}, "
-                       f"redundancy={'on' if redundancy_enabled else 'off'}")
+                       f"redundancy={'on' if redundancy_enabled else 'off'}, "
+                       f"cheap_filter={'on' if self.cheap_filter_enabled else 'off'}")
                 
             scen: Scenario = import_class(PROP_SETTING.scen)(use_local=use_local)
             logger.log_object(scen, tag="scenario")
@@ -112,7 +131,9 @@ class AlphaAgentLoop(LoopBase, metaclass=LoopMeta):
 
             # Pass consistency check config into factor constructor
             self.factor_constructor: Hypothesis2Experiment = import_class(PROP_SETTING.hypothesis2experiment)(
-                consistency_enabled=consistency_enabled
+                consistency_enabled=consistency_enabled,
+                max_construct_failures_per_branch=max_construct_failures_per_branch,
+                max_json_parse_failures_per_branch=max_json_parse_failures_per_branch,
             )
             logger.log_object(self.factor_constructor, tag="experiment generation")
 
@@ -131,10 +152,17 @@ class AlphaAgentLoop(LoopBase, metaclass=LoopMeta):
             super().__init__()
 
     @classmethod
-    def load(cls, path, use_local: bool = True):
+    def load(
+        cls,
+        path,
+        use_local: bool = True,
+        stop_event: threading.Event | None = None,
+    ):
         """Load existing session."""
         instance = super().load(path)
         instance.use_local = use_local
+        global STOP_EVENT
+        STOP_EVENT = stop_event
         logger.info(f"Loaded AlphaAgentLoop, backtest in {'local' if use_local else 'Docker'}")
         return instance
 
@@ -153,16 +181,183 @@ class AlphaAgentLoop(LoopBase, metaclass=LoopMeta):
     def factor_construct(self, prev_out: dict[str, Any]):
         """Construct multiple factors from the hypothesis."""
         with logger.tag("r"): 
+            # New loop may run after previous feedback already saved fresh factors.
+            # Invalidate seen-expression cache so duplicate filter can observe latest library/pool state.
+            self._seen_expressions_cache = None
             factor = self.factor_constructor.convert(prev_out["factor_propose"], self.trace)
             logger.log_object(factor.sub_tasks, tag="experiment generation")
+            self._last_skip_reason = None
         return factor
+
+    def _collect_factor_tasks(self, experiment: Any) -> list[Any]:
+        tasks = getattr(experiment, "sub_tasks", None)
+        if tasks is None:
+            tasks = getattr(experiment, "tasks", None)
+        return list(tasks or [])
+
+    def _assign_factor_tasks(self, experiment: Any, tasks: list[Any]) -> None:
+        if hasattr(experiment, "sub_tasks"):
+            experiment.sub_tasks = tasks
+        if hasattr(experiment, "tasks"):
+            experiment.tasks = tasks
+
+    @staticmethod
+    def _normalize_expression(expr: str) -> str:
+        if not isinstance(expr, str):
+            return ""
+        return " ".join(expr.strip().split())
+
+    @staticmethod
+    def _safe_load_json(path: Path) -> dict[str, Any]:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _load_seen_expressions(self) -> set[str]:
+        cached = getattr(self, "_seen_expressions_cache", None)
+        if cached is not None:
+            return set(cached)
+
+        seen: set[str] = set()
+        project_root = Path(__file__).resolve().parent.parent.parent
+
+        # 1) Existing factor library expressions (cross-run, same suffix).
+        library_suffix = os.environ.get("FACTOR_LIBRARY_SUFFIX", "")
+        if library_suffix:
+            library_filename = f"all_factors_library_{library_suffix}.json"
+        else:
+            library_filename = "all_factors_library.json"
+        library_path = project_root / "data" / "factorlib" / library_filename
+        if library_path.exists():
+            payload = self._safe_load_json(library_path)
+            factors = payload.get("factors", {})
+            if isinstance(factors, dict):
+                for finfo in factors.values():
+                    if not isinstance(finfo, dict):
+                        continue
+                    expr = self._normalize_expression(str(finfo.get("factor_expression", "")))
+                    if expr:
+                        seen.add(expr)
+
+        # 2) Current experiment trajectory pool expressions (cross-round in same run).
+        trace_path = Path(str(logger.log_trace_path))
+        pool_candidates = [
+            trace_path / "trajectory_pool.json",
+            trace_path.parent / "trajectory_pool.json",
+            trace_path.parent.parent / "trajectory_pool.json",
+        ]
+        loaded_pool = False
+        for pool_path in pool_candidates:
+            if not pool_path.exists():
+                continue
+            payload = self._safe_load_json(pool_path)
+            trajectories = payload.get("trajectories", {})
+            if not isinstance(trajectories, dict):
+                continue
+            loaded_pool = True
+            for traj in trajectories.values():
+                if not isinstance(traj, dict):
+                    continue
+                factors = traj.get("factors", [])
+                if not isinstance(factors, list):
+                    continue
+                for finfo in factors:
+                    if not isinstance(finfo, dict):
+                        continue
+                    expr = finfo.get("expression", finfo.get("factor_expression", ""))
+                    expr = self._normalize_expression(str(expr))
+                    if expr:
+                        seen.add(expr)
+            break
+
+        self._seen_expressions_cache = set(seen)
+        logger.info(
+            f"Exact-duplicate prefilter loaded {len(seen)} seen expressions "
+            f"(library={'yes' if library_path.exists() else 'no'}, trajectory_pool={'yes' if loaded_pool else 'no'})."
+        )
+        return set(seen)
+
+    def _apply_precalc_quality_gate(self, experiment: Any) -> Any:
+        if not self.cheap_filter_enabled:
+            return experiment
+
+        regulator = getattr(self.factor_constructor, "factor_regulator", None)
+        if regulator is None:
+            logger.warning("Cheap filter enabled but no factor_regulator found; skipping pre-calc quality gate.")
+            return experiment
+
+        tasks = self._collect_factor_tasks(experiment)
+        if not tasks:
+            self._last_skip_reason = "cheap_filter_empty_tasks"
+            raise FactorEmptyError("Cheap filter: no factor tasks to evaluate.")
+
+        seen_expressions = self._load_seen_expressions()
+        accepted_expressions: set[str] = set()
+        valid_tasks: list[Any] = []
+        rejected_reasons: list[str] = []
+        for task in tasks:
+            factor_name = getattr(task, "factor_name", "unknown")
+            expr = getattr(task, "factor_expression", "")
+            if not isinstance(expr, str) or not expr.strip():
+                rejected_reasons.append(f"{factor_name}:empty_expression")
+                continue
+
+            normalized_expr = self._normalize_expression(expr)
+            if normalized_expr in seen_expressions or normalized_expr in accepted_expressions:
+                rejected_reasons.append(f"{factor_name}:duplicate_exact")
+                continue
+
+            style_ok, style_feedback = regulator.validate_expression_style(expr)
+            if not style_ok:
+                rejected_reasons.append(f"{factor_name}:style:{style_feedback}")
+                continue
+
+            if not regulator.is_parsable(expr):
+                rejected_reasons.append(f"{factor_name}:parse_failed")
+                continue
+
+            success, eval_dict = regulator.evaluate(expr)
+            if not success:
+                rejected_reasons.append(f"{factor_name}:evaluate_failed")
+                continue
+
+            if self.cheap_filter_require_acceptable and not regulator.is_expression_acceptable(eval_dict):
+                rejected_reasons.append(f"{factor_name}:quality_gate_failed")
+                continue
+
+            valid_tasks.append(task)
+            accepted_expressions.add(normalized_expr)
+
+        if rejected_reasons:
+            logger.warning(
+                "Pre-calc cheap gate rejected factors: "
+                f"{len(rejected_reasons)}/{len(tasks)}. "
+                f"samples={rejected_reasons[:3]}"
+            )
+
+        if not valid_tasks:
+            if rejected_reasons and all(r.endswith(":duplicate_exact") for r in rejected_reasons):
+                self._last_skip_reason = "duplicate_exact"
+                raise FactorEmptyError(
+                    "Cheap filter removed all candidate factors before calculate/backtest (duplicate_exact)."
+                )
+            self._last_skip_reason = "cheap_filter_no_valid_factors"
+            raise FactorEmptyError("Cheap filter removed all candidate factors before calculate/backtest.")
+
+        if len(valid_tasks) < len(tasks):
+            logger.info(f"Cheap filter retained {len(valid_tasks)}/{len(tasks)} factors for calculation.")
+            self._assign_factor_tasks(experiment, valid_tasks)
+
+        return experiment
 
     @measure_time
     @stop_event_check
     def factor_calculate(self, prev_out: dict[str, Any]):
         """Compute factor values from factor expressions."""
         with logger.tag("d"):  # develop
-            factor = self.coder.develop(prev_out["factor_construct"])
+            filtered_experiment = self._apply_precalc_quality_gate(prev_out["factor_construct"])
+            factor = self.coder.develop(filtered_experiment)
             logger.log_object(factor.sub_workspace_list, tag="coder result")
         return factor
     
@@ -259,6 +454,7 @@ class AlphaAgentLoop(LoopBase, metaclass=LoopMeta):
             "hypothesis": self._last_hypothesis,
             "experiment": self._last_experiment,
             "feedback": self._last_feedback,
+            "skip_reason": self._last_skip_reason,
             "direction_id": self.direction_id,
             "evolution_phase": self.evolution_phase,
             "trajectory_id": self.trajectory_id,

@@ -14,6 +14,7 @@ from pathlib import Path
 import fire
 import signal
 import sys
+import json
 import threading
 from multiprocessing import Process, Queue
 from functools import wraps
@@ -56,6 +57,106 @@ def _is_truthy(value: Any) -> bool:
     if value is None:
         return False
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _parse_failover_base_urls(raw_value: Any) -> list[str]:
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, list):
+        return [str(x).strip() for x in raw_value if str(x).strip()]
+    text = str(raw_value).strip()
+    if not text:
+        return []
+    # Prefer JSON list first, then fall back to comma-separated string.
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+        except Exception:
+            pass
+    return [x.strip() for x in text.split(",") if x.strip()]
+
+
+def _apply_runtime_llm_settings(llm_cfg: dict[str, Any] | None) -> None:
+    """Apply run-config llm.* overrides onto global LLM settings."""
+    if not isinstance(llm_cfg, dict) or not llm_cfg:
+        return
+
+    # Backward-compatible keys from configs/experiment.yaml
+    if "factor_mining_timeout" in llm_cfg:
+        try:
+            LLM_SETTINGS.factor_mining_timeout = int(llm_cfg["factor_mining_timeout"])
+        except Exception:
+            logger.warning(f"Invalid llm.factor_mining_timeout={llm_cfg['factor_mining_timeout']!r}, ignored.")
+    if "max_retries" in llm_cfg:
+        try:
+            LLM_SETTINGS.max_retry = int(llm_cfg["max_retries"])
+        except Exception:
+            logger.warning(f"Invalid llm.max_retries={llm_cfg['max_retries']!r}, ignored.")
+    if "retry_delay" in llm_cfg:
+        try:
+            LLM_SETTINGS.retry_wait_seconds = float(llm_cfg["retry_delay"])
+        except Exception:
+            logger.warning(f"Invalid llm.retry_delay={llm_cfg['retry_delay']!r}, ignored.")
+    if "json_mode_strict" in llm_cfg:
+        LLM_SETTINGS.json_mode_strict = _is_truthy(llm_cfg["json_mode_strict"])
+
+    # Second-round optimization keys
+    if "json_mode_temperature" in llm_cfg:
+        try:
+            LLM_SETTINGS.json_mode_temperature = float(llm_cfg["json_mode_temperature"])
+        except Exception:
+            logger.warning(f"Invalid llm.json_mode_temperature={llm_cfg['json_mode_temperature']!r}, ignored.")
+    if "freeform_temperature" in llm_cfg:
+        try:
+            raw = llm_cfg["freeform_temperature"]
+            LLM_SETTINGS.freeform_temperature = None if raw is None else float(raw)
+        except Exception:
+            logger.warning(f"Invalid llm.freeform_temperature={llm_cfg['freeform_temperature']!r}, ignored.")
+    if "request_timeout_s" in llm_cfg:
+        try:
+            LLM_SETTINGS.request_timeout_s = float(llm_cfg["request_timeout_s"])
+        except Exception:
+            logger.warning(f"Invalid llm.request_timeout_s={llm_cfg['request_timeout_s']!r}, ignored.")
+    if "retry_backoff" in llm_cfg:
+        LLM_SETTINGS.retry_backoff = str(llm_cfg["retry_backoff"]).strip().lower()
+    if "retry_jitter" in llm_cfg:
+        LLM_SETTINGS.retry_jitter = _is_truthy(llm_cfg["retry_jitter"])
+    if "retry_max_wait_seconds" in llm_cfg:
+        try:
+            LLM_SETTINGS.retry_max_wait_seconds = float(llm_cfg["retry_max_wait_seconds"])
+        except Exception:
+            logger.warning(
+                f"Invalid llm.retry_max_wait_seconds={llm_cfg['retry_max_wait_seconds']!r}, ignored."
+            )
+    if "failover_base_urls" in llm_cfg:
+        parsed_urls = _parse_failover_base_urls(llm_cfg["failover_base_urls"])
+        LLM_SETTINGS.failover_base_urls = json.dumps(parsed_urls, ensure_ascii=False)
+    if "json_mode_response_format" in llm_cfg:
+        LLM_SETTINGS.json_mode_response_format = str(llm_cfg["json_mode_response_format"]).strip().lower()
+    if "json_mode_json_schema" in llm_cfg:
+        schema = llm_cfg["json_mode_json_schema"]
+        if isinstance(schema, str):
+            LLM_SETTINGS.json_mode_json_schema = schema
+        else:
+            try:
+                LLM_SETTINGS.json_mode_json_schema = json.dumps(schema, ensure_ascii=False)
+            except Exception:
+                logger.warning("Invalid llm.json_mode_json_schema, ignored.")
+
+    logger.info(
+        "Runtime llm settings applied: "
+        f"max_retry={LLM_SETTINGS.max_retry}, "
+        f"retry_wait_seconds={LLM_SETTINGS.retry_wait_seconds}, "
+        f"retry_backoff={LLM_SETTINGS.retry_backoff}, "
+        f"retry_jitter={LLM_SETTINGS.retry_jitter}, "
+        f"request_timeout_s={LLM_SETTINGS.request_timeout_s}, "
+        f"json_mode_temperature={LLM_SETTINGS.json_mode_temperature}, "
+        f"freeform_temperature={LLM_SETTINGS.freeform_temperature}, "
+        f"json_mode_response_format={LLM_SETTINGS.json_mode_response_format}, "
+        f"failover_base_urls={LLM_SETTINGS.failover_base_urls}"
+    )
 
 
 
@@ -128,6 +229,7 @@ def _run_evolution_task(
     log_root: str,
     stop_event: threading.Event | None,
     quality_gate_cfg: dict[str, Any] | None = None,
+    max_empty_retries: int = 1,
 ) -> dict[str, Any]:
     """
     Run a single evolution task (one small loop).
@@ -169,7 +271,7 @@ def _run_evolution_task(
 
     logger.info(f"Starting evolution task: phase={phase.value}, round={round_idx}, direction={direction_id}")
 
-    max_empty_retries = 1
+    max_empty_retries = max(0, int(max_empty_retries))
     last_traj_data: dict[str, Any] | None = None
 
     for attempt in range(1, max_empty_retries + 2):
@@ -179,25 +281,62 @@ def _run_evolution_task(
                 f"direction={direction_id}, attempt={attempt}/{max_empty_retries + 1}"
             )
 
-        trajectory_id = StrategyTrajectory.generate_id(direction_id, round_idx, phase)
+        model_loop = None
+        # Only resume from an existing session snapshot on the first attempt.
+        # Later attempts are meant to re-sample new candidates (e.g., after empty factors).
+        if log_root and attempt == 1:
+            from quantaalpha.utils.workflow import (
+                count_steps_done,
+                find_latest_session_snapshot,
+            )
+            snapshot_path = find_latest_session_snapshot(branch_log)
+            if snapshot_path is not None:
+                try:
+                    model_loop = AlphaAgentLoop.load(
+                        snapshot_path,
+                        use_local=use_local,
+                        stop_event=stop_event,
+                    )
+                    model_loop.user_initial_direction = user_direction
+                    done_steps = count_steps_done(model_loop)
+                    remaining_steps = max(0, int(step_n) - int(done_steps))
+                    if remaining_steps > 0:
+                        logger.info(
+                            "Task resume: continue from latest session snapshot "
+                            f"(done_steps={done_steps}, remaining_steps={remaining_steps}, snapshot={snapshot_path})"
+                        )
+                        model_loop.run(step_n=remaining_steps, stop_event=stop_event)
+                    else:
+                        logger.info(
+                            "Task resume: latest session snapshot already covers target steps "
+                            f"(done_steps={done_steps} >= target_step_n={step_n}, snapshot={snapshot_path})"
+                        )
+                except Exception as resume_err:
+                    logger.warning(
+                        f"Task resume failed (snapshot={snapshot_path}): {resume_err}. "
+                        "Fallback to fresh task execution."
+                    )
+                    model_loop = None
 
-        model_loop = AlphaAgentLoop(
-            ALPHA_AGENT_FACTOR_PROP_SETTING,
-            potential_direction=direction,
-            stop_event=stop_event,
-            use_local=use_local,
-            strategy_suffix=strategy_suffix,
-            evolution_phase=phase.value,
-            trajectory_id=trajectory_id,
-            parent_trajectory_ids=parent_ids,
-            direction_id=direction_id,
-            round_idx=round_idx,
-            quality_gate_config=quality_gate_cfg or {},
-        )
-        model_loop.user_initial_direction = user_direction
+        if model_loop is None:
+            trajectory_id = StrategyTrajectory.generate_id(direction_id, round_idx, phase)
+            model_loop = AlphaAgentLoop(
+                ALPHA_AGENT_FACTOR_PROP_SETTING,
+                potential_direction=direction,
+                stop_event=stop_event,
+                use_local=use_local,
+                strategy_suffix=strategy_suffix,
+                evolution_phase=phase.value,
+                trajectory_id=trajectory_id,
+                parent_trajectory_ids=parent_ids,
+                direction_id=direction_id,
+                round_idx=round_idx,
+                quality_gate_config=quality_gate_cfg or {},
+            )
+            model_loop.user_initial_direction = user_direction
 
-        # Run one small loop (5 steps)
-        model_loop.run(step_n=step_n, stop_event=stop_event)
+            # Run one small loop (5 steps)
+            model_loop.run(step_n=step_n, stop_event=stop_event)
 
         traj_data = model_loop._get_trajectory_data()
         factor_count = _count_experiment_factors(traj_data.get("experiment"))
@@ -215,7 +354,8 @@ def _run_evolution_task(
         )
 
     assert last_traj_data is not None
-    last_traj_data["skip_reason"] = "zero_factors_after_retry"
+    if not last_traj_data.get("skip_reason"):
+        last_traj_data["skip_reason"] = "zero_factors_after_retry"
     return last_traj_data
 
 
@@ -228,6 +368,8 @@ def _parallel_task_worker(
     log_root: str,
     result_queue: Queue,
     task_idx: int,
+    max_empty_retries: int,
+    quality_gate_cfg: dict[str, Any] | None = None,
 ):
     """
     Worker for parallel evolution tasks. Runs one evolution task in a separate process and puts result in queue.
@@ -248,6 +390,8 @@ def _parallel_task_worker(
             user_direction=user_direction,
             log_root=log_root,
             stop_event=None,
+            quality_gate_cfg=quality_gate_cfg,
+            max_empty_retries=max_empty_retries,
         )
         result_queue.put({
             "success": True,
@@ -294,6 +438,9 @@ def _run_tasks_parallel(
     use_local: bool,
     user_direction: str | None,
     log_root: str,
+    quality_gate_cfg: dict[str, Any] | None = None,
+    max_parallel_workers: int | None = None,
+    max_empty_retries: int = 1,
 ) -> list[dict[str, Any]]:
     """
     Run multiple evolution tasks in parallel.
@@ -303,13 +450,21 @@ def _run_tasks_parallel(
         return []
     
     result_queue = Queue()
-    processes = []
-    
-    logger.info(f"Starting {len(tasks)} parallel evolution tasks")
+    processes: list[Process] = []
+    running: dict[int, Process] = {}
+    pending_indices = list(range(len(tasks)))
+    worker_limit = len(tasks)
+    if max_parallel_workers is not None:
+        worker_limit = max(1, min(int(max_parallel_workers), len(tasks)))
 
-    for idx, task in enumerate(tasks):
+    logger.info(
+        f"Starting {len(tasks)} parallel evolution tasks "
+        f"(max_workers={worker_limit})"
+    )
+
+    def _start_task(task_idx: int) -> None:
+        task = tasks[task_idx]
         serialized_task = _serialize_task_for_parallel(task)
-        
         p = Process(
             target=_parallel_task_worker,
             args=(
@@ -320,17 +475,32 @@ def _run_tasks_parallel(
                 user_direction,
                 log_root,
                 result_queue,
-                idx,
+                task_idx,
+                max_empty_retries,
+                quality_gate_cfg,
             ),
         )
         p.start()
         processes.append(p)
-        logger.info(f"Started task {idx}: phase={task['phase'].value}, direction={task['direction_id']}")
+        running[task_idx] = p
+        logger.info(
+            f"Started task {task_idx}: phase={task['phase'].value}, "
+            f"direction={task['direction_id']}"
+        )
 
     results = []
     fatal_no_space_result = None
-    for _ in range(len(tasks)):
+    while pending_indices or running:
+        while pending_indices and len(running) < worker_limit:
+            next_idx = pending_indices.pop(0)
+            _start_task(next_idx)
+
         result = result_queue.get()
+        finished_idx = result.get("task_idx")
+        finished_proc = running.pop(finished_idx, None)
+        if finished_proc is not None:
+            finished_proc.join(timeout=5)
+
         if result["success"]:
             original_task = tasks[result["task_idx"]]
             result["task"] = original_task
@@ -349,7 +519,7 @@ def _run_tasks_parallel(
                 break
 
     if fatal_no_space_result is not None:
-        for p in processes:
+        for p in running.values():
             if p.is_alive():
                 p.terminate()
         for p in processes:
@@ -361,7 +531,7 @@ def _run_tasks_parallel(
         )
 
     for p in processes:
-        p.join()
+        p.join(timeout=5)
 
     logger.info(f"Parallel tasks done: {len(results)}/{len(tasks)} succeeded")
     
@@ -399,6 +569,27 @@ def run_evolution_loop(
     top_percent_threshold = float(evolution_cfg.get("top_percent_threshold", 0.3))
     log_root = str(logger.log_trace_path)
     parallel_enabled = bool(evolution_cfg.get("parallel_enabled", False))
+    max_empty_retries = int(evolution_cfg.get("max_empty_retries", 1))
+    if max_empty_retries < 0:
+        logger.warning(f"Invalid max_empty_retries={max_empty_retries}, force to 0")
+        max_empty_retries = 0
+    raw_max_parallel_workers = evolution_cfg.get("max_parallel_workers", None)
+    max_parallel_workers: int | None = None
+    if raw_max_parallel_workers is not None:
+        try:
+            parsed_workers = int(raw_max_parallel_workers)
+            if parsed_workers <= 0:
+                logger.warning(
+                    f"Invalid max_parallel_workers={raw_max_parallel_workers!r}; "
+                    "fallback to uncapped parallelism."
+                )
+            else:
+                max_parallel_workers = parsed_workers
+        except (TypeError, ValueError):
+            logger.warning(
+                f"Invalid max_parallel_workers={raw_max_parallel_workers!r}; "
+                "fallback to uncapped parallelism."
+            )
     fresh_start = bool(evolution_cfg.get("fresh_start", True))
     cleanup_on_finish = bool(evolution_cfg.get("cleanup_on_finish", False))
     relay_enabled = _is_truthy(evolution_cfg.get("relay_enabled", False)) or _is_truthy(
@@ -537,6 +728,8 @@ def run_evolution_loop(
                 "parent_selection_strategy": parent_selection_strategy,
                 "top_percent_threshold": top_percent_threshold,
                 "parallel_enabled": parallel_enabled,
+                "max_parallel_workers": max_parallel_workers,
+                "max_empty_retries": max_empty_retries,
             }
             mismatch_items: list[str] = []
             for key, current_val in current_cfg.items():
@@ -737,7 +930,14 @@ def run_evolution_loop(
         logger.info("Mode: original only (no evolution)")
     logger.info(f"Parent selection: {parent_selection_strategy}" +
                (f" (top_percent={top_percent_threshold})" if parent_selection_strategy == "top_percent_plus_random" else ""))
-    logger.info(f"Parallel execution: {'on' if parallel_enabled else 'off'}")
+    logger.info(f"Empty-branch retry budget: {max_empty_retries}")
+    if parallel_enabled:
+        logger.info(
+            "Parallel execution: on "
+            f"(max_workers={max_parallel_workers if max_parallel_workers is not None else 'all'})"
+        )
+    else:
+        logger.info("Parallel execution: off")
     if relay_enabled:
         control_items = [
             f"mode={relay_mode}",
@@ -775,6 +975,9 @@ def run_evolution_loop(
                 use_local=use_local,
                 user_direction=initial_direction,
                 log_root=log_root,
+                quality_gate_cfg=quality_gate_cfg,
+                max_parallel_workers=max_parallel_workers,
+                max_empty_retries=max_empty_retries,
             )
             
             completed_tasks = []
@@ -845,6 +1048,7 @@ def run_evolution_loop(
                     log_root=log_root,
                     stop_event=stop_event,
                     quality_gate_cfg=quality_gate_cfg,
+                    max_empty_retries=max_empty_retries,
                 )
                 raw_count = traj_data.get("factor_count", 0)
                 try:
@@ -947,6 +1151,8 @@ def main(path=None, step_n=100, direction=None, stop_event=None, config_path=Non
         exec_cfg = (run_cfg.get("execution") or {}) if isinstance(run_cfg, dict) else {}
         evolution_cfg = (run_cfg.get("evolution") or {}) if isinstance(run_cfg, dict) else {}
         quality_gate_cfg = (run_cfg.get("quality_gate") or {}) if isinstance(run_cfg, dict) else {}
+        llm_cfg = (run_cfg.get("llm") or {}) if isinstance(run_cfg, dict) else {}
+        _apply_runtime_llm_settings(llm_cfg)
 
         if evolution_mode is not None:
             use_evolution = evolution_mode

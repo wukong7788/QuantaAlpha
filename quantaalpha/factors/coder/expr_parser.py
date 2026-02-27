@@ -342,14 +342,21 @@ def preprocess_unary_minus(factor_expression):
 
 
 def parse_expression(factor_expression):
+    if factor_expression is None:
+        raise ParseException("", 0, "Expression is None")
+    if not isinstance(factor_expression, str):
+        raise ParseException(str(factor_expression), 0, f"Expression must be str, got {type(factor_expression).__name__}")
+
+    factor_expression = factor_expression.strip()
+    if not factor_expression:
+        raise ParseException("", 0, "Expression is empty")
+
     check_parentheses_balance(factor_expression)
     check_for_invalid_operators(factor_expression)
     
     factor_expression = preprocess_unary_minus(factor_expression)
-    
-    print("factor_expression: ", factor_expression)
-    
-    parsed_data_function = expr.parseString(factor_expression)[0]
+
+    parsed_data_function = expr.parseString(factor_expression, parseAll=True)[0]
     return parsed_data_function
 
 
