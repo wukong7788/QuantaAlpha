@@ -128,3 +128,6 @@ release-notes.md
 
 # ---- Sphinx documentation ----
 docs/_build/
+
+# ---- Large docs artifacts (local) ----
+docs/*.pdf

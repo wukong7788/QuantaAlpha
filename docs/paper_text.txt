@@ -1,0 +1,1056 @@
+2026-02-10
+QuantaAlpha: An Evolutionary Framework for LLM-Driven
+Alpha Mining
+Jun Han1*, Shuo Zhang2*, Wei Li1*, Zhi Yang1*, Yifan Dong1, Tu Hu2,
+Jialuo Yuan3,Xiaomin Yu 2,Yumo Zhu 1,Fangqi Lou 1,Xin Guo 1,Zhaowei Liu 1,
+Tianyi Jiang4,Ruichuan An 4,Jingping Liu 5,Biao Wu 2,Rongze Chen 2,Kunyi Wang 2,
+Yifan Wang2,Sen Hu 2,4,Xinbing Kong 6†,Liwen Zhang 1†,Ronghao Chen 2,4†,Huacan Wang 2†
+1SUFE§ , 2QuantaAlpha¶ , 3Stanford, 4PKU, 5SYSU, 6SEU
+*These authors contributed equally to this work.
+†Correspondence:xinbingkong@126.com, zhang.liwen@shufe.edu.cn, chenronghao@alumni.pku.edu.cn, wanghuacan17@mails.ucas.ac.cn
+/githubhttps://github.com/QuantaAlpha/QuantaAlpha
+Abstract
+Financial markets are noisy and non-stationary, making alpha mining highly sensitive to
+noise in backtesting results and sudden market regime shifts. While recent agentic frame-
+works improve alpha mining automation, they often lack controllable multi-round search
+and reliable reuse of validated experience. To address these challenges, we proposeQuan-
+taAlpha, an evolutionary alpha mining framework that treats each end-to-end mining run
+as a trajectory and improves factors through trajectory-level mutation and crossover op-
+erations. QuantaAlpha localizes suboptimal steps in each trajectory for targeted revision
+and recombines complementary high-reward segments to reuse effective patterns, enabling
+structured exploration and refinement across mining iterations. During factor generation,
+QuantaAlpha enforces semantic consistency across the hypothesis, factor expression, and
+executable code, while constraining the complexity and redundancy of the generated factor
+to mitigate crowding. Extensive experiments on the China Securities Index 300 (CSI 300)
+demonstrate consistent gains over strong baseline models and prior agentic systems. When
+utilizing GPT-5.2, QuantaAlpha achieves an Information Coefficient (IC) of 0.1501, with
+an Annualized Rate of Return (ARR) of 27.75% and a Maximum Drawdown (MDD) of
+7.98%. Moreover, factors mined on CSI 300 transfer effectively to the China Securities Index
+500 (CSI 500) and the Standard & Poor’s 500 Index (S&P 500), delivering 160% and 137%
+cumulative excess return over four years, respectively, which indicates strong robustness of
+QuantaAlpha under market distribution shifts.
+Figure 1: Cumulative excess returns of different approaches on CSI 500 and S&P 500.
+§ AIFin Lab: aifinlab.sufe@gmail.com
+¶ QuantaAlpha: quantaalpha.ai@gmail.com
+1
+arXiv:2602.07085v1  [q-fin.ST]  6 Feb 2026
+1 Introduction
+Financial markets are high-dimensional, non-stationary stochastic systems, where returns exhibit heavy
+tails (Fama, 1965), time-varying volatility (Engle, 1982), and cross-sectional dependence (Pesaran,
+2021). Quantitative investment therefore relies on alpha mining to extract predictive signals from noisy
+observations. Recently, large language models (LLMs) (Lopez-Lira and Tang, 2023) and LLM-based
+agent frameworks (Zhang et al., 2024; Xiao et al., 2024) have been introduced into the factor research
+workflow. By leveraging advanced reasoning and code generation capabilities, these systems can automate
+factor construction and iteratively refine candidates through backtesting feedback.
+Figure 2: Comparison with existing methods: QuantaAlpha improves alpha discovery through trajectory-level
+self-evolution.
+Representative agent frameworks for alpha mining simulate the workflow of human quantitative re-
+searchers by iteratively performing hypothesis generation, executable factor construction, and backtesting-
+based refinement, as illustrated in Figure 2. Under this paradigm, AlphaAgent (Tang et al., 2025b)
+imposes explicit regularization during factor generation to curb factor crowding and mitigate alpha
+decay, while RD-Agent (Li et al., 2025d) targets full-stack automation with coordinated research and
+development agents, enabling joint factor–model co-optimization for robust strategy discovery. These
+frameworks reduce the trial-and-error costs of factor research while preserving interpretability relative to
+parameter-trained methods, making large-scale exploration practical.
+However, under real-market non-stationarity and low signal-to-noise ratios, existing systems still face
+three limitations.(i) Fragile controllability:Iterative refinement is driven by noisy backtest feedback,
+which can induce semantic drift and steer updates toward spurious correlations, gradually deviating
+from the intended economic mechanism.(ii) Limited trustworthiness:Many methods rely on stochastic
+re-generation conditioned on transient contexts, without explicitly inheriting validated rationales across
+iterations. As a result, they lack a traceable lineage and the produced factors are harder to audit and trust.
+(iii) Constrained exploration:Search often over-exploits local neighborhoods around initial seeds, leading
+to redundancy and factor crowding, while providing limited systematic coverage of the broader hypothesis
+space and weakening long-horizon discovery.
+To address these challenges, we propose QuantaAlpha, an evolutionary alpha mining framework that
+improves factor quality through trajectory-level self-evolution. Inspired by (Lin et al., 2025), we view
+2
+each end-to-end mining run as a mining trajectory and explicitly evolve trajectories rather than relying on
+unconstrained re-generation from noisy feedback. First, to mitigate local optimization, we introduce a
+Diversified Planning Initialization that generates multiple complementary research directions, yielding
+broad initial coverage in the hypothesis space. Second, to support controllable refinement and reliable
+reuse of validated experience, QuantaAlpha performs self-evolution via trajectory-level mutation and
+crossover. Mutation performs targeted revision by localizing the failure-causing step via self-reflection
+and rewriting only the corresponding segment, while keeping the rest of the trajectory intact. Crossover
+recombines complementary segments from high-reward parents to reuse validated hypothesis structures,
+construction patterns, and repair behaviors. We further apply generation constraints to enforce semantic
+consistency and constrain complexity and redundancy, preventing drift and crowding. Together, these
+mechanisms expand exploration while stabilizing refinement under real-market noise and non-stationarity.
+Extensive experiments on CSI 300 and cross-market transfer to CSI 500 and S&P 500 demonstrate
+consistent improvements in predictive power and strategy performance over strong baselines and prior
+agentic systems.
+2 Related Work
+Agents in FinanceRecent advances in financial LLMs (Liu et al., 2023, 2025) and evaluation bench-
+marks (Guo et al., 2025; Tang et al., 2025a) have substantially expanded the scope of automated financial
+reasoning. Building on these foundations, a growing line of work explores how agentic systems (Li et al.,
+2025a; Yang et al., 2026) can move beyond financial understanding toward decision-oriented research
+workflows, including factor discovery and trading analysis. In this context, the pursuit of alpha factors
+has evolved from manual engineering and heuristic search toward LLM-driven closed-loop discovery
+(Li et al., 2024b; Shi et al., 2025b; Chen et al., 2025; Wang et al., 2025). Beyond search optimization,
+recent efforts emphasize workflow systematization. RD-Agent (Li et al., 2025d) proposes a multi-agent
+framework that decouples the pipeline into research and development stages, enabling data-centric joint
+optimization of factors and models. To address market non-stationarity, AlphaForge (Shi et al., 2025a)
+focuses on the dynamic combination of mined factors, while Alphafin (Li et al., 2024a) and AlphaEval
+(Ding et al., 2025) establish standardized, task-oriented protocols for reproducible evaluation. Despite
+these advances, trading constraints (e.g., turnover, complexity) remain largely post-hoc filters rather than
+intrinsic objectives, leading to suboptimal generalization and interpretability in live trading.
+Self-Evolving AgentsSelf-evolving agents (Fang et al., 2025; Zhai et al., 2025; Lin et al., 2025; Zhang
+et al., 2026) represent a paradigm shift from static instruction-following to autonomous learning through
+interacting with environment. AlphaEvolve (Novikov et al., 2025) demonstrates a coding-centric evolution
+where the agent employs evolutionary resampling to autonomously generate algorithms for scientific
+discovery. Building on this, CSE (Hu et al., 2026) introduces controllable self-evolution, facilitating a
+critical transition from stochastic generation to feedback-driven evolution. The financial domain adapts
+this self-evolutionary framework to handle non-stationary and high-dimensional data. Research has
+converged on multi-agent coordination and structured feedback to guide evolution (Li et al., 2025b).
+TradingAgents (Xiao et al., 2024) and FactorMAD (Duan et al., 2025) utilize institutional-style debates
+to refine trading hypotheses, while QuantAgents (Li et al., 2025c) and ATLAS (Papadakis et al., 2025)
+incorporate simulated trading performance as a reward signal for dynamic prompt optimization. To
+ensure consistency over long horizons, FinMem (Yu et al., 2025) and FinCon (Yu et al., 2024) leverage
+hierarchical memory and conceptual reinforcement to retain and refine high-level trading experience.
+Despite these advancements, the transition of self-evolving agents to finance is hindered by the low
+signal-to-noise ratio and non-stationary. To mitigate this, our QuantaAlpha employs stable optimization
+units with mutation and crossover operators, ensuring a robust, traceable evolution path through structured
+archiving of iteration logic.
+3 Problem Setup
+Alpha MiningThe alpha mining task aims to learn an alpha factor f from a market feature tensor
+X∈R N×T×D for a stock universe S={s 1, . . . , sN } and a time horizon T={t 1, . . . , tT }. At each
+3
+time t∈ T , the factor produces a signal from the feature slice Xt ∈R N×D that is used to predict the
+cross-sectional return yt+1 ∈R N. In notation, an alpha can be written as f(X t)→y t+1, where yt+1
+denotes the realized returns at time t+ 1 . Accordingly, we formulate alpha mining as the following
+optimization problem:
+f ∗ = arg max
+f∈F
+L
+ 
+f(X),y
+
+−λR(f),(1)
+where F denotes the space of all possible factor expressions, y is the ground-truth return target (e.g.,
+next-day returns), L(·) measures predictive effectiveness, R(·) is a regularization term that encourages
+simplicity and novelty of the expression, andλbalances utility and regularization.
+Alpha Mining TrajectoryDistinct from purely data-driven pipelines, we introduce market hypotheses
+h∈ H to guide LLM-based factor construction. Each alpha mining run follows an end-to-end workflow
+from hypothesis generation to factor generation and backtesting evaluation (see Section 4.1). We represent
+each run by a mining trajectory, defined as an ordered sequence τ= (s 0, a0, s1, a1, . . . , sn), where s0
+denotes the initial mining context (e.g., market context and optional user-provided seeds), ai is the action
+taken at step i by the multi-agent system, and sn is the terminal state containing the evaluated result of
+this run. The quality of a trajectory is measured by its terminal reward:
+R(τ) =L
+ 
+fτ(X),y
+
+−λR(f τ),(2)
+wheref τ denotes the factor produced by trajectoryτ.
+ObjectiveOur objective is to find a trajectory generation mechanism π for the multi-agent system that
+maximizes the expected terminal reward of the generated mining trajectory:
+π∗ = arg max
+π
+Eτ∼π
+
+R(τ)
+
+,(3)
+whereτ∼πdenotes the trajectory induced by repeatedly applyingπfrom the initial states 0.
+4 Method
+As illustrated in Figure 3, our approach treats alpha mining as an agentic research workflow rather than
+a one-shot factor construction procedure. Given market context and user-provided seeds, a multi-agent
+system produces a complete mining trajectory that records hypothesis generation, controllable factor
+construction, code implementation, and backtesting-based evaluation. We first describe the end-to-end
+mining workflow that instantiates and evaluates a single trajectory (Section 4.1). Building on these
+evaluated trajectories, we then introduce an evolutionary optimization scheme that iteratively improves
+mining quality via a self-evolution process (Section 4.2).
+4.1 Alpha Mining Process
+A standalone alpha mining process involves a sequential progression starting from hypothesis generation,
+followed by factor creation and concluding with backtesting-based evaluation. We translate this process
+into the collaborative efforts of multiple agents, each responsible for a specific task at different stages of
+the workflow.
+4.1.1 Hypothesis Generation
+We use the idea agentAi to generate market hypotheses via structured knowledge integration. Conditioned
+on (i) observations from current market conditions or previous mining trajectories, (ii) domain priors from
+financial theories and empirical evidence, and (iii) parametric specifications (e.g., “10-day high/low”),
+Ai produces actionable hypotheses that describe candidate market mechanisms and serve as the input to
+subsequent factor generation.
+4
+Figure 3:Overview of the QuantaAlpha framework. Our approach consists of four core components: (A) Diver-
+sified Planning Initialization to generate candidate hypotheses, (B) Factor Realization that iteratively instantiates
+hypotheses into executable factors with constraint gating, (C) Self-Evolution that applies mutation and crossover
+over evaluated trajectories, and (D) A Final Factor Pool that consolidates validated effective factors.
+4.1.2 Controllable Factor Construction
+To effectively instantiate hypothesis-driven factors, we need a robust mechanism to align implementations
+with domain hypotheses. However, directly generating factor code is brittle, often suffering from syntax
+errors, dependency mismatches, and semantic drift, causing a mismatch between the code and the
+hypothesis.To address these limitations, We introduce an intermediate symbolic representation based on a
+standardized operator library O and an Abstract Syntax Tree (AST). This abstraction bridges high-level
+market intent and low-level implementation, enabling controllable construction, structural validation, and
+reliable compilation.
+Factor GenerationGiven a hypothesis h∈ H and raw features X , the factor agent Af generates
+a symbolic expression f∈ F over the operator library and parses it into an AST as the intermediate
+representation. Concretely, it first maps h to a structured semantic description d that formalizes the
+intended mechanism into discrete operators, while concurrently instantiating operational parameters—such
+as look-back windows and thresholds—from either prescribed parameters in h or heuristic defaults
+anchored in domain expertise. Conditioned on d, the agent then assembles an operator composition
+into a symbolic expression f and parses it into an AST, denoted as T(f) . In T(f) , leaf nodes bind
+to raw feature fields (e.g., $high, $volume) and internal nodes correspond to operator instances from
+O (e.g., TS_MIN(·), SMA(·), RANK(·)), thereby rendering the computational dependencies and data flow
+fully transparent. Finally, the agent translates the validated symbolic form into executable code c via
+compilation; when compilation fails due to implementation issues, an LLM-based repair step is triggered
+to regenerate a consistent implementation while preserving the semantics of f. This design ensures
+that code generation remains anchored to an explicit symbolic specification rather than unconstrained
+free-form generation.
+Consistency VerificationWe enforce semantic consistency across representations to prevent drift during
+generation. Specifically, we apply an LLM-based verifier to assess (i) alignment among the hypothesis h,
+semantic description d, and symbolic expression f, and (ii) faithfulness between the symbolic definition
+f and the generated code c. The verifier returns a consistency decision under fixed criteria. If it fails, we
+rewrite the inconsistent component(s) by regenerating d and f or repairing c until the check passes or a
+5
+maximum retry budget is reached.
+Complexity and Redundancy ControlWe further regularize factor generation with explicit structural
+constraints to promote parsimony and novelty. For complexity, we compute
+C(f) =α 1 ·SL(f) +α 2 ·P C(f) +α 3 ·log
+ 
+1 +|F f |
+
+,(4)
+where SL(f) measures symbolic length, P C(f) counts free parameters (e.g., window sizes), and Ff is
+the set of raw features used by f. For redundancy, we quantify structural similarity via AST matching.
+Given two factors fi and fj with ASTs T(f i) and T(f j), we define s(fi, fj) as the size of their largest
+common isomorphic subtree:
+s(fi, fj) = max
+Si⊆T(f i),Sj ⊆T(f j ),Si∼=Sj
+|V(S i)|.(5)
+Here, Si and Sj range over subtrees of T(f i) and T(f j), respectively, Si ∼= Sj denotes subtree isomor-
+phism, and |V(S i)| is the number of nodes in Si. For a candidate factor f, we compute its maximum
+similarity against an existing alpha zooZas
+S(f) = max
+ϕ∈Z
+s(f, ϕ).(6)
+We reject and rewrite any factor that violates the prescribed complexity or redundancy limits, promoting
+parsimonious generation while avoiding near-duplicate structures.
+4.1.3 Factor Evaluation
+The evaluation agent Ae assesses factors via a standardized backtesting system. The protocol covers three
+complementary aspects: predictive capability metrics for forecasting effectiveness, return performance
+metrics for profit-generating potential under a fixed execution setting, and risk control metrics for stability
+and robustness across market conditions. Beyond factor scoring, the agent maintains an evaluation history
+that records outcomes and summarizes systematic patterns among successful and failed factors.
+4.2 Evolutionary Alpha Mining
+We improve alpha discovery via iterative optimization over mining trajectories. Starting from user-
+provided seed factors, we generate a diversified set of initial hypotheses. We then run the end-to-end
+mining workflow in Section 4.1 to turn each hypothesis into an evaluated mining trajectory, forming an
+initial trajectory pool T0 ={τ 0
+1 , τ 0
+2 , . . . , τ0
+Ninit}. We then apply an iterative evolution process to obtain
+progressively improved factors.
+4.2.1 Diversified Planning Initialization
+Let Z0 denote the user-provided seed factors (or seed ideas). We employ an initialization agent A0
+to propose a diversified set of initial hypotheses H0 ={h 0
+1, . . . , h0
+Ninit}. The agent is instructed to
+maximize complementarity among hypotheses at both semantic and structural levels, e.g., varying signal
+sources (price vs. volume), time scales (short-term vs. long-term), and mechanism types (momentum
+vs. mean-reversion or regime-conditioned triggers). For each h0
+i ∈ H 0, we run the mining workflow
+in Section 4.1 and obtain a mining trajectory τ 0
+i . This diversified initialization expands the effective
+search frontier by providing broad starting coverage in the hypothesis space. As a result, the subsequent
+evolutionary process can explore multiple promising regions in parallel, significantly reducing the risk of
+premature convergence to a suboptimal local optimum.
+4.2.2 Self-Evolution
+The goal of self-evolutionary updates is to guide the alpha mining system to search for better trajectories
+based on existing ones. Specifically, we apply trajectory-level operators to existing mining trajectories to
+generate improved trajectories as demonstrations. These demonstrations provide imitation learning priors
+that bias subsequent trajectory generation toward effective decisions. In practice, we instantiate the update
+with two evolutionary primitives, Mutation and Crossover, which revise a single trajectory or recombine
+complementary sub-trajectories, respectively. Each iteration i yields a new trajectory generation Ti, and
+factor quality improves progressively across iterations (see Figure 7 in Appendix for a case study).
+6
+MutationGiven a mining trajectory τ∈ T i−1, the primitive first performs self-reflection to diagnose
+sub-optimal decision node that most significantly accounts for the low terminal reward, denoted by an
+index k∈ {0, . . . , n−1} . We then rewrite only the localized action (or a short local segment) while
+keeping the remaining steps unchanged:
+τchild =
+ 
+s0, a0, . . . , sk,Refine(a k), s′
+k+1, a′
+k+1, . . . , s′
+n
+
+,(7)
+where the prefix up to sk is frozen, and the remaining steps are regenerated by the agent conditioned
+on this fixed prefix to preserve trajectory coherence. Depending on the localized fault, the rewrite may
+update the hypothesis, the symbolic expression under the operator library, or the compiled code, and can
+introduce mechanism-level changes such as altering the time scale, or adding regime conditions.
+CrossoverCrossover aims to exploit and inherit validated components by recombining complementary
+sub-trajectories from high-quality parents. At iteration i−1 , we select a parent subset Pi−1 ⊆ T i−1 based
+on trajectory reward (Eq. 2). Given k parent trajectories τ (1), . . . , τ(k) ∈ P i−1, Crossover synthesizes a
+new child trajectory by composing high-performing segments from different parents:
+τchild = Crossover
+ 
+τ (1), . . . , τ(k)
+.(8)
+Operationally, the primitive identifies specific trajectory segments that consistently contribute to high
+cumulative rewards—such as hypothesis templates, factor construction patterns, or strategic repair ac-
+tions—and merges them into a single, highly coherent sequence. This recombination mimics the human
+practice of combining complementary strengths from different solutions, while providing a more credible
+lineage by explicitly inheriting decisions that have been validated in previously successful trajectories.
+5 Experiments
+5.1 Experimental Setup
+Datasets and MetricsWe conduct experiments on the CSI 300 dataset, which covers 300 large-cap
+A-share stocks in the Chinese market. We adopt a chronological split with training (Jan. 1, 2016 to Dec.
+31, 2020), validation (Jan. 1, 2021 to Dec. 31, 2021), and testing (Jan. 1, 2022 to Dec. 26, 2025). We
+evaluate performance from two complementary perspectives. Factor predictive power is measured by
+Information Coefficient (IC), IC Information Ratio (ICIR), Rank IC, and Rank ICIR. Strategy performance
+is measured by Annualized Return (ARR), Information Ratio (IR), Maximum Drawdown (MDD), and
+Calmar Ratio (CR). Further details are provided in Appendix A.1.
+BaselinesWe compare QuantaAlpha against four baseline categories: traditional machine learning
+models, deep learning time-series models, classical factor libraries, and LLM-based factor research agents,
+including RD-Agent and AlphaAgent. More details are provided in Appendix A.3.
+5.2 Main Results
+Table 1 reports the main results on the CSI 300 market over a four-year evaluation period. QuantaAlpha
+outperforms all baselines on both factor predictive power and strategy-level performance. Using GPT-5.2,
+QuantaAlpha achieves the best IC at 0.1501, delivers an ARR of 27.75%, and maintains a low MDD
+of 7.98%. From a real-world perspective, this performance indicates that the mined factors can support
+production trading under standard risk controls, rather than being artifacts of backtest noise. Similarly, we
+observe consistent gains across different base models, suggesting that the improvements are robust rather
+than model-specific.
+Compared with RD-Agent, QuantaAlpha and AlphaAgent both incorporate generation-stage regu-
+larization, and this is reflected in stronger predictive power and strategy performance. Under GPT-5.2,
+QuantaAlpha improves IC by 0.0970 and ARR by 17.84% relative to RD-Agent while reducing MDD
+by 6.84%, suggesting that constraining hypothesis-to-factor construction with explicit intermediate rep-
+resentations and verification effectively reduces semantic drift and improves implementation reliability.
+Beyond these constraints, QuantaAlpha further improves upon AlphaAgent by 0.0535 IC and 12.21%
+7
+Table 1: Performance comparison of different methods onCSI 300. We report bothfactor predictive powerand
+strategy-level performancemetrics, wherehigher ↑ values indicate better performance for all metrics (with the
+exception of MDD). For each method category, the best result in each column is highlighted inbold, while the
+second-best result is underlined. Across all methods, the overall best-performing method is highlighted with a light
+blue background .
+Methods Factor Predictive Power Strategy Performance
+IC ICIR Rank IC Rank ICIR IR (SHR*) CR ARR (%) MDD (%)↓
+Classical F actor Mining
+Machine Learning
+Linear 0.0155 0.1174 0.0368 0.2834 -0.3078 -0.1407 -2.67 18.97
+XGBoost 0.0175 0.1336 0.0420 0.3417 -0.5280 -0.1488 -4.24 28.50
+CatBoost 0.0162 0.1203 0.0405 0.3289 -0.2807 -0.1077 -2.30 21.35
+LightGBM 0.0247 0.2055 0.0423 0.3726 0.0092 0.0032 0.07 21.80
+MLP0.0321 0.2780 0.0438 0.40880.1716 0.0804 1.46 18.15
+DoubleEnsemble 0.0213 0.1670 0.0408 0.33720.2490 0.1233 1.85 15.00
+Deep Learning
+GRU 0.0321 0.2603 0.0442 0.3601 0.5302 0.2405 3.61 15.01
+Transformer 0.0331 0.2702 0.0451 0.3801 0.4502 0.3773 5.21 13.81
+LSTM 0.0331 0.2502 0.0451 0.3503 0.6802 0.4058 6.01 14.81
+TRA0.0421 0.3402 0.0511 0.4203 1.0502 0.8002 6.81 8.51
+Factor Libraries
+Alpha158(20) 0.0051 0.0329 0.0184 0.1177 0.5044 0.20874.6322.19
+Alpha1580.0131 0.0817 0.0334 0.21190.4099 0.2620 2.6610.15
+Alpha360 0.0105 0.0636 0.0306 0.1889 0.6009 0.35504.09 11.52
+LLM-based Agentic F actor Mining
+RD-Agent
+Qwen3-235B 0.0352 0.2850 0.0485 0.3950 0.6502 0.3591 7.20 20.05
+Deepseek-V3.2 0.0401 0.3250 0.0522 0.4250 0.8202 0.4332 7.81 18.03
+Gemini-3-pro-preview 0.0481 0.3900 0.0583 0.4750 1.0202 0.5499 8.81 16.02
+Claude-4.5-sonnet 0.0527 0.4250 0.0623 0.5050 1.2202 0.6488 9.81 15.12
+GPT-5.20.0531 0.4300 0.0633 0.5150 1.2502 0.6687 9.91 14.82
+AlphaAgent
+Qwen3-235B 0.0952 0.6632 0.1019 0.6471 2.1053 1.5945 15.10 9.47
+Deepseek-V3.2 0.0955 0.6637 0.0919 0.6450 1.9230 1.4746 14.51 9.84
+Gemini-3-pro-preview 0.0804 0.5366 0.0784 0.5290 1.7821 1.4729 14.11 9.58
+Claude-4.5-sonnet0.1092 0.7718 0.1062 0.7596 2.2739 2.0246 16.48 8.14
+GPT-5.2 0.0966 0.6344 0.0942 0.6237 1.9328 1.2056 15.54 12.89
+QuantaAlpha
+Qwen3-235B 0.1252 0.8672 0.1226 0.8577 2.6114 2.2859 20.55 8.99
+Deepseek-V3.2 0.1338 0.8533 0.1300 0.8304 2.8797 2.6007 23.77 9.14
+Gemini-3-pro-preview 0.1124 0.7391 0.1086 0.7205 2.5189 2.1503 20.32 9.45
+Claude-4.5-sonnet 0.1111 0.6374 0.1077 0.6211 2.6459 3.2615 22.70 6.96
+GPT-5.2 0.1501 0.9110 0.1465 0.8909 3.3251 3.4774 27.757.98
+ARR while reducing MDD by 4.91%, highlighting the added value of trajectory-centric self-evolution:
+mutation broadens exploration via mechanism-level variations, while crossover reuses validated trajectory
+segments and repair strategies, jointly increasing the yield and stability of high-quality factors under
+non-stationary market dynamics.
+5.3 Ablation Study
+Ablation of Evolutionary Mining ComponentsWe conduct an ablation study to quantify the contri-
+bution of three components in evolutionary alpha mining: diversified planning initialization, trajectory
+mutation, and trajectory crossover. The results are summarized in Table 2. Removingplanningyields
+only marginal changes in IC and Rank IC, but substantially degrades strategy-level outcomes, with
+ARR decreasing by 7.78% and MDD increasing by 2.73%. This indicates that diversified initialization
+primarily improves the search frontier by providing broader and less correlated starting hypotheses, which
+stabilizes subsequent evolution. In contrast, removingmutationcauses the largest drop in predictive power,
+decreasing IC by 0.0292 and Rank IC by 0.0284, and also leads to the largest reduction in ARR by 9.81%.
+This highlights mutation as the primary driver of effective exploration and trajectory repair, enabling the
+system to escape suboptimal regions and correct failure modes discovered during mining. Meanwhile,
+8
+IC Rank IC
+0.00
+0.02
+0.04
+0.06
+0.08
+0.10
+0.12
+0.14
+0.16 0.149
+-0.019
+-0.024 -0.027 -0.027
+0.146
+-0.020 -0.023 -0.027 -0.027
+IC  and Rank IC
+ARR MDD
+0
+5
+10
+15
+20
+25
+30
+35
+28.99
+-5.48
+-8.44
+-6.62
+-11.48
+9.42 +0.33
++2.57
++0.02
++1.27
+ARR (%)  and MDD (%)
+QuantaAlpha
+w/o Consistency
+w/o Complexity
+w/o Redundancy
+w/o All
+Figure 4: Ablation study of semantic consistency, complexity, and redundancy controls.
+removingcrossoverleads to a smaller but consistent degradation. This supports the role of crossover in
+exploiting and inheriting complementary high-performing trajectory segments, improving efficiency and
+stability by recombining validated patterns from successful trajectories.
+Table 2: Ablation study of evolutionary mining components.
+Method Key Metrics
+IC Rank IC ARR(%)MDD(%)↓
+QuantaAlpha 0.1493 0.1458 28.99 9.42
+-w/oPlanning0.1488 -0.0005 0.1452-0.0006 21.21-7.78 12.15+2.73
+-w/oMutation0.1201 -0.0292 0.1174-0.0284 19.18-9.81 9.85+0.43
+-w/oCrossover0.1423 -0.0070 0.1381-0.0077 26.17-2.82 10.63+1.21
+Ablation of Consistency, Complexity, and Redundancy ControlsWe ablate three controls during
+factor generation that gate rewriting, including semantic consistency verification, complexity regulariza-
+tion, and redundancy filtering. As shown in Figure 4, disabling any single control consistently degrades
+performance, confirming that each contributes non-trivially to robust factor generation. Theconsistency
+control prevents semantic drift between the hypothesis, symbolic specification, and implementation. The
+complexitycontrol improves robustness by discouraging overly complex expressions that generalize poorly,
+and its removal leads to the most pronounced degradation at the strategy level, with the annualized excess
+return dropping by 8.44% and the maximum drawdown increasing by 2.57%. Theredundancycontrol
+preserves exploration by filtering near-duplicate structures and mitigating factor crowding. Disabling all
+three yields the largest degradation, indicating that these controls are complementary and jointly needed
+for reliable generation.
+5.4 More Analysis
+Factor GeneralizabilityTo evaluate factor robustness under significant market distribution shifts, we
+conduct a zero-shot transfer experiment where the factors mined and selected on CSI 300 are directly
+deployed on CSI 500 and the S&P 500 without any re-optimization or market-specific adaptation. As
+shown in Figure 1, QuantaAlpha demonstrates substantially stronger out-of-distribution generalization
+than all baselines. A clear divergence emerges around December 2023, when competing methods begin to
+stagnate under shifts in market microstructure and volatility regimes, whereas QuantaAlpha sustains a
+stable upward trajectory. By the end of the evaluation period, it reaches a cumulative excess return of
+roughly160%on CSI 500 and over137%on the S&P 500. These results indicate that the discovered
+9
+factors transfer beyond the source market and retain effectiveness under distribution shifts, rather than
+relying on market-specific historical patterns.
+Alpha DecayFigure 5 reports annual IC and Rank IC on the CSI 300 universe from 2021 to 2025.
+A pronounced performance collapse is observed for the baselines in 2023, coinciding with a major
+regime shift in the A-share market. The pre-2023 period is dominated by large-cap “core assets”, where
+institutional trading supports relatively stable trends and makes classical momentum or mean-reversion
+signals effective. In 2023, the market rotates toward small-cap and thematic stocks, together with higher
+intraday noise, more frequent overnight gaps, and weaker trend persistence. Baseline methods, whose
+factor libraries implicitly assume smooth trends and regular reversal patterns, fail to transfer to this
+out-of-distribution environment. QuantaAlpha, by comparison, maintains strong IC and Rank IC through
+the regime transition. It discovers more structural factors, such asMean-Reverting Range Deviationand
+Overnight Gap Structure, that reflect persistent microstructure effects including volatility clustering and
+overnight information incorporation. These signals are less sensitive to capitalization style, enabling better
+temporal generalization.
+Figure 5: Annual IC and Rank IC comparison on the CSI 300.
+Table 3 provides a factor-level diagnosis of the alpha decay observed in 2023, grounding the analysis
+jointly inmarket style changes,factor semantics, andempirical factor statistics. Rather than enumerating
+factor formulas, we focus on which information channels remain predictive under the 2022–2023 regime
+transition and why.
+Market Style Transition and Its ImplicationsThe CSI 300 market undergoes a pronounced style
+transition in 2023 relative to the training period (2016–2020). The earlier regime is dominated by
+large-cap core assets, with high institutional participation, smooth intraday dynamics, and persistent
+short-horizon trends. Under such conditions, classical momentum, mean-reversion, and exhaustion-based
+factors are effective.In 2023, leadership rotates toward small-cap and thematic stocks. This shift is
+accompanied by increased intraday noise, frequent overnight gaps driven by call auctions, and rapid
+cross-style liquidity re-allocation. These changes weaken trend persistence and amplify path-dependent
+noise, directly challenging factor constructions that rely on stable intraday structure or fast mean reversion.
+Factor Semantics Aligned with Market MicrostructureThe empirical contrast between QuantaAlpha
+(QA) and AlphaAgent (AA) in 2023 reflects differences in thesemantic compositionof their factor
+libraries.
+(i). Overnight and auction information.Gap-based factors aggregate information released during
+non-trading hours and price discovery in the opening auction. As shown in Table 3, multiple QA factors
+from this channel occupy the right tail of the 2023 Rank IC distribution, while maintaining near-complete
+coverage (Table 4). This indicates that overnight information becomes a dominant and stable signal when
+intraday predictability deteriorates.
+10
+Table 3: Representative factors and their performance metrics on the CSI 300 index in 2023.
+Factor (representative) Rank IC IC Interpretation (short)
+QA — strong performers (overnight/auction, trend-quality, and liquidity re-rating)
+GapZ10_Overnight_vs_TR0.0793 0.0335 Normalized overnight gap magnitude relative to recent true range; captures auction-
+driven shocks and subsequent adjustment.
+Gap_IntradayAcceptanceScore_20D0.0744 0.0330 ‘Acceptance vs. rejection” of an overnight gap using intraday direction, scaled by
+recent volatility.
+Gap_IntradayAcceptance_VolWeighted_20D0.0606 0.0314 Gap acceptance score weighted by abnormal volume; emphasizes information-rich
+openings with high participation.
+CleanTrend_Continuation_Score_RS10_WVMA50.0590 0.0267 Trend continuation conditioned on high trend quality (low residual noise) and muted
+intraday/volume pressure.
+OrderlyTrend_x_Absorption_10D_5D_20D0.0465 0.0271 ‘Orderly” short-horizon trend cross-validated by liquidity absorption (high dollar
+volume with low price impact).
+QA — weak performers (overly rigid gates or noisy-path proxies under rotation)
+KineticLength_AbsRetSum_Z_10D-0.0720 -0.0246 Path-length proxy (choppiness): can behave like a noise detector, but may invert
+under fast style rotation.
+Drawdown_Gated_NegCorr_60D_20D_thr20pct-0.0282 -0.0095 Hard regime gate based on deep drawdown; brittle when drawdowns cluster and
+cross-sectional regimes shift quickly.
+HighClose_Shock_With_VolSync_60_20-0.0274 -0.0090 ‘Shock-day” breakout quality (close-in-range, range shock, return–volume sync);
+sensitive to regime-dependent follow-through.
+AA — strong performers (exhaustion/climax-style reversals)
+Exhaustion_Intensity_Index_10D0.0323 0.0159 Price displacement over 60D interacted with volume intensity ratio; targets potential
+exhaustion and reversal.
+Climax_Exhaustion_Intensity0.0242 0.0160 Variant using short-horizon volume climax vs. long-horizon baseline; aims to identify
+capitulation-like turns.
+Exhaustion_Volume_Instability_Index0.0121 0.0117 Trend deviation combined with volume instability; highlights fragile price levels
+supported by unstable liquidity.
+AA — weak performers (bottom-fishing under non-stationary liquidity)
+Relative_Volume_Calm_Reversal-0.0279 -0.0188 ‘Quiet-volume” regimes multiplied by momentum divergence; may fail when liquid-
+ity conditions change abruptly.
+Volume_Stability_Momentum_Divergence_40D-0.0247 -0.0155 Robust volume-stability proxy (MAD) times momentum spread; sensitive to turnover
+regime changes.
+LVR_Bottom_Fishing_20D-0.0190 -0.0144 ‘Bottom-fishing” reversal with intraday rejection and volume surge; vulnerable when
+reversals are short-lived and crowded.
+Table 4: Summary statistics of annual factor predictability on the CSI 300 index in 2023.
+Metric QA AA
+Coverage ratio (valid metrics) 0.98 0.80
+Share with Rank IC>00.626 0.594
+Mean Rank IC 0.0057 0.0012
+Max Rank IC 0.0793 0.0323
+Min Rank IC -0.0720 -0.0279
+Share with Rank IC>0.030.102 0.0156
+Share with Rank IC>0.050.0272 0.0000
+Mean IC 0.0044 0.0015
+(ii). Volatility structure and range-based signals.Range deviation factors conditioned on volatility
+clustering capture abnormal variability rather than directional trends. In 2023, these signals remain
+predictive despite elevated noise, consistent with the persistence of volatility clustering across market
+styles. Their contribution is reflected in the heavier positive Rank IC tail of QA relative to AA.
+(iii). Trend quality and liquidity re-rating.QA emphasizes trend continuation only when supported
+by low residual volatility and improving liquidity (e.g., rising dollar volume with limited price impact).
+This conditioning filters out noise-driven pseudo-trends prevalent in small-cap rotation, explaining why
+QA retains a higher fraction of strong-performing factors, whereas raw momentum proxies degrade.
+Factor Statistics as Supporting EvidenceThe factor-level statistics in 2023 provide quantitative
+support for the semantic interpretation above. QA achieves substantially higher coverage and a heavier
+right tail of Rank IC, including a non-trivial share of factors exceeding moderate predictability thresholds,
+whereas AA exhibits compressed tails and fewer robust signals. These differences are consistent with the
+dominance of overnight, volatility-structure, and trend-quality channels under the 2023 market style.
+A key distinction is that QA explicitly encourages semantic diversity through its factor mutation
+11
+mechanism. By generating and recombining heterogeneous primitives across multiple information
+channels, QA avoids concentration on a single market hypothesis. This diversity increases the probability
+that a subset of factors remains aligned with the prevailing market microstructure after a style transition,
+thereby mitigating regime-specific alpha decay. Overall, the 2023 diagnosis indicates that alpha robustness
+under distribution shift is driven by alignment between market style and factor semantics, supported by
+sufficient diversity across information channels. QA’s ability to maintain performance arises not from
+fitting a specific regime, but from sustaining a broad and adaptive factor population whose predictive
+subsets persist across market style transitions.
+Evolutionary Alpha Mining EfficiencyWe analyze the iterative dynamics of factor mining by tracking
+the IC distribution across generation rounds. As visualized in Figure 6, QuantaAlpha consistently
+maintains the highest IC across all five iterations, indicating that its evolutionary updates improve factor
+quality more effectively than both AlphaAgent and RD-Agent. Notably, QuantaAlpha exhibits a rapid
+gain in the early rounds and then remains stable at a high level, suggesting strong sample efficiency
+in converting early exploration into consistently predictive factors. In addition to the higher mean,
+QuantaAlpha shows a moderate but persistent spread of IC across rounds, reflecting sustained diversity in
+the explored factor candidates rather than premature collapse to a narrow region. By comparison, RD-
+Agent remains lower with relatively homogeneous IC profiles, consistent with weaker exploration and a
+higher risk of generating crowded signals. AlphaAgent improves over RD-Agent but remains consistently
+below QuantaAlpha, suggesting that our trajectory-level evolution more efficiently accumulates and reuses
+successful generation patterns across iterations.
+Figure 6: The evolution of IC over the first five iterations.
+5.5 Case Study
+Case Study SetupTo make the evolution process concrete, we present a representative case study and
+trace how QuantaAlpha updates hypotheses and factors over five iterations. We run QuantaAlpha for a
+total of 15 iterations on CSI300, using Deepseek-V3.2 as the backbone LLM for all agents. To improve
+mining throughput, we set the factor-complexity constraints to symbol length ≤200 and base features
+≤4 . Each iteration consists of two phases: aMutationphase followed by aCrossoverphase.At the end of
+each iteration, we maintain a global high-quality factor pool using all factors generated up to that iteration.
+The maintenance rule is greedy and RankIC-driven: we sort all candidate factors by RankIC (descending)
+and add them into the pool in order, subject to a redundancy constraint. A factor is admitted only if its
+absolute correlation with every factor already in the pool is below 0.7. The pool size is capped at 50% of
+the total number of mined factors up to the current iteration.
+Factor ExampleFigure 7 illustrates how QuantaAlpha refines hypotheses and factor expressions across
+iterations via themutationandcrossoverphases. The highlighted factors in the figure are therefore
+representative nodes on different traces across iterations. The first iteration yields interpretable short-
+term reversal factors. The second broadens the mechanism via volatility-weighted momentum, but
+12
+[Hypothesis]
+Aligned 1D/5D/20D momentum 
+predicts sustained price 
+continuation.
+[Key Factor] 
+Nested_Momentum_Alignment_
+1_5_20
+Expr: SIGN(TS_MEAN($return, 
+1)) * SIGN(TS_MEAN($return, 
+5)) * SIGN(TS_MEAN($return, 
+20)) + 0.5 * 
+(TS_CORR($return, $return, 
+5) + TS_CORR($return, 
+$return, 20))
+[Feedback]
+Missing Magnitude & Risk 
+Control. Need to upgrade from 
+simple sign alignment to 
+Magnitude + Direction 
+consistency, gated by volatility to 
+prevent false signals during 
+stress.
+Iter2 | Mutation
+ARR: 7.06% | RankICIR: 0.166 | 
+MDD: 10.7% [Hypothesis]
+Volatility regime stress amplifies aligned nested momentum signals.
+[Key Factor] VolRegime_Momentum_Composite_5_1_5_20
+Expr: ZSCORE(TS_STD($return, 5) * (SIGN(TS_MEAN($return, 
+1)) + SIGN(TS_MEAN($return, 5)) + SIGN(TS_MEAN($return, 
+20))))
+[Feedback]
+Over-engineered & Lacks Generalization. Drastically simplify. 
+Replace complex nested logic with a standard 5D/20D Vol Ratio + 
+20D Momentum. Use linear weighting instead of complex conditions 
+to reduce overfitting.
+Iter2 | Crossover
+ARR: 7.35% | RankICIR: 0.170 | MDD: 9.67%
+13.27%
+19.14%
+22.38%
+27.85%
+29.63%
+[Initial Direction]
+Does STD5/WVMA5 Filter enhance ROC60 & KLOW?
+[Hypothesis]
+High Price Vol / Low Volume Vol = Noise Regime.Filters for 
+enhanced Mean Reversion efficacy.
+[Key Factor] RegimeFiltered_Reversal_5D
+Expr:(TS_STD($return, 5) / (TS_STD($return * 
+$volume, 5) + 1e-8)) * TS_PCTCHANGE($close, 60)
+Iter1 | Initialization
+ARR: 5.22% | RankICIR: 0.158 | MDD: 7.67%
+[Hypothesis]
+Volatility-weighted fusion of Institutional Momentum 
+and Retail Herding Reversals.
+[Key Factor] Institutional_Momentum_Score_20D
+Expr: RANK(TS_CORR(DELTA($close, 1)/$close, 
+DELTA($volume, 1)/$volume, 20) * 
+TS_MEAN(($close -$open)/$close, 5))
+[Observation]
+Stronger Signal but Higher Risk. Returns (7.8%) and 
+IC improved significantly, but Max Drawdown 
+worsened (-11.4%). The factors capture the trend but 
+lack Regime-Adaptive Weighting to protect against 
+downside volatility.
+Iter5 | Crossover
+ARR: 7.80% | RankICIR: 0.193 | MDD: 11.4%
+FactorPool EvolvedFactorPool
+Figure 7: A case study of iterative hypothesis and factor updates in QuantaAlpha.
+increased structural complexity coincides with weaker generalization. Subsequent iterations simplify
+the expression into a linear additive form, improving drawdown and stabilizing performance. The fifth
+iteration adds participant-differentiated behavioral signals, incorporating complementary information and
+further improving predictability. Throughout the evolution, QuantaAlpha maintains a cumulative factor
+pool. Its predictive performance does not saturate within the first five iterations and only begins to decay
+after roughly 15 iterations, indicating that the evolution sustains effective improvement over a substantial
+horizon before diminishing returns emerge.
+Iteration ConvergenceFigure 8 illustrates the predictive performance of the factor pool from the
+fifth iteration onwards. We observe that the predictive performance does not increase linearly with the
+number of iterations. The strategy’s return capacity and risk control ability are gradually optimized,
+reaching a balanced high level between return and maximum drawdown around the 11th to 12th iterations.
+Subsequent additional iterations fail to bring significant performance improvement; instead, they may
+introduce redundant information through newly generated factors, leading to reduced strategy robustness
+and deteriorated drawdown performance. Overall, the 11th to 12th iterations (approximately 350 factors
+in total) represent the optimal trade-off point between return level and risk control effect under this
+experimental setup.
+6 Conclusion
+We present QuantaAlpha, a self-evolving framework for interpretable alpha mining that formulates factor
+discovery as a constrained multi-agent research process. Extensive experiments across both Chinese and
+U.S. equity markets show that QuantaAlpha consistently produces more stable and generalizable factors
+than all baselines. Beyond empirical performance, QuantaAlpha emphasizes three properties critical for
+real-world quantitative research:diversity,controllability, andtrustworthiness. Diversity is promoted
+by broad hypothesis exploration and redundancy-aware evolution, improving robustness under non-
+stationarity; controllability is enabled by symbolic representations and synthesis-time gates that enforce
+consistency and limit complexity. Trustworthiness is further strengthened by trajectory-level inheritance,
+where crossover recombines high-performing segments from previously successful trajectories, providing
+a verifiable lineage of validated mechanisms and repair patterns. Future work will explore extending
+QuantaAlpha to multi-asset and cross-market settings, incorporating adaptive regime-aware evolution, and
+13
+Figure 8: Factor Pool Performance by Iteration.
+integrating the agentic discovery process more tightly with portfolio construction and risk management.
+More broadly, we believe that agentic evolution provides a promising paradigm for discovery problems in
+high-noise, non-stationary domains beyond finance.
+Acknowledgments
+This work was supported by the National Social Science Fund of China Project under Grant No. 22BTJ031;
+and the Shanghai Engineering Research Center of Finance Intelligence under Grant No. 19DZ2254600.
+We acknowledge the technical support from the Qinghai Provincial Key Laboratory of Big Data in Finance
+and Artificial Intelligence Application Technology.
+References
+Binqi Chen, Hongjun Ding, Ning Shen, Jinsheng Huang, Taian Guo, Luchen Liu, and Ming Zhang. 2025. Alphasage:
+Structure-aware alpha mining via gflownets for robust exploration.arXiv preprint arXiv:2509.25055.
+Hongjun Ding, Binqi Chen, Jinsheng Huang, Taian Guo, Zhengyang Mao, Guoyi Shao, Lutong Zou, Luchen Liu,
+and Ming Zhang. 2025. Alphaeval: A comprehensive and efficient evaluation framework for formula alpha
+mining.arXiv preprint arXiv:2508.13174.
+Yitong Duan, Chuheng Zhang, and Jian Li. 2025. Factormad: A multi-agent debate framework based on large
+language models for interpretable stock alpha factor mining. InProceedings of the 6th ACM International
+Conference on AI in Finance, pages 605–613.
+Robert F Engle. 1982. Autoregressive conditional heteroscedasticity with estimates of the variance of united
+kingdom inflation.Econometrica: Journal of the econometric society, pages 987–1007.
+Eugene F Fama. 1965. The behavior of stock-market prices.The journal of Business, 38(1):34–105.
+Jinyuan Fang, Yanwen Peng, Xi Zhang, Yingxu Wang, Xinhao Yi, Guibin Zhang, Yi Xu, Bin Wu, Siwei Liu, Zihao
+Li, and 1 others. 2025. A comprehensive survey of self-evolving ai agents: A new paradigm bridging foundation
+models and lifelong agentic systems.arXiv preprint arXiv:2508.07407.
+Xin Guo, Haotian Xia, Zhaowei Liu, Hanyang Cao, Zhi Yang, Zhiqiang Liu, Sizhe Wang, Jinyi Niu, Chuqi Wang,
+Yanhui Wang, and 1 others. 2025. Fineval: A chinese financial domain knowledge evaluation benchmark for
+large language models. InProceedings of the 2025 Conference of the Nations of the Americas Chapter of the
+Association for Computational Linguistics: Human Language Technologies (Volume 1: Long Papers), pages
+6258–6292.
+Tu Hu, Ronghao Chen, Shuo Zhang, Jianghao Yin, Mou Xiao Feng, Jingping Liu, Shaolei Zhang, Wenqi Jiang, Yuqi
+Fang, Sen Hu, and 1 others. 2026. Controlled self-evolution for algorithmic code optimization.arXiv preprint
+arXiv:2601.07348.
+14
+Haohang Li, Yupeng Cao, Yangyang Yu, Shashidhar Reddy Javaji, Zhiyang Deng, Yueru He, Yuechen Jiang,
+Zining Zhu, Kp Subbalakshmi, Jimin Huang, and 1 others. 2025a. Investorbench: A benchmark for financial
+decision-making tasks with llm-based agent. InProceedings of the 63rd Annual Meeting of the Association for
+Computational Linguistics (Volume 1: Long Papers), pages 2509–2525.
+Xiang Li, Zhenyu Li, Chen Shi, Yong Xu, Qing Du, Mingkui Tan, and Jun Huang. 2024a. Alphafin: Benchmarking
+financial analysis with retrieval-augmented stock-chain framework. InProceedings of the 2024 joint international
+conference on computational linguistics, language resources and evaluation (LREC-COLING 2024), pages
+773–783.
+Xiangyu Li, Yawen Zeng, Xiaofen Xing, Jin Xu, and Xiangmin Xu. 2025b. Hedgeagents: A balanced-aware
+multi-agent financial trading system. InCompanion Proceedings of the ACM on Web Conference 2025, pages
+296–305.
+Xiangyu Li, Yawen Zeng, Xiaofen Xing, Jin Xu, and Xiangmin Xu. 2025c. Quantagents: Towards multi-agent
+financial system via simulated trading.arXiv preprint arXiv:2510.04643.
+Yuante Li, Xu Yang, Xiao Yang, Minrui Xu, Xisen Wang, Weiqing Liu, and Jiang Bian. 2025d. R&d-agent-quant:
+A multi-agent framework for data-centric factors and model joint optimization.arXiv preprint arXiv:2505.15155.
+Zhiwei Li, Ran Song, Caihong Sun, Wei Xu, Zhengtao Yu, and Ji-Rong Wen. 2024b. Can large language models
+mine interpretable financial factors more effectively? a neural-symbolic factor mining agent model. InFindings
+of the Association for Computational Linguistics ACL 2024, pages 3891–3902.
+Jiaye Lin, Yifu Guo, Yuzhen Han, Sen Hu, Ziyi Ni, Licheng Wang, Mingguang Chen, Hongzhang Liu, Ronghao
+Chen, Yangfan He, and 1 others. 2025. Se-agent: Self-evolution trajectory optimization in multi-step reasoning
+with llm-based agents.arXiv preprint arXiv:2508.02085.
+Xiao-Yang Liu, Guoxuan Wang, Hongyang Yang, and Daochen Zha. 2023. Fingpt: Democratizing internet-scale
+data for financial large language models.arXiv preprint arXiv:2307.10485.
+Zhaowei Liu, Xin Guo, Fangqi Lou, Lingfeng Zeng, Jinyi Niu, Zixuan Wang, Jiajie Xu, Weige Cai, Ziwei Yang,
+Xueqian Zhao, and 1 others. 2025. Fin-r1: A large language model for financial reasoning through reinforcement
+learning.arXiv preprint arXiv:2503.16252.
+Alejandro Lopez-Lira and Yuehua Tang. 2023. Can chatgpt forecast stock price movements? return predictability
+and large language models.arXiv preprint arXiv:2304.07619.
+Alexander Novikov, Ngân V˜u, Marvin Eisenberger, Emilien Dupont, Po-Sen Huang, Adam Zsolt Wagner, Sergey
+Shirobokov, Borislav Kozlovskii, Francisco JR Ruiz, Abbas Mehrabian, and 1 others. 2025. Alphaevolve: A
+coding agent for scientific and algorithmic discovery.arXiv preprint arXiv:2506.13131.
+Charidimos Papadakis, Angeliki Dimitriou, Giorgos Filandrianos, Maria Lymperaiou, Konstantinos Thomas, and
+Giorgos Stamou. 2025. Atlas: Adaptive trading with llm agents through dynamic prompt optimization and
+multi-agent coordination.arXiv preprint arXiv:2510.15949.
+M Hashem Pesaran. 2021. General diagnostic tests for cross-sectional dependence in panels.Empirical economics,
+60(1):13–50.
+Hao Shi, Weili Song, Xinting Zhang, Jiahe Shi, Cuicui Luo, Xiang Ao, Hamid Arian, and Luis Angel Seco. 2025a.
+Alphaforge: A framework to mine and dynamically combine formulaic alpha factors. InProceedings of the AAAI
+Conference on Artificial Intelligence, volume 39, pages 12524–12532.
+Yu Shi, Yitong Duan, and Jian Li. 2025b. Navigating the alpha jungle: An llm-powered mcts framework for
+formulaic factor mining.arXiv preprint arXiv:2505.11122.
+Zichen Tang, Jiacheng Liu, Zhongjun Yang, Rongjin Li, Zihua Rong, Haoyang He, Zhuodi Hao, Xinyang Hu,
+Kun Ji, Ziyan Ma, and 1 others. 2025a. Finmmr: make financial numerical reasoning more multimodal,
+comprehensive, and challenging. InProceedings of the IEEE/CVF International Conference on Computer Vision,
+pages 3245–3257.
+Ziyi Tang, Zechuan Chen, Jiarui Yang, Jiayao Mai, Yongsen Zheng, Keze Wang, Jinrui Chen, and Liang Lin. 2025b.
+Alphaagent: Llm-driven alpha mining with regularized exploration to counteract alpha decay. InProceedings of
+the 31st ACM SIGKDD Conference on Knowledge Discovery and Data Mining V . 2, pages 2813–2822.
+Saizhuo Wang, Hang Yuan, Leon Zhou, Lionel Ni, Heung Yeung Shum, and Jian Guo. 2025. Alpha-gpt: Human-ai
+interactive alpha mining for quantitative investment. InProceedings of the 2025 Conference on Empirical
+Methods in Natural Language Processing: System Demonstrations, pages 196–206.
+15
+Yijia Xiao, Edward Sun, Di Luo, and Wei Wang. 2024. Tradingagents: Multi-agents llm financial trading framework.
+arXiv preprint arXiv:2412.20138.
+Zhi Yang, Runguo Li, Qiqi Qiang, Jiashun Wang, Fangqi Lou, Mengping Li, Dongpo Cheng, Rui Xu, Heng
+Lian, Shuo Zhang, and 1 others. 2026. Finvault: Benchmarking financial agent safety in execution-grounded
+environments.arXiv preprint arXiv:2601.07853.
+Yangyang Yu, Haohang Li, Zhi Chen, Yuechen Jiang, Yang Li, Jordan W Suchow, Denghui Zhang, and Khaldoun
+Khashanah. 2025. Finmem: A performance-enhanced llm trading agent with layered memory and character
+design.IEEE Transactions on Big Data.
+Yangyang Yu, Zhiyuan Yao, Haohang Li, Zhiyang Deng, Yuechen Jiang, Yupeng Cao, Zhi Chen, Jordan Suchow,
+Zhenyu Cui, Rong Liu, and 1 others. 2024. Fincon: A synthesized llm multi-agent system with conceptual verbal
+reinforcement for enhanced financial decision making.Advances in Neural Information Processing Systems,
+37:137010–137045.
+Yunpeng Zhai, Shuchang Tao, Cheng Chen, Anni Zou, Ziqian Chen, Qingxu Fu, Shinji Mai, Li Yu, Jiaji Deng,
+Zouying Cao, and 1 others. 2025. Agentevolver: Towards efficient self-evolving agent system.arXiv preprint
+arXiv:2511.10395.
+Shuo Zhang, Chaofa Yuan, Ryan Guo, Xiaomin Yu, Rui Xu, Zhangquan Chen, Zinuo Li, Zhi Yang, Shuhao Guan,
+Zhenheng Tang, and 1 others. 2026. Evofsm: Controllable self-evolution for deep research with finite state
+machines.arXiv preprint arXiv:2601.09465.
+Wentao Zhang, Lingxuan Zhao, Haochong Xia, Shuo Sun, Jiaze Sun, Molei Qin, Xinyi Li, Yuqing Zhao, Yilei
+Zhao, Xinyu Cai, and 1 others. 2024. A multimodal foundation agent for financial trading: Tool-augmented,
+diversified, and generalist. InProceedings of the 30th acm sigkdd conference on knowledge discovery and data
+mining, pages 4314–4325.
+16
+SUMMARY OF THE APPENDIX
+This appendix contains additional details for the“QuantaAlpha: An Evolutionary Framework for
+LLM-Driven Alpha Mining”. The appendix is organized as follows:
+Appendix Table of Contents
+A Experiment Settings 17
+A.1 Evaluation Metrics . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 17
+A.2 Backtesting Setup . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 18
+A.3 Baselines . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 18
+B Algorithm Configuration 18
+C Case Study: Factor Evolution Trajectory 18
+C.1 Factor Identity . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 20
+C.2 Evolution Lineage . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 20
+C.3 Synthesized Hypothesis . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 21
+C.4 Backtest Performance . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 22
+C.5 Trajectory Summary . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 22
+A Experiment Settings
+This section provides details of our experimental setup, including computational infrastructure, evaluation
+metrics, backtesting setup, and baselines.
+A.1 Evaluation Metrics
+We evaluate predictive performance using two categories of metrics: factor predictive power and strategy-
+level performance.
+Without loss of generality, the bar notation¯· denotes the mean, and σ(·) denotes the standard deviation.
+• Information Coefficient (IC): Pearson correlation between factor values ft and future returns rt+1:
+ICt = (ft − ¯ft1)⊤(rt+1 −¯rt+11)
+∥ft − ¯ft1∥2 · ∥rt+1 −¯rt+11∥2
+,
+where1denotes a column vector of ones.
+•ICIR: Information ratio of IC, measuring consistency:ICIR = IC/σ(IC).
+•Rank IC: Spearman correlation using rank vectors ˜ft = rank(ft)and ˜rt+1 = rank(rt+1):
+RankICt = (˜ft − ¯˜ft1)⊤(˜rt+1 − ¯˜rt+11)
+∥˜ft − ¯˜ft1∥2 · ∥˜rt+1 − ¯˜rt+11∥2
+,
+whererank(·)is the rank function applied element-wise to its input vector in ascending order.
+•Rank ICIR: Information ratio of Rank IC:RankICIR = RankIC/σ(RankIC).
+All strategy metrics are computed onexcess returns after transaction costs, whererexcess,t =r portfolio,t −
+rbenchmark,t −c transaction,t. Here, rportfolio,t represents the return of the strategy portfolio, rbenchmark,t denotes
+the return of the market benchmark, andc transaction,t accounts for the transaction costs incurred at timet.
+•Information Ratio (IR):IR = ( rexcess/σ(rexcess))×
+√
+252.
+•Annualized Return (ARR): Annualized excess return over benchmark.
+•Maximum Drawdown (MDD): Largest peak-to-trough decline in cumulative excess returns.
+•Calmar Ratio (CR):CR = ARR/|MDD|.
+17
+A.2 Backtesting Setup
+Backtesting is conducted using the Qlib framework across the CSI 300, CSI 500, and S&P 500 indices,
+with the data split detailed in Table 5. Factor construction utilizes six basic features— open, high, low,
+close, volume, and vwap—to predict the next-day return, defined as yt =P close
+t+2 /P close
+t+1 −1 , where P close
+t
+denotes the closing price at time t. To ensure robustness against outliers, the preprocessing pipeline
+includes forward-filling missing values, replacing infinite values, dropping samples with missing labels,
+and applying cross-sectional rank normalization (CSRankNorm) to both features and labels.
+Table 5: Data Split Periods for Train, Validation, and Test Sets across All Markets
+Market Train Valid Test
+CSI 300 2016-01-01–2020-12-31 2021-01-01–2021-12-31 2022-01-01–2025-12-26
+CSI 500 2016-01-01–2020-12-31 2021-01-01–2021-12-31 2022-01-01–2025-12-26
+S&P 500 2016-01-01–2020-12-31 2021-01-01–2021-12-31 2022-01-01–2025-12-26
+A.3 Baselines
+We benchmark against four categories: (1)ML models: Linear Regression (Linear), Multi-Layer
+Perceptron (MLP), and gradient boosting decision trees including LightGBM, XGBoost, and CatBoost,
+along with DoubleEnsemble, an ensemble method for financial time series; (2)Deep learning: Recurrent
+networks such as Gated Recurrent Unit (GRU) and Long Short-Term Memory (LSTM), the attention-based
+Transformer, and Temporal Routing Adaptor (TRA); (3)Classical factors: Alpha158 and Alpha360,
+which are widely used sets of technical factors derived from price and volume; (4)LLM agents: RD-Agent
+and AlphaAgent, which utilize large language models for automated factor mining. For the LLM-agent
+baselines (RD-Agent and AlphaAgent), we evaluate multiple backbone LLMs, including Qwen3-235B,
+DeepSeek-V3.2, Gemini-3-Pro-Preview, Claude-4.5-Sonnet, and GPT-5.2. Unless otherwise specified, all
+other LLM-based experiments in this paper adopt DeepSeek-V3.2 for consistency and fair comparison.
+B Algorithm Configuration
+This section details the evolution algorithm parameters, factor constraints, and trading strategy configura-
+tion.
+QuantaAlpha employs an evolutionary algorithm with mutation and crossover operations, with Light-
+GBM used as the downstream model for factor-based prediction. In the Planning Phase of the algorithm,
+we set ten parallel exploration directions to broaden the initial coverage of research space. For the
+experimental setup, beyond the original round, the algorithm follows a fixed iterative process: the main
+experiment consists of 5 total iterations, and each iteration comprises one Mutation phase followed by
+one Crossover phase—alternating between these two phases to iteratively refine high-quality hypotheses.
+Additionally, we set a rule that each hypothesis attempts to generate 3 factor expressions, ensuring a
+focused yet sufficient exploration of factor candidates under each research direction.
+To prevent overfitting and ensure interpretability, factor expressions—built using the operators listed in
+Table 6—are restricted by the following constraints: symbol length ≤ 250 characters, base features ≤ 6,
+free arguments ratio<50
+We employ a TopkDropout strategy for portfolio construction, as detailed in Table 7. On each trading
+day, stocks are ranked according to their predicted scores; the ndrop lowest-scoring holdings are liquidated
+and replaced with the highest-ranked candidates to maintain a constant portfolio size with equal weighting.
+C Case Study: Factor Evolution Trajectory
+This appendix presents a detailed case study of factor evolution in QuantaAlpha. We trace the complete
+trajectory of a representative factor—Institutional_Momentum_Score_20D—through the crossover phase,
+demonstrating how the evolutionary framework synthesizes complementary market hypotheses from
+parent trajectories.
+18
+Table 6: List of Supported Operators for Factor Construction
+Category Operators Description
+Time-SeriesDELTA , DELAY, TS_MEAN, TS_STD, TS_VAR, TS_MAX, TS_MIN,
+TS_SUM, TS_RANK, TS_CORR, TS_COVARIANCE, TS_ARGMAX,
+TS_ARGMIN, TS_SKEW, TS_KURT, TS_PCTCHANGE, TS_ZSCORE,
+TS_QUANTILE
+Rolling statistics computed along time axis
+per instrument
+Cross-SectionalRANK , ZSCORE, SCALE, MEAN, STD, MEDIAN, MAX, MIN, SKEW, KURT Statistics computed across stocks per date-
+time
+MathematicalABS,SIGN,LOG,EXP,SQRT,POW,INVElement-wise mathematical functions
+TechnicalSMA , EMA, WMA, MACD, RSI, BB_UPPER, BB_LOWER, DECAYLINEAR,
+REGBETA,REGRESI
+Common technical indicators
+LogicalGT,LT,GE,LE,AND,OR,WHEREComparison and conditional operators
+AuxiliaryCOUNT,SUMIF,FILTER,PROD,HIGHDAY,LOWDAYHelper functions for complex expressions
+Table 7: Parameters for the TopkDropout Trading Strategy
+Parameter Value Description
+Portfolio
+topk 50 Number of stocks held
+n_drop 5 Stocks dropped per rebalance
+Transaction Costs
+Buying Fee 0.05% Commission
+Selling Fee 0.15% Commission + stamp duty
+Execution
+Deal Price Open Next-day opening price
+Limit Threshold 9.5% Price limit for halt
+Benchmark
+China SH000300/SH000905 CSI 300/CSI500
+U.S. SPX S&P 500
+19
+QuantaAlpha’s evolution process operates in three phases: (1)Originalphase where initial hypotheses
+are generated, (2)Mutationphase where existing trajectories are perturbed to explore diversified strategies,
+and (3)Crossoverphase where high-performing parent trajectories are combined to synthesize offspring
+with potentially superior predictive power. The following factor card illustrates a Crossover operation.
+C.1 Factor Identity
+The factor card below presents the basic information of the evolved factor, including its unique identifiers,
+evolution lineage, and mathematical formulation.
+/tagInstitutional_Momentum_Score_20D
+Factor ID:c57cace576a95356
+Trajectory ID:df5a496878f4
+Evolution Round:Round 10
+Evolution Phase: Crossover
+Direction ID:6
+Factor Expression:
+RANK(TS_CORR(DELTA(close, 1)/close, DELTA(volume, 1)/volume, 20) * TS_MEAN((close -
+open)/close, 5))
+Mathematical Formulation:
+IMS20D =RANK
+ 
+ρ20
+∆P
+P , ∆V
+V
+
+×
+ C−O
+C
+
+5
+!
+,
+where ρ20(·,·) denotes the 20-day rolling correlation, ∆P/P is the daily return, ∆V /V is the volume change ratio, (·)5
+is the 5-day moving average, andCandOrepresent the closing and opening prices, respectively.
+Factor Interpretation:
+This factor captures institutional-driven momentum by measuring two key signals: (1) the correlation between price
+returns and volume changes, which indicates coordinated institutional trading when positive; and (2) the average intraday
+return pattern, reflecting institutional activity that typically influences closing prices. The cross-sectional ranking ensures
+comparability across stocks.
+C.2 Evolution Lineage
+The crossover operation combines insights from two parent trajectories with complementary market
+hypotheses. Parent 1 focuses on identifyingfragile momentumdriven by retail speculation, while
+Parent 2 targetssustainable momentumsupported by institutional activity. The LLM synthesizes these
+complementary perspectives into a unified framework.
+/dnaEvolution Information
+/code-branchParent Trajectories:
+20
+Parent 1: 1e6d57e38e89
+Round:Round 9
+Phase:Mutation
+Rank IC:0.0216
+IC:0.0059
+IR:1.297
+Core Hypothesis:
+When retail investors exhibit herd behavior and momentum chasing in stocks with high social media activity, but
+accompanied by declining institutional ownership and deteriorating fundamentals, the resulting price momentum
+is unsustainable and leads to mean reversion.
+Parent 2: 47e0f0e55382
+Round:Round 8
+Phase:Crossover
+Rank IC:0.0246
+IC:0.0069
+IR:1.347
+Core Hypothesis:
+A regime-adaptive structural momentum factor combining institutional ownership-driven medium-term price
+trends with short-term microstructure regime validation, where coordinated accumulation/distribution patterns
+amplify momentum when confirmed by microstructure alignment.
+♂site¶apEvolution Path Diagram:
+Parent 1
+Round 9 Mutation
+Rank IC: 0.0216
+Parent 2
+Round 8 Crossover
+Rank IC: 0.0246
+Offspring Factor
+Round 8 Crossover
+Rank IC:0.0311
+C.3 Synthesized Hypothesis
+Through crossover, the LLM generates a new hypothesis that integrates the complementary insights from
+both parents, rather than simply averaging their factor expressions. This hypothesis-driven approach
+ensures that the offspring factor captures genuinely novel market dynamics.
+♂lightbulbHypothesis
+Core Hypothesis:
+A regime-aware dual-source momentum factor that combines institutional-driven structural momen-
+tum (validated by healthy microstructure) and retail-driven speculative momentum (characterized
+by high attention and deteriorating fundamentals), dynamically weighted by market volatility:
+amplifying institutional signals in stable regimes and retail reversal signals in turbulent regimes,
+will generate superior predictive returns.
+21
+Component Description
+Observation Parent strategies separately targeting institutional trends and retail
+herding show moderate predictive power (Rank IC ∼0.02–0.025),
+suggesting combined signals could capture complementary market
+dynamics.
+Justification Sustainable price trends require institutional sponsorship and or-
+derly trading, while retail-driven bubbles lack fundamental support
+and reverse under stress; a hybrid model exploiting both can en-
+hance robustness across market regimes.
+Domain Knowledge Institutional accumulation with strong price-volume correlation
+and low volatility indicates sustainable momentum; retail herding
+with declining institutional ownership and high volatility signals
+fragile momentum prone to reversal.
+C.4 Backtest Performance
+After factor construction, QuantaAlpha automatically backtests the generated factors using the Qlib
+framework. The results below compare the offspring factor against both parent trajectories and the
+baseline, demonstrating the effectiveness of the crossover operation.
+/char◎-lineBacktest Metrics
+Metric Offspring Factor Baseline
+IC0.0126 0.0058
+Rank IC 0.03110.0220
+ARR (Excess)7.80% 5.20%
+IR0.963 0.973
+MDD (Excess)−11.37%−7.30%
+Detailed Statistics:
+Metric Value Metric Value
+Daily Excess Return (w/o cost)0.0328% Daily Excess Return (w/ cost)0.0128%
+Excess Return Std0.52% Turnover (FFR)100%
+L2 Train Loss0.9936 L2 Valid Loss0.9962
+C.5 Trajectory Summary
+After evaluating backtest results, the LLM provides structured summary. This trajectory summary loop
+enables continuous improvement by learning from both successes and failures.
+/commen◎sEvaluation & Summary
+♂searchObservations:
+The crossover operation demonstrates a trade-off between enhanced predictive accuracy and
+increased risk exposure compared to the baseline:
+•/check-circleSignificant improvement in annualized excess return and predictive metrics (IC and Rank
+IC), validating the effectiveness of synthesizing dual-source momentum signals.
+•/times-circleIncreased maximum drawdown and a marginal decline in the Information Ratio, suggesting
+that the offspring factor introduces higher volatility during certain market regimes.
+22
+/balance-scaleHypothesis Evaluation:
+Results partially support the hypothesis. Improved annualized return and IC suggest that combining institutional and
+retail momentum signals has merit. However, deterioration in risk metrics indicates that without proper regime-adaptive
+weighting, the combined signals may amplify risks during turbulent periods. The full hypothesis requires all three
+components (institutional momentum, retail herding reversal, volatility-adaptive weighting) to work effectively.
+/flagDecision:REJECTEDfor direct deployment.
+/exclamati⌢n-triangleRecommendations:
+1. Use 20-day price-volume correlation as institutional momentum proxy;
+2. Use 5-day average intraday returns as retail attention proxy;
+3. Add volatility regime indicator (recent/historical volatility ratio) for dynamic weighting.
+This summary will inform the next mutation round, guiding the LLM to simplify the factor expression while preserving
+the core dual-source concept.
+23
