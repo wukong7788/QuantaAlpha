@@ -11,7 +11,6 @@ from quantaalpha.core.proposal import Hypothesis, Scenario, Trace
 from quantaalpha.core.experiment import Experiment
 from quantaalpha.factors.experiment import QlibFactorExperiment
 from quantaalpha.llm.client import APIBackend, robust_json_parse
-import os
 import pandas as pd
 from quantaalpha.log import logger
 from quantaalpha.factors.regulator.factor_regulator import FactorRegulator
@@ -232,7 +231,6 @@ class AlphaAgentHypothesisGen(FactorHypothesisGen):
         self.potential_direction = potential_direction
 
     def prepare_context(self, trace: Trace, history_limit: int = DEFAULT_HISTORY_LIMIT) -> Tuple[dict, bool]:
-        
         if len(trace.hist) > 0:
             hypothesis_and_feedback = render_hypothesis_and_feedback(
                 qa_prompt_dict, trace, history_limit

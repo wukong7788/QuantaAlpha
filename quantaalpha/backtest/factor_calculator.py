@@ -328,24 +328,21 @@ Output format: Just the expression string, nothing else.
     def _load_from_cache(self, expr: str) -> Optional[pd.Series]:
         """Load factor from cache."""
         cache_key = self._get_cache_key(expr)
-        cache_file = self.cache_dir / f"{cache_key}.pkl"
-        
-        if cache_file.exists():
-            try:
-                return pd.read_pickle(cache_file)
-            except Exception:
-                return None
-        return None
+        from quantaalpha.utils.factor_cache import read_factor_cache
+
+        try:
+            return read_factor_cache(self.cache_dir, cache_key, config=self.llm_config)
+        except Exception:
+            return None
     
     def _save_to_cache(self, expr: str, result: pd.Series):
         """Save factor to cache."""
         cache_key = self._get_cache_key(expr)
-        cache_file = self.cache_dir / f"{cache_key}.pkl"
-        
-        try:
-            result.to_pickle(cache_file)
-        except Exception as e:
-            logger.warning(f"Save to cache failed: {str(e)}")
+        from quantaalpha.utils.factor_cache import write_factor_cache
+
+        ok = write_factor_cache(self.cache_dir, cache_key, result, config=self.llm_config)
+        if not ok:
+            logger.warning("Save to cache failed")
 
 
 class QlibDataProvider:
@@ -405,4 +402,3 @@ class QlibDataProvider:
         logger.info(f"Loaded stock data: {len(df)} rows")
         
         return df
-

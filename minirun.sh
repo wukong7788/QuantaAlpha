@@ -70,6 +70,31 @@ if [ -z "${DEBUG_DATA_DIR}" ] || [ ! -f "${DEBUG_DATA_DIR}/daily_pv.h5" ]; then
   exit 1
 fi
 
+# Parse optional flags before positional args
+EXTRA_FLAGS=""
+POSITIONAL_ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --low-disk)
+      EXTRA_FLAGS="${EXTRA_FLAGS} --low-disk"
+      shift
+      ;;
+    --no-low-disk)
+      EXTRA_FLAGS="${EXTRA_FLAGS} --no-low-disk"
+      shift
+      ;;
+    --zoo-dedup)
+      EXTRA_FLAGS="${EXTRA_FLAGS} --zoo-dedup"
+      shift
+      ;;
+    *)
+      POSITIONAL_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- "${POSITIONAL_ARGS[@]}"
+
 DIRECTION="${1:-价量因子挖掘}"
 STEP_N_VALUE="${STEP_N:-5}"
 CONFIG_FILE="${CONFIG_PATH:-configs/experiment_smoke.yaml}"
@@ -119,7 +144,7 @@ echo "----------------------------------------"
 
 START_TS="$(date +%s)"
 set +e
-CONFIG_PATH="${CONFIG_FILE}" STEP_N="${STEP_N_VALUE}" EXPERIMENT_ID="${EXPERIMENT_ID}" FACTOR_LIBRARY_SUFFIX="${FACTOR_LIBRARY_SUFFIX}" bash ./run.sh "${DIRECTION}"
+CONFIG_PATH="${CONFIG_FILE}" STEP_N="${STEP_N_VALUE}" EXPERIMENT_ID="${EXPERIMENT_ID}" FACTOR_LIBRARY_SUFFIX="${FACTOR_LIBRARY_SUFFIX}" bash ./run.sh ${EXTRA_FLAGS} "${DIRECTION}"
 RC=$?
 set -e
 END_TS="$(date +%s || true)"

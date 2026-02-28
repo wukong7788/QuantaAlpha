@@ -160,13 +160,14 @@ def _collect_orphan_factor_cache(
         return []
 
     plans: list[DeletePlan] = []
-    for pkl_file in factor_cache_dir.glob("*.pkl"):
-        if pkl_file.stem not in keep_md5:
+    cache_files = list(factor_cache_dir.glob("*.pkl")) + list(factor_cache_dir.glob("*.parquet"))
+    for cache_file in cache_files:
+        if cache_file.stem not in keep_md5:
             plans.append(
                 DeletePlan(
-                    path=pkl_file,
+                    path=cache_file,
                     reason="orphan factor_cache (not referenced by factor libraries)",
-                    size_bytes=_path_size(pkl_file),
+                    size_bytes=_path_size(cache_file),
                 )
             )
     return plans
@@ -690,7 +691,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--prune-factor-cache",
         action="store_true",
-        help="Delete factor_cache *.pkl not referenced by factorlib JSONs (off by default).",
+        help="Delete factor_cache *.pkl/*.parquet not referenced by factorlib JSONs (off by default).",
     )
     parser.add_argument(
         "--factor-cache-dir",

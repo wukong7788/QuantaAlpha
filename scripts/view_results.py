@@ -34,6 +34,11 @@ class RunMeta:
     mode: str
     quality_min: str
     max_factors: str
+    corr_dedup: bool
+    dedup_topn_effective: str
+    dedup_per_cluster: str
+    dedup_corr_threshold: str
+    dedup_sample_size: str
     bob_grade: str
     bob_top: str
     bob_metric: str
@@ -45,6 +50,12 @@ class RunMeta:
     @property
     def params_tag(self) -> str:
         base = f"m={self.mode or '-'};q={self.quality_min or '-'};mf={self.max_factors or '-'}"
+        if self.corr_dedup:
+            topn = self.dedup_topn_effective or "-"
+            k = self.dedup_per_cluster or "-"
+            th = self.dedup_corr_threshold or "-"
+            ss = self.dedup_sample_size or "-"
+            base = f"{base};dedup=on(topn={topn},k={k},th={th},ss={ss})"
         if self.bob_enabled:
             return f"{base};bob={self.bob_grade or '-'}/{self.bob_top or '-'}({self.bob_metric or '-'})"
         return base
@@ -137,6 +148,11 @@ def _parse_pid_file(path: Path) -> RunMeta | None:
         mode=data.get("mode", ""),
         quality_min=data.get("quality_min", ""),
         max_factors=data.get("max_factors", ""),
+        corr_dedup=_as_bool(data.get("corr_dedup", "false")),
+        dedup_topn_effective=data.get("dedup_topn_effective", ""),
+        dedup_per_cluster=data.get("dedup_per_cluster", ""),
+        dedup_corr_threshold=data.get("dedup_corr_threshold", ""),
+        dedup_sample_size=data.get("dedup_sample_size", ""),
         bob_grade=data.get("bob_grade", ""),
         bob_top=data.get("bob_top", ""),
         bob_metric=data.get("bob_metric", ""),

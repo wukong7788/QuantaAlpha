@@ -24,8 +24,10 @@ cd "${SCRIPT_DIR}"
 # Parse arguments early (avoid side effects for --help)
 # =============================================================================
 LOW_DISK_MODE=true
+ZOO_DEDUP_MODE=false
 RELAY_MODE=false
 RESUME_MODE=false
+ROUNDS_OVERRIDE=""
 POSITIONAL_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -45,22 +47,36 @@ while [[ $# -gt 0 ]]; do
             RESUME_MODE=true
             shift
             ;;
+        --zoo-dedup)
+            ZOO_DEDUP_MODE=true
+            shift
+            ;;
+        --rounds)
+            ROUNDS_OVERRIDE="$2"
+            shift 2
+            ;;
         -h|--help)
             echo "Usage:"
-            echo "  ./run.sh [--low-disk|--no-low-disk] [--relay|--resume] \"initial direction\" [library_suffix]"
+            echo "  ./run.sh [--low-disk|--no-low-disk] [--relay|--resume] [--zoo-dedup] [--rounds N] \"initial direction\" [library_suffix]"
             echo ""
             echo "Options:"
-            echo "  --low-disk   Enable low-disk mode."
-            echo "  --no-low-disk Disable low-disk mode (default is ON)."
-            echo "               Low-disk mode disables pickle cache, compresses parquet,"
-            echo "               and purges large temporary files after backtest/cache sync."
-            echo "  --relay      Relay mode: run in planned chunks."
-            echo "               Default chunk is 5 rounds; next run auto-completes remaining rounds"
-            echo "               up to evolution.max_rounds (default 11)."
-            echo "  --resume     Resume mode: continue from saved state directly to max_rounds."
+            echo "  --low-disk    Enable low-disk mode (default: ON)."
+            echo "  --no-low-disk Disable low-disk mode."
+            echo "                Low-disk mode disables pickle cache, compresses parquet,"
+            echo "                and purges large temporary files after backtest/cache sync."
+            echo "  --relay       Relay mode: run in planned chunks."
+            echo "                Default chunk is 5 rounds; next run auto-completes remaining rounds"
+            echo "                up to evolution.max_rounds (default 11)."
+            echo "  --resume      Resume mode: continue from saved state directly to max_rounds."
+            echo "  --zoo-dedup   Zoo dedup mode: skip factor expressions already explored in any"
+            echo "                previous run. Sets factor_zoo_path to data/factorlib/factor_zoo.json"
+            echo "                and auto-updates the zoo when the experiment finishes."
+            echo "  --rounds N    Override evolution.max_rounds (e.g. --rounds 23 for full paper reproduction)."
+            echo "                Creates a temporary config with max_rounds replaced; original config is unchanged."
             echo ""
             echo "Environment override:"
             echo "  QUANTA_RELAY_CHUNK_ROUNDS=5   first relay leg rounds (default 5)"
+            echo "  QUANTA_FACTOR_ZOO_PATH=...    override zoo path (default: data/factorlib/factor_zoo.json)"
             exit 0
             ;;
         *)
@@ -85,6 +101,22 @@ fi
 # =============================================================================
 # Load .env configuration
 # =============================================================================
+# Preserve pre-set env overrides from caller (A/B harness, CI, etc.).
+# NOTE: `.env` is sourced with `set -a`, which would otherwise overwrite these.
+_HAS_CONFIG_PATH=0; _SAVED_CONFIG_PATH=""
+_HAS_STEP_N=0; _SAVED_STEP_N=""
+_HAS_EXPERIMENT_ID=0; _SAVED_EXPERIMENT_ID=""
+_HAS_FACTOR_LIBRARY_SUFFIX=0; _SAVED_FACTOR_LIBRARY_SUFFIX=""
+_HAS_DATA_RESULTS_DIR=0; _SAVED_DATA_RESULTS_DIR=""
+_HAS_LOG_TRACE_PATH=0; _SAVED_LOG_TRACE_PATH=""
+
+if [ "${CONFIG_PATH+x}" = "x" ]; then _HAS_CONFIG_PATH=1; _SAVED_CONFIG_PATH="${CONFIG_PATH}"; fi
+if [ "${STEP_N+x}" = "x" ]; then _HAS_STEP_N=1; _SAVED_STEP_N="${STEP_N}"; fi
+if [ "${EXPERIMENT_ID+x}" = "x" ]; then _HAS_EXPERIMENT_ID=1; _SAVED_EXPERIMENT_ID="${EXPERIMENT_ID}"; fi
+if [ "${FACTOR_LIBRARY_SUFFIX+x}" = "x" ]; then _HAS_FACTOR_LIBRARY_SUFFIX=1; _SAVED_FACTOR_LIBRARY_SUFFIX="${FACTOR_LIBRARY_SUFFIX}"; fi
+if [ "${DATA_RESULTS_DIR+x}" = "x" ]; then _HAS_DATA_RESULTS_DIR=1; _SAVED_DATA_RESULTS_DIR="${DATA_RESULTS_DIR}"; fi
+if [ "${LOG_TRACE_PATH+x}" = "x" ]; then _HAS_LOG_TRACE_PATH=1; _SAVED_LOG_TRACE_PATH="${LOG_TRACE_PATH}"; fi
+
 if [ -f "${SCRIPT_DIR}/.env" ]; then
     set -a
     source "${SCRIPT_DIR}/.env"
@@ -94,6 +126,14 @@ else
     echo "Please run: cp configs/.env.example .env"
     exit 1
 fi
+
+# Restore preserved overrides.
+if [ "${_HAS_CONFIG_PATH}" -eq 1 ]; then CONFIG_PATH="${_SAVED_CONFIG_PATH}"; export CONFIG_PATH; fi
+if [ "${_HAS_STEP_N}" -eq 1 ]; then STEP_N="${_SAVED_STEP_N}"; export STEP_N; fi
+if [ "${_HAS_EXPERIMENT_ID}" -eq 1 ]; then EXPERIMENT_ID="${_SAVED_EXPERIMENT_ID}"; export EXPERIMENT_ID; fi
+if [ "${_HAS_FACTOR_LIBRARY_SUFFIX}" -eq 1 ]; then FACTOR_LIBRARY_SUFFIX="${_SAVED_FACTOR_LIBRARY_SUFFIX}"; export FACTOR_LIBRARY_SUFFIX; fi
+if [ "${_HAS_DATA_RESULTS_DIR}" -eq 1 ]; then DATA_RESULTS_DIR="${_SAVED_DATA_RESULTS_DIR}"; export DATA_RESULTS_DIR; fi
+if [ "${_HAS_LOG_TRACE_PATH}" -eq 1 ]; then LOG_TRACE_PATH="${_SAVED_LOG_TRACE_PATH}"; export LOG_TRACE_PATH; fi
 
 # =============================================================================
 # Resolve Python environment (prefer uv .venv, no conda dependency)
@@ -149,6 +189,19 @@ export FACTOR_CoSTEER_PYTHON_BIN="${FACTOR_CoSTEER_PYTHON_BIN:-${PYTHON_BIN}}"
 # Experiment isolation
 # =============================================================================
 CONFIG_PATH=${CONFIG_PATH:-"configs/experiment.yaml"}
+
+# If --rounds N is given, create a temp config with max_rounds overridden
+_TEMP_CONFIG=""
+if [ -n "${ROUNDS_OVERRIDE}" ]; then
+    if ! [[ "${ROUNDS_OVERRIDE}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Error: --rounds must be a positive integer (got '${ROUNDS_OVERRIDE}')."
+        exit 1
+    fi
+    _TEMP_CONFIG="$(mktemp /tmp/quanta_config_rounds_XXXXXX.yaml)"
+    sed "s/max_rounds:[ ]*[0-9]\+/max_rounds: ${ROUNDS_OVERRIDE}/" "${CONFIG_PATH}" > "${_TEMP_CONFIG}"
+    echo "Rounds override: max_rounds=${ROUNDS_OVERRIDE} (temp config: ${_TEMP_CONFIG})"
+    CONFIG_PATH="${_TEMP_CONFIG}"
+fi
 
 if [ -z "${EXPERIMENT_ID}" ]; then
     if [ "${RELAY_MODE}" = true ] || [ "${RESUME_MODE}" = true ]; then
@@ -279,8 +332,48 @@ if [ -f "${SCRIPT_DIR}/scripts/preflight_check.py" ]; then
     echo "----------------------------------------"
 fi
 
+if [ "${ZOO_DEDUP_MODE}" = true ]; then
+    # factor_regulator.py reads zoo via pd.read_csv → point to CSV file
+    # Env var matches FactorCoSTEERSettings(env_prefix="FACTOR_CoSTEER_") + field factor_zoo_path
+    ZOO_CSV_PATH="${QUANTA_FACTOR_ZOO_PATH:-${SCRIPT_DIR}/data/factorlib/factor_zoo.csv}"
+    export FACTOR_CoSTEER_FACTOR_ZOO_PATH="${ZOO_CSV_PATH}"
+    echo "Zoo dedup mode: ON"
+    echo "  Zoo CSV: ${ZOO_CSV_PATH}"
+    if [ -f "${ZOO_CSV_PATH}" ]; then
+        ZOO_COUNT=$(( $(wc -l < "${ZOO_CSV_PATH}") - 1 ))
+        echo "  Zoo size: ${ZOO_COUNT} expressions (skip before calculate/backtest)"
+    else
+        echo "  Zoo CSV not found — will be created after first run. Run:"
+        echo "    ${PYTHON_BIN} scripts/update_factor_zoo.py build"
+    fi
+    echo "----------------------------------------"
+fi
+
 if [ -n "${STEP_N}" ]; then
     "${QA_BIN}" mine --direction "${DIRECTION}" --step_n "${STEP_N}" --config_path "${CONFIG_PATH}"
 else
     "${QA_BIN}" mine --direction "${DIRECTION}" --config_path "${CONFIG_PATH}"
 fi
+MINE_EXIT_CODE=$?
+
+# Clean up temp config if --rounds was used
+if [ -n "${_TEMP_CONFIG}" ] && [ -f "${_TEMP_CONFIG}" ]; then
+    rm -f "${_TEMP_CONFIG}"
+fi
+
+# After experiment: auto-update factor zoo if --zoo-dedup is on
+if [ "${ZOO_DEDUP_MODE}" = true ]; then
+    echo ""
+    echo "----------------------------------------"
+    echo "[zoo-dedup] Updating factor zoo with new factors from this run..."
+    ZOO_UPDATE_ARGS="update"
+    if [ -n "${LIBRARY_SUFFIX}" ]; then
+        ZOO_UPDATE_ARGS="update --lib ${LIBRARY_SUFFIX}"
+    fi
+    "${PYTHON_BIN}" "${SCRIPT_DIR}/scripts/update_factor_zoo.py" ${ZOO_UPDATE_ARGS} || \
+        echo "[zoo-dedup] Warning: zoo update failed (non-fatal)"
+    echo "[zoo-dedup] Zoo updated. Next run with --zoo-dedup will skip these factor expressions."
+fi
+
+exit ${MINE_EXIT_CODE}
+

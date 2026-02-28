@@ -1,6 +1,6 @@
 # QuantaAlpha 因子挖掘提速与质量守恒优化指南（第一性原理版）
 
-更新时间：2026-02-26
+更新时间：2026-02-28
 适用范围：`run.sh` / `run_doctor` / 演化模式（original -> mutation -> crossover）
 
 ---
@@ -61,13 +61,13 @@
 - `evolution.parallel_enabled = false`
 - `evolution.max_parallel_workers = 2`
 - `evolution.max_empty_retries = 1`
-- `factor.factors_per_hypothesis = 1`
 - `quality_gate.consistency_enabled = false`
-- `quality_gate.cheap_filter_enabled = true`
+- `quality_gate.cheap_filter_enabled = false`（默认关闭；A/B（STEP_N=3）为负优化）
 - `quality_gate.max_construct_failures_per_branch = 2`
 - `quality_gate.max_json_parse_failures_per_branch = 2`
 - `llm.max_retries = 3`
 - `llm.retry_delay = 1.0`
+- `llm.json_mode_temperature = 0.5`
 
 运行环境（本机）：
 
@@ -112,11 +112,11 @@
   - `construct` 仅保留必要规则 + 最近高价值失败摘要
   - 历史长文本改为结构化短摘要（失败类型、修复指令、反例）
 - 文件与参数：
-  - `quantaalpha/factors/proposal.py -> DEFAULT_HISTORY_LIMIT`（当前 4）
+  - `quantaalpha/factors/proposal.py -> DEFAULT_HISTORY_LIMIT`（固定 4）
   - `quantaalpha/factors/prompts/prompts.yaml`（构造提示词模板）
   - `quantaalpha/factors/coder/qa_prompts.yaml`（函数与表达式约束文案）
 - 建议起点：
-  - 将 `DEFAULT_HISTORY_LIMIT` 从 6 降到 3~4 做 A/B
+  - 如需复测，需在单独分支改代码常量（例如 6 vs 4）并同时看耗时与质量信号（见 **5.4 opt3**）
   - 保留最近 3 条失败摘要，不直接拼接长原文
 - 预期收益：
   - 减少 token 和响应波动，提升稳定性
@@ -174,21 +174,26 @@
 - 质量护栏：
   - 固定随机种子、任务隔离、失败重试与可复现日志
 
-### 3.6 [ ] 缓存格式升级：Parquet + ZSTD
+### 3.6 [x] 缓存格式升级：Parquet + ZSTD
 
-- 优化点：
-  - `factor_cache` 从 `.pkl` 迁移至 `parquet+zstd`（可双写灰度）
+- 目标：降低 `data/results/factor_cache` 的磁盘占用，并在可控前提下改善读取开销（读取失败时可回退到 `*.pkl`）。
 - 文件与参数：
-  - 读取：`quantaalpha/backtest/custom_factor_calculator.py`
-  - 读写：`quantaalpha/backtest/factor_calculator.py`
-  - 同步：`quantaalpha/factors/library.py`
-  - 路径：`configs/backtest*.yaml -> cache_dir`（当前 `data/results/factor_cache`）
-- 预期收益：
-  - 空间压力显著下降，I/O 更稳定
-- 实验观察：
-  - 抽样基准显示体积约可下降 58%（具体以实际数据为准）
-- 质量护栏：
-  - 先双读（新格式优先，旧格式回退），再完全切换
+  - 统一 I/O：`quantaalpha/utils/factor_cache.py`（parquet 优先读；可选 dual-write pkl）
+  - 回测读取：`quantaalpha/backtest/custom_factor_calculator.py`
+  - 回测读写：`quantaalpha/backtest/factor_calculator.py`
+  - H5 同步：`quantaalpha/factors/library.py`
+  - 迁移脚本：`scripts/migrate_factor_cache_to_parquet.py`（默认 dry-run）
+  - 配置（`configs/backtest*.yaml -> llm.*`）：
+    - `cache_format: "parquet" | "pkl"`（默认 parquet）
+    - `cache_compression: "zstd"`（默认 zstd）
+    - `cache_dual_write_pkl: false`（默认 false）
+  - 环境变量（优先级低于 config）：
+    - `QUANTA_FACTOR_CACHE_FORMAT=parquet|pkl`
+    - `QUANTA_FACTOR_CACHE_COMPRESSION=zstd`
+    - `QUANTA_FACTOR_CACHE_DUAL_WRITE_PKL=true|false`
+- 风险与护栏：
+  - “格式升级”应保持数值一致；任何精度/口径变化（例如 `float32`）都必须单独做指标级回归。
+  - 建议先 `dual-write`（pkl + parquet）灰度 + 回滚开关，再做全量迁移。
 
 ### 3.7 [ ] 演化预算动态分配（Bandit/Success-weighted）[高危]
 
@@ -322,10 +327,10 @@
   - near-duplicate 去重：对表达式做 canonicalization（例如：空白、括号冗余、常量写法）后再做 hash，避免“等价但字符串不同”导致重复算。
 - 文件与参数（代码落点）：
   - `quantaalpha/factors/library.py`（因子 ID/去重逻辑）
-  - `quantaalpha/pipeline/loop.py`（cheap gate 已存在：可在这里补上“跨轮次已见过”判定）
+  - `quantaalpha/pipeline/loop.py`（可选 cheap gate：包含静态过滤 + `duplicate_exact` 跳过）
   - `log/<exp>/trajectory_pool.json`（已存在：可作为“已见集合”）
 - 现状快照：
-  - `quality_gate.cheap_filter_enabled=true` 只能挡掉明显非法任务，但挡不住“合法但重复”的浪费。
+  - cheap gate（`quality_gate.cheap_filter_enabled`）默认关闭：A/B（STEP_N=3）为负优化；但在包含 backtest 的用例下仍可能通过减少重复/无效计算获益（需另行 A/B）。
 - 建议起点（低风险）：
   - 先做 exact 去重（零风险）；
   - near-duplicate canonicalization 做成可开关（默认 off，避免误判）。
@@ -421,7 +426,173 @@
 
 ---
 
-## 5. 推荐落地顺序（先易后难）
+## 5. A/B Test 记录（可复现）
+
+### 5.1 3.6 缓存格式升级：Parquet + ZSTD（空间占用，已验证）
+
+- 记录时间：2026-02-28
+- 目标：验证 `parquet+zstd` 相比 `pkl` 的体积下降幅度（只看落盘大小，不含读取耗时）。
+- 样本：`data/results/factor_cache` 中按文件名排序的前 5 个 `*.pkl`（快照抽样）。
+
+结果（单位 MiB）：
+
+| md5_key | pkl_size | parquet_zstd_size | ratio |
+|---|---:|---:|---:|
+| 002e5db6bf500bdb99b642dc29e9f676 | 217.0 | 76.4 | 0.352 |
+| 014a07f7886e15a72c59d0c2671c152c | 217.0 | 117.2 | 0.540 |
+| 01de578e15b9a7df29cf5df08c749e21 | 217.0 | 75.0 | 0.346 |
+| 03334b1f36cdf9344b74df1b3d8f51d9 | 11.1 | 5.6 | 0.499 |
+| 03de75a3931310d7bd7a7cc29dc291c0 | 217.0 | 112.1 | 0.516 |
+
+结论：
+
+- 在该抽样下，`parquet+zstd` 的体积约为 `pkl` 的 `0.35 ~ 0.54`。
+- 如需全量迁移，优先用 `scripts/migrate_factor_cache_to_parquet.py` 先 dry-run 再 apply（必要时可开启 dual-write 便于回滚）。
+
+---
+
+### 5.2 opt1：`cheap_filter + duplicate_exact`（STEP_N=3，负优化 -> 默认关闭）
+
+- 记录时间：2026-02-28
+- 目标：验证 cheap gate（预计算静态过滤 + exact 去重）是否能降低端到端 wall-time。
+- 用例：`configs/experiment_smoke.yaml` + `direction="价量因子挖掘"` + `STEP_N=3`（只跑到 `factor_calculate`）。
+- 对照方式：只切换
+  - `quality_gate.cheap_filter_enabled`
+  - `quality_gate.cheap_filter_require_acceptable`
+
+结果：
+
+- baseline（关闭）：`277.771s`
+- optimized（开启）：`415.958s`（+49.8%，负优化）
+
+结论：
+
+- 在 `STEP_N=3` 用例下，cheap gate 增加了额外开销，但无法通过“减少 backtest”等昂贵阶段来抵消，因此属于负优化。
+- 仓库默认改为关闭：`quality_gate.cheap_filter_enabled=false`。
+
+---
+
+### 5.3 opt2：协议层强约束 JSON（STEP_N=3，正优化 -> 默认开启）
+
+- 记录时间：2026-02-28
+- 目标：通过协议层 `response_format`（JSON object）提升结构化输出稳定性，降低 construct 阶段无效重试。
+- 用例：`configs/experiment_smoke.yaml` + `direction="价量因子挖掘"` + `STEP_N=3`。
+- 对照方式：只切换
+  - `llm.json_mode_strict`
+  - `llm.json_mode_response_format`
+
+结果：
+
+- baseline（`json_mode_strict=false, response_format=none`）：`363.289s`
+- optimized（`json_mode_strict=true, response_format=json_object`）：`334.619s`（-7.9%，正优化）
+
+结论：
+
+- 协议层 JSON 约束可默认开启：`llm.json_mode_strict=true`、`llm.json_mode_response_format=json_object`。
+
+---
+
+### 5.4 opt3：上下文历史窗口（3.2）（STEP_N=3，本用例下未提速 -> 需按目标再评估）
+
+- 记录时间：2026-02-28
+- 目标：通过缩短历史窗口减少 prompt token 与长文本波动，期望改善构造阶段吞吐与稳定性（注意：会改变 LLM 输入，产出分布可能变化）。
+- 用例：`configs/experiment_smoke.yaml` + `direction="价量因子挖掘"` + `STEP_N=3` + 每组重复 3 次取中位数。
+- 对照方式：在实验分支改 `DEFAULT_HISTORY_LIMIT`（6 vs 4）
+
+结果（elapsed_s，中位数）：
+
+- baseline：`119.433s`（min=101.192, max=147.344）
+- optimized：`123.209s`（min=100.486, max=145.749）
+- 差值：`+3.776s`（+3.16%，本用例下为负优化）
+
+观测补充：
+
+- 两组 `json_fail_counts_sum` 均为 0（本用例下未出现 JSON parse/fix 失败）。
+
+结论：
+
+- 在该 `STEP_N=3` 用例下，“缩短 history window”未带来提速收益；如果目标是**降低 token/费用**，建议补充 token 统计后再复测。
+- 当前主分支已恢复原始固定窗口行为（`DEFAULT_HISTORY_LIMIT=4`），不再启用运行时 `prompts.history_limit` 覆盖。
+
+---
+
+### 5.5 opt4：温度分层（json vs freeform）（STEP_N=3，本用例下耗时变差 -> 需要再验证）
+
+- 记录时间：2026-02-28
+- 目标：把结构化 JSON 输出稳定性（低温）与自由生成多样性（较高温）解耦，期望同时提升稳定性与探索质量。
+- 用例：`configs/experiment_smoke.yaml` + `direction="价量因子挖掘"` + `STEP_N=3` + 每组重复 3 次取中位数。
+- 对照方式：只切换
+  - baseline：`llm.json_mode_temperature=0.5`，`llm.freeform_temperature=0.5`（不分层）
+  - optimized：`llm.json_mode_temperature=0.0`，`llm.freeform_temperature=0.5`（分层）
+
+结果（elapsed_s，中位数）：
+
+- baseline：`169.201s`（min=117.166, max=199.425）
+- optimized：`193.420s`（min=158.023, max=300.248）
+- 差值：`+24.219s`（+14.31%，本用例下为负优化）
+
+观测补充：
+
+- 两组 `json_fail_counts_sum` 均为 0（本用例下并未出现 JSON parse/fix 失败，因此稳定性收益不可见）。
+- step 粗分解（每次 run 仅 1 个 loop；取 3 次的中位数）：
+  - `factor_propose`：baseline ≈46.06s，optimized ≈58.07s
+  - `factor_construct`：baseline ≈79.58s，optimized ≈85.07s
+
+结论：
+
+- 在该 `STEP_N=3` 用例下，“温度分层”未带来可观的稳定性收益，且耗时中位数变差；暂不作为“提速优化”成立。
+- 默认不启用温度分层：`llm.json_mode_temperature=0.5`（与 `llm.freeform_temperature` 保持一致）。
+- 是否重新启用需在“JSON 不稳定/网络抖动更明显”的用例上复测（否则容易把采样噪声当成优化收益/损失）。
+
+---
+
+### 5.6 opt5：分支止损预算（3.10）（STEP_N=3，本用例下耗时变差 -> 默认不收紧）
+
+- 目标：减少“坏分支耗时黑洞”（construct/json 反复失败、空分支反复重试）对整体吞吐的拖累。
+- 开关（对照时只改这些）：
+  - `quality_gate.max_construct_failures_per_branch`
+  - `quality_gate.max_json_parse_failures_per_branch`
+  - `evolution.max_empty_retries`
+- 对照设置：
+  - baseline：`2 / 2 / 1`（现状）
+  - optimized：`1 / 1 / 0`（更激进止损，可能误杀潜力分支）
+- 用例：`configs/experiment_smoke.yaml` + `direction="价量因子挖掘"` + `STEP_N=3` + 每组重复 3 次取中位数。
+
+结果（elapsed_s，中位数）：
+
+- baseline：`247.684s`（min=215.982, max=294.778）
+- optimized：`274.327s`（min=202.168, max=372.624）
+- 差值：`+26.643s`（+10.76%，本用例下为负优化）
+
+观测补充：
+
+- 两组 `json_fail_counts_sum` 均为 0，`llm_connection_error_count` 均为 0。
+- optimized 组波动更大（max 到 `372.624s`），并出现一次仅 `factor_propose` 计时的运行记录（`r01`），说明更激进止损并未稳定带来吞吐收益。
+
+结论：
+
+- 在该 `STEP_N=3` 用例下，收紧止损预算（`2/2/1 -> 1/1/0`）未带来提速，反而中位耗时上升。
+- 默认保持：`max_construct_failures_per_branch=2`、`max_json_parse_failures_per_branch=2`、`max_empty_retries=1`（不收紧）。
+
+可复现命令（用 `compare` 一次跑完两组）：
+
+```bash
+cd /Users/ron/Documents/QuantaAlpha
+.venv/bin/python scripts/abtest_experiment.py compare \
+  --name opt5_stoploss_budget \
+  --base-config configs/experiment_smoke.yaml \
+  --direction "价量因子挖掘" \
+  --step-n 3 \
+  --times 3 \
+  --set-baseline quality_gate.max_construct_failures_per_branch=2 \
+  --set-baseline quality_gate.max_json_parse_failures_per_branch=2 \
+  --set-baseline evolution.max_empty_retries=1 \
+  --set-optimized quality_gate.max_construct_failures_per_branch=1 \
+  --set-optimized quality_gate.max_json_parse_failures_per_branch=1 \
+  --set-optimized evolution.max_empty_retries=0
+```
+
+## 6. 推荐落地顺序（先易后难）
 
 1. 先做“低风险高收益”：
    - construct 失败减量
@@ -437,7 +608,7 @@
 
 ---
 
-## 5.1 可直接执行的最小改动建议（示例）
+## 7. 可直接执行的最小改动建议（示例）
 
 仅作为起点，不代表最终最优：
 
@@ -447,14 +618,14 @@
    - 同时在代码中增加 `evolution.max_parallel_workers: 2`（建议新增）
 2. 上下文降噪
    - 文件：`quantaalpha/factors/proposal.py`
-   - 参数：`DEFAULT_HISTORY_LIMIT: 6 -> 4`（A/B 验证）
+   - 参数：`DEFAULT_HISTORY_LIMIT`（当前固定为 4；本轮 A/B 未证明提速，暂不继续调）
 3. warm-start 对照
    - 文件：`configs/experiment.yaml`
    - 参数：`evolution.fresh_start: true -> false`（单独实验组）
 
 ---
 
-## 6. 验证标准（必须同时看速度与质量）
+## 8. 验证标准（必须同时看速度与质量）
 
 每轮优化都应做 A/B 对比，并至少跟踪：
 
@@ -481,35 +652,111 @@
 
 ---
 
-## 7. 第二轮优化代办（建议先做的 4 项）
+## 9. 第二轮优化收敛与后续待办
 
 说明：
-- 以下 4 项按优先级排序（提速且不降质量）。
-- 其中涉及的“温度映射/网络超时与退避”等配置项，属于本次优化**新增选项**，不是原项目默认选项。落地时需要同步更新 `SPECS.md`（配置项可观测）。
+- 本节与 `docs/todo-fix.md` 保持同步：已在 A/B 中判定为负优化且默认关闭/回滚的项，不再放入待办。
+- 详细对照数据见第 5 章各实验（`5.2 ~ 5.6`）。
 
-1. [x] 3.13 协议层强约束 JSON（`response_format` / `json_schema`）
-   - 目标：把“只返回 JSON”从提示词升级为 API 层硬约束，降低 `JSON fix failed/parse failed` 的重试黑洞。
-   - 改动点：`quantaalpha/llm/client.py`
-   - 护栏：仅在 `json_mode=true` 的调用启用；`reasoning_flag=true && json_mode=false` 不得触发 JSON 截取/修复链路。
+已收敛结论（当前默认）：
 
-2. [x] 3.18 分阶段温度分层（只对 `json_mode` 降温到 0~0.1）
-   - 目标：提升结构化输出的格式稳定性，减少 construct/repair 的无效重试；不影响 hypothesis/propose 的探索多样性。
-   - 新增配置（建议放到 `configs/experiment.yaml -> llm.*`，并在 `quantaalpha/llm/config.py` 读取）：
-     - `llm.json_mode_temperature: 0.0`（或 0.1）
-     - `llm.freeform_temperature: 0.5`（默认沿用现有 `chat_temperature`）
-   - 改动点：`quantaalpha/llm/client.py`（按 `json_mode` 选择温度）。
+1. [x] 3.13 协议层强约束 JSON：**正优化，默认开启**（见 `5.3 opt2`）。
+2. [x] 3.11 + 3.15（cheap gate + exact 去重）：在本次 `STEP_N=3` 用例下**负优化，默认关闭 cheap gate**（见 `5.2 opt1`）。
+3. [x] 3.2 上下文历史窗口：在本次用例下**未提速，恢复原默认**（见 `5.4 opt3`）。
+4. [x] 3.18 温度分层：在本次用例下**负优化，默认不启用分层**（见 `5.5 opt4`）。
+5. [x] 3.10 分支止损预算（收紧）：在本次用例下**负优化，默认不收紧**（见 `5.6 opt5`）。
 
-3. [x] 3.15 跨轮次去重（先做 exact 去重，near-duplicate 先观测后启用）
-   - 目标：减少重复 `calculate/backtest` 的浪费（只减少重复，不改变质量门）。
-   - 改动点：
-     - `quantaalpha/pipeline/loop.py`：进入 `calculate/backtest` 前，查 `factor_library` + `trajectory_pool` 是否已存在同一 `(factor_name, factor_expression)`。
-   - 产出：skip 时写 `skip_reason=duplicate_exact`（便于 doctor 统计）。
+后续待优化 / 待 A/B（按建议顺序）：
 
-4. [x] 3.19 网络稳态与尾延迟优化（timeout/指数退避+jitter/可选 failover）
-   - 目标：减少“卡住等半天”的空耗，改善 p90/p99；只改变传输与重试策略，不改变提示词与质量门。
-   - 新增配置（建议放到 `configs/experiment.yaml -> llm.*`）：
-     - `llm.request_timeout_s: 60`（单次请求上限，按实际模型/服务调）
-     - `llm.retry_backoff: exponential`
-     - `llm.retry_jitter: true`
-     - `llm.failover_base_urls: []`（可选）
-   - 改动点：`quantaalpha/llm/client.py`（timeout/backoff/failover + 结构化日志字段）。
+1. [ ] 3.19 网络稳态（timeout/backoff/jitter/failover）：主看长尾卡顿（p90/p99 step 耗时）是否下降；稳定网络下可能不显著。
+2. [ ] 3.5 受控并行：主看吞吐（tasks/hour）提升 vs 稳定性（OOM/失败率/峰值内存/swap）。
+3. [ ] 3.9 warm start：对照 `fresh_start=true/false`，主看“收敛速度 vs 多样性”。
+4. [ ] 3.7 动态预算：未落地（需先定义预算分配策略与质量护栏）。
+5. [ ] 3.4 多保真筛选：未落地（需先定义保真层级与误杀护栏）。
+
+---
+
+## 10. 第三轮优化（回测降低内存占用）
+
+时间：2026-02-28
+目标：在 16GB 笔记本上降低 backtest 峰值内存，减少 OOM/swap 抖动；不改变默认回测结果口径。
+状态：**已回滚**（A/B Test 显示峰值内存上升，属于负优化）。
+
+### 10.1 改动点（低风险，优先削峰）
+
+本轮尝试过的方向（现已回滚，不在当前代码中生效）：
+
+- 减少 custom 因子计算与缓存批量加载阶段的中间对象与拷贝。
+- 减少 dataset 构建阶段对大矩阵的全量 `.copy()`。
+- 调整 DataHandler `fetch()` 的 copy 时机（先切片后 copy）。
+
+### 10.2 可选开关（更激进但可控）
+
+（候选）自定义因子结果降精度为 `float32`（显著降内存，但会改变特征精度，需要单独实现并严格 A/B 验证）。
+
+### 10.3 A/B Test（必须跑，跑完写结果）
+
+脚本：`scripts/abtest_backtest_memory.py`（baseline=HEAD，optimized=当前工作区）
+
+说明：当前第三轮优化相关代码已回滚，因此再次运行时 `optimized` 应接近 `baseline`。该脚本保留用于后续新优化的验证。
+
+对照命令（示例，按你当前常用库调整）：
+
+```bash
+LIB=data/factorlib/all_factors_library_paper_reproduction_r2.json
+
+# A: baseline（HEAD）
+.venv/bin/python scripts/abtest_backtest_memory.py baseline -- \
+  -c configs/backtest_limited.yaml \
+  --factor-source custom \
+  --factor-json "$LIB" \
+  --skip-uncached
+
+# B: optimized（working tree）
+.venv/bin/python scripts/abtest_backtest_memory.py optimized -- \
+  -c configs/backtest_limited.yaml \
+  --factor-source custom \
+  --factor-json "$LIB" \
+  --skip-uncached
+```
+
+记录项（从脚本输出的 `ABTEST_RESULT=...` 里摘）：
+
+- 峰值内存：`max_rss_mb`
+- 总耗时：`elapsed_s`
+
+结果（运行后填表）：
+
+| 组别 | max_rss_mb (MB) | elapsed_s (s) | 结论 |
+|---|---:|---:|---|
+| A baseline | 8260.8 | 212.212 | baseline（HEAD） |
+| B optimized | 9897.7 | 143.810 | 变快但更吃内存（未达成“降内存”目标） |
+
+对比结论（本轮未通过）：
+
+- 峰值内存：`8260.8 -> 9897.7`（+1636.9MB，约 +19.8%）
+- 总耗时：`212.212 -> 143.810`（-68.402s，约 -32.2%）
+
+本轮改动在该用例下“提速明显”，但“内存峰值上升”，不符合第三轮目标（回测降内存）。需要继续迭代并重新 A/B。
+
+ABTEST_RESULT（原始记录）：
+
+- A baseline:
+  - `ABTEST_RESULT={"variant": "baseline", "elapsed_s": 212.212, "max_rss_mb": 8260.8, "python": "3.12.8", "platform": "macOS-26.4-arm64-arm-64bit", "argv": ["-c", "configs/backtest_limited.yaml", "--factor-source", "custom", "--factor-json", "data/factorlib/all_factors_library_paper_reproduction_r2.json", "--skip-uncached"], "exit_code": 0}`
+- B optimized:
+  - `ABTEST_RESULT={"variant": "optimized", "elapsed_s": 143.81, "max_rss_mb": 9897.7, "python": "3.12.8", "platform": "macOS-26.4-arm64-arm-64bit", "argv": ["-c", "configs/backtest_limited.yaml", "--factor-source", "custom", "--factor-json", "data/factorlib/all_factors_library_paper_reproduction_r2.json", "--skip-uncached"], "exit_code": 0}`
+
+复测（2026-02-28 10:39~10:44）：
+
+| 组别 | max_rss_mb (MB) | elapsed_s (s) | 结论 |
+|---|---:|---:|---|
+| A baseline | 8132.0 | 153.337 | baseline（HEAD） |
+| B optimized | 10252.2 | 140.477 | 变快但更吃内存（仍未达成“降内存”目标） |
+
+- 峰值内存：`8132.0 -> 10252.2`（+2120.2MB，约 +26.1%）
+- 总耗时：`153.337 -> 140.477`（-12.860s，约 -8.4%）
+
+- A baseline:
+  - `ABTEST_RESULT={"variant": "baseline", "elapsed_s": 153.337, "max_rss_mb": 8132.0, "python": "3.12.8", "platform": "macOS-26.4-arm64-arm-64bit", "argv": ["-c", "configs/backtest_limited.yaml", "--factor-source", "custom", "--factor-json", "data/factorlib/all_factors_library_paper_reproduction_r2.json", "--skip-uncached"], "exit_code": 0}`
+- B optimized:
+  - `ABTEST_RESULT={"variant": "optimized", "elapsed_s": 140.477, "max_rss_mb": 10252.2, "python": "3.12.8", "platform": "macOS-26.4-arm64-arm-64bit", "argv": ["-c", "configs/backtest_limited.yaml", "--factor-source", "custom", "--factor-json", "data/factorlib/all_factors_library_paper_reproduction_r2.json", "--skip-uncached"], "exit_code": 0}`

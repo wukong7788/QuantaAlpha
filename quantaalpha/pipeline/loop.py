@@ -101,8 +101,8 @@ class AlphaAgentLoop(LoopBase, metaclass=LoopMeta):
             consistency_enabled = self.quality_gate_config.get("consistency_enabled", False)
             complexity_enabled = self.quality_gate_config.get("complexity_enabled", True)
             redundancy_enabled = self.quality_gate_config.get("redundancy_enabled", True)
-            cheap_filter_enabled = self.quality_gate_config.get("cheap_filter_enabled", True)
-            cheap_filter_require_acceptable = self.quality_gate_config.get("cheap_filter_require_acceptable", True)
+            cheap_filter_enabled = self.quality_gate_config.get("cheap_filter_enabled", False)
+            cheap_filter_require_acceptable = self.quality_gate_config.get("cheap_filter_require_acceptable", False)
             max_construct_failures_per_branch = self.quality_gate_config.get(
                 "max_construct_failures_per_branch",
                 2,

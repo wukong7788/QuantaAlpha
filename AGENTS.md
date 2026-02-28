@@ -56,6 +56,14 @@ These terms are easy to mix up during paper reproduction and performance optimiz
 - If requirements are ambiguous, ask the user for clarification before implementing structural changes.
 - If the user is brainstorming or "just want to discuss options", provide a concrete proposal first and do not start modifying code/files until the user explicitly asks to implement.
 
+## Documentation Hygiene (non-spec docs)
+
+- `SPECS.md` is the contract/spec source and must be kept in sync (see "Specs Sync Policy" above).
+- For other docs (e.g. `docs/*.md`, `CHANGELOG.md`, `README*.md`):
+  - Do **not** blindly append/stack notes ("堆砌") if the new content is large.
+  - First propose a clearer structure outline (sections + ordering) to keep the doc readable.
+  - Apply the restructure **only after** the user explicitly agrees to the proposed new structure.
+
 ## Local Runtime (current)
 
 Use `uv + .venv` (no conda required).
@@ -96,17 +104,30 @@ Scope: human-facing entry scripts used in day-to-day operation.
 ### 1) Main experiment: `run.sh`
 
 1. Confirm `.env` + `.venv` are ready.
-2. Run `./run.sh "方向" "suffix"` (low-disk is ON by default; optional flags: `--no-low-disk`, `--relay`, `--resume`).
+2. Run `./run.sh "方向" "suffix"` (low-disk ON by default; see flag table below).
 3. Check printed `EXPERIMENT_ID`, `WORKSPACE_PATH`, and log output.
 4. Relay/resume semantics (`--relay` and `--resume` are mutually exclusive): first relay leg uses chunk (`QUANTA_RELAY_CHUNK_ROUNDS`, default 5), later leg auto-finishes to `max_rounds`; `--resume` requires existing `evolution_state.json` and fails fast if missing.
 5. Round terminology: `evolution.max_rounds` uses **phase-round** (each phase completion increments `round`), not “epoch=original+mutation+crossover”.
 6. Fine-grained resume: on restart via `--relay/--resume`, each task directory will resume from the latest `__session__` snapshot and continue from the next unfinished step (within the 5-step loop). If the task enters an “empty-factor retry attempt”, it will re-run fresh (not resume the previous attempt).
-7. Naming safety: for a new run, change both `EXPERIMENT_ID` and library suffix together; reusing suffix appends/overwrites in the same `all_factors_library_<suffix>.json`.
+7. Naming safety: change both `EXPERIMENT_ID` and suffix for a new run; reusing suffix appends to same `all_factors_library_<suffix>.json`.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--low-disk` | ON | Disable pickle cache, compress parquet, purge temp after backtest |
+| `--no-low-disk` | — | Disable low-disk mode explicitly |
+| `--relay` | — | Run N rounds then exit; re-run same command to continue |
+| `--resume` | — | Continue directly to `max_rounds` from saved state |
+| `--zoo-dedup` | — | Skip expressions in `factor_zoo.csv`; auto-update zoo after run |
+| `--rounds N` | — | Override `evolution.max_rounds` without editing yaml (temp config) |
+
+Env: `QUANTA_RELAY_CHUNK_ROUNDS` (default 5), `QUANTA_FACTOR_ZOO_PATH`, `EXPERIMENT_ID`.
+
 
 ### 2) Smoke pipeline: `minirun.sh`
 
 1. Confirm `.env` and required `daily_pv.h5` files exist.
-2. Run `./minirun.sh` (optional: `STEP_N=5 ./minirun.sh`).
+2. Run `./minirun.sh` with optional flags: `--low-disk`, `--zoo-dedup`.
+   - Example: `./minirun.sh --low-disk --zoo-dedup "价量因子测试" "smoke_test"`
 3. Read manifest under `log/minirun_manifests/` for artifact paths.
 4. Use Telegram summary for quick success/failure signal.
 
@@ -160,8 +181,11 @@ From root `.env`:
 
 Optional:
 
-- `SESSION_DUMP_TXT=true` to output text snapshots besides pickle session dumps
-- `EXPERIMENT_ID=shared` to reuse workspace/cache paths across runs
+- `SESSION_DUMP_TXT=true` — also write text snapshots beside pickle session dumps
+- `EXPERIMENT_ID=shared` — reuse workspace/cache paths across runs
+- `QUANTA_RELAY_CHUNK_ROUNDS=6` — override first relay leg chunk size
+- `QUANTA_FACTOR_ZOO_PATH=...` — override zoo CSV path (used by `--zoo-dedup`)
+- `FACTOR_CoSTEER_FACTOR_ZOO_PATH=...` — set directly if bypassing `run.sh` (matches `FactorCoSTEERSettings` env prefix)
 
 ## Data Requirements
 
@@ -217,17 +241,27 @@ Qlib data path must contain:
   - load latest result by default,
   - select a specific offline run from dropdown and load it.
 
-## Factor Library and Duplicate Behavior
+## Factor Library, Zoo, and Duplicate Behavior
 
 Factor library output:
+- `data/factorlib/all_factors_library_<suffix>.json` — per-experiment factor results
 
-- `data/factorlib/all_factors_library*.json`
+**Factor Zoo (cross-run dedup):**
+- `data/factorlib/factor_zoo.json` — full metadata (inspection/merge)
+- `data/factorlib/factor_zoo.csv` — CSV used by `FactorRegulator` via `pd.read_csv()` for AST dedup
+  - This is what `FACTOR_CoSTEER_FACTOR_ZOO_PATH` must point to.
 
-Notes:
+Managing the zoo:
+```bash
+.venv/bin/python scripts/update_factor_zoo.py build    # full rebuild from all factorlib files
+.venv/bin/python scripts/update_factor_zoo.py update   # incremental: add new factors from latest run
+.venv/bin/python scripts/update_factor_zoo.py status   # show zoo stats
+```
 
-- Direction is recorded in metadata, but same direction is not globally auto-skipped.
-- Factor IDs are based on `md5(factor_name + factor_expression)` in library manager.
-- Repeated runs can still regenerate candidates; backtest side may reuse H5/MD5 cache.
+- Factor IDs: `md5(factor_name + factor_expression)` in library manager.
+- Zoo IDs: `md5(normalized_expression)` with prefix `zoo_`.
+- `--zoo-dedup` in `run.sh` auto-calls `update` after experiment finishes.
+- `factor_zoo.csv` columns: `factor_name`, `factor_expression`.
 
 ## Known Pitfalls and Fixes Applied
 
@@ -253,8 +287,8 @@ Used in local automation:
 
 ## Recommended Workflow
 
-1. `./minirun.sh` (sanity)
-2. `STEP_N=5 ./minirun.sh` (include later steps)
-3. Full run with suffix:
-   - `./run.sh "价量因子挖掘" "pv_v1_ds"`
-4. Backtest selected library JSON
+1. **冒烟验证**：`./minirun.sh --low-disk "价量因子测试" "smoke_test"`
+2. **安全模式（11 轮）**：`CONFIG=configs/experiment_full_11.yaml ./run.sh --low-disk --relay --zoo-dedup "价量因子挖掘" "r3"`
+3. **土豪模式（23 轮）**：  
+   `./scripts/safe_cleanup.sh` → `EXPERIMENT_ID="paper_repro_23r" QUANTA_RELAY_CHUNK_ROUNDS=6 ./run.sh --rounds 23 --low-disk --relay --zoo-dedup "价量因子挖掘" "paper_repro_23r"`
+4. **独立回测**：`./scripts/run_backtest_safe.sh --interactive`

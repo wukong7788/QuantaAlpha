@@ -381,6 +381,14 @@ python -m quantaalpha.backtest.run_backtest \
 ./scripts/run_backtest_safe.sh \
   --library data/factorlib/all_factors_library_paper_reproduction_ds.json \
   --max-factors all
+
+# 相关性去重 + 多样性 Top-N（per-cluster 默认 3；设为 1 更严格）
+./scripts/run_backtest_safe.sh \
+  --library data/factorlib/all_factors_library_paper_reproduction_ds.json \
+  --mode limited \
+  --max-factors 80 \
+  --corr-dedup \
+  --dedup-per-cluster 1
 ```
 
 补充说明：

@@ -118,6 +118,10 @@ llm:
   max_retries: 3
   cache_results: true
   cache_dir: "data/results/factor_cache"
+  # Cache format upgrade (3.6): parquet is preferred; pickle is kept as read-fallback.
+  cache_format: "parquet"
+  cache_compression: "zstd"
+  cache_dual_write_pkl: false
   auto_extract_cache: false
   debug: false
 

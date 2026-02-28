@@ -1,10 +1,14 @@
 ######################################################################
-# Backtest tool V2 configuration
-# Supports Qlib official factor sets (alpha158/alpha360) and custom factor JSON
+# Backtest config — 2021 验证集口径（与挖掘期内打分对齐）
 #
-# Usage:
-#   python backtest_v2/run_backtest.py -c backtest_v2/config.yaml --factor-source alpha158
-#   python backtest_v2/run_backtest.py -c backtest_v2/config.yaml --factor-source custom --factor-json /path/to/factors.json
+# 用途：对旧轮次因子重新计算回测指标，与 R2 等主实验因子
+# （在挖掘期间用 conf_baseline.yaml 打分：2021-01-01 ~ 2021-12-31）
+# 保持一致的评估口径。
+#
+# 使用示例（重算旧因子）：
+#   .venv/bin/python scripts/fix_missing_factors.py \
+#     --library data/factorlib/_pending_old_factors.json \
+#     --config configs/backtest_2021_validate.yaml
 ######################################################################
 
 # Global random seed (for reproducibility)
@@ -121,8 +125,8 @@ backtest:
       n_drop: 5
 
   backtest:
-    start_time: "2022-01-01"
-    end_time: "2025-12-26"
+    start_time: "2021-01-01"
+    end_time: "2021-12-31"
     account: 100000000
     benchmark: "SH000300"
     exchange_kwargs:

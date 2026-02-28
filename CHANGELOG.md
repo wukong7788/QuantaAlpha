@@ -95,6 +95,29 @@
 - Fixed failover over-triggering by limiting endpoint switching to transport-like exceptions (timeout/connection/rate-limit/server), excluding JSON parse/content errors.
 - Fixed runtime bool option parsing (`llm.json_mode_strict`, `llm.retry_jitter`) to correctly handle bool-like strings such as `"false"` / `"0"`.
 
+## 2026-02-28
+
+### Added
+- Added backtest A/B memory harness script:
+  - `scripts/abtest_backtest_memory.py` (reports elapsed time + peak RSS; baseline=HEAD vs optimized=working tree).
+- Added experiment A/B harness script:
+  - `scripts/abtest_experiment.py` (runs `./run.sh` with config toggles; isolates artifacts under `/tmp`; emits `ABTEST_RESULT=...` and saves doctor report).
+  - New `compare` mode: runs baseline+optimized (each repeated N times) and prints `ABTEST_COMPARISON=...`.
+- Added correlation de-dup option in `scripts/run_backtest_safe.sh`:
+  - `--corr-dedup` with tuning knobs `--dedup-topn`, `--dedup-per-cluster` (default 3), `--dedup-corr-threshold`, `--dedup-sample-size`.
+  - Backtest PID metadata now records dedup settings (`corr_dedup`, `dedup_*`) for later comparison.
+
+### Changed
+- Attempted backtest peak-memory reduction changes, but reverted after A/B test showed higher peak RSS (negative optimization).
+- Disabled cheap pre-calc filter by default after A/B (STEP_N=3) showed worse wall-time:
+  - `quality_gate.cheap_filter_enabled=false`
+  - `quality_gate.cheap_filter_require_acceptable=false`
+- Kept protocol-level JSON constraint defaults enabled (A/B positive):
+  - `llm.json_mode_strict=true`
+  - `llm.json_mode_response_format=json_object`
+- Reverted temperature-split default after A/B (STEP_N=3) showed worse wall-time:
+  - default keeps `llm.json_mode_temperature=0.5` aligned with `llm.freeform_temperature=0.5`
+
 ## 2026-02-25
 
 ### Added

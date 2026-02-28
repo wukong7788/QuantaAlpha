@@ -389,6 +389,14 @@ Useful options:
 ./scripts/run_backtest_safe.sh \
   --library data/factorlib/all_factors_library_paper_reproduction_ds.json \
   --max-factors all
+
+# Correlation de-dup + diverse Top-N (default per-cluster=3; set 1 for strict diversity)
+./scripts/run_backtest_safe.sh \
+  --library data/factorlib/all_factors_library_paper_reproduction_ds.json \
+  --mode limited \
+  --max-factors 80 \
+  --corr-dedup \
+  --dedup-per-cluster 1
 ```
 
 Notes:

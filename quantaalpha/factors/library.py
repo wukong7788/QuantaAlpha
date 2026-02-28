@@ -14,6 +14,8 @@ from typing import Any, Optional
 import numpy as np
 import pandas as pd
 
+from quantaalpha.utils.factor_cache import cache_paths, write_factor_cache
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_FACTOR_CACHE_DIR = os.environ.get(
@@ -167,7 +169,7 @@ class FactorLibraryManager:
     @staticmethod
     def _sync_h5_to_md5_cache(factor_expression: str, h5_path: str,
                                 cache_dir: Optional[str] = None) -> bool:
-        """Sync factor values from result.h5 to MD5 cache dir (.pkl). Returns True on success."""
+        """Sync factor values from result.h5 to MD5 cache dir (parquet preferred; pickle fallback)."""
         cache_dir = Path(cache_dir or DEFAULT_FACTOR_CACHE_DIR)
         h5_file = Path(h5_path)
         purge_h5 = FactorLibraryManager._env_truthy(
@@ -179,9 +181,9 @@ class FactorLibraryManager:
             return False
 
         md5_key = hashlib.md5(factor_expression.encode()).hexdigest()
-        pkl_file = cache_dir / f"{md5_key}.pkl"
+        parquet_file, pkl_file = cache_paths(cache_dir, md5_key)
 
-        if pkl_file.exists():
+        if parquet_file.exists() or pkl_file.exists():
             if purge_h5:
                 FactorLibraryManager._safe_remove_result_h5(h5_file)
             return True
@@ -189,11 +191,12 @@ class FactorLibraryManager:
         try:
             cache_dir.mkdir(parents=True, exist_ok=True)
             result = pd.read_hdf(str(h5_file))
-            result.to_pickle(pkl_file)
-            logger.debug(f"Synced factor cache -> {pkl_file.name}")
+            ok = write_factor_cache(cache_dir, md5_key, result)
+            if ok:
+                logger.debug(f"Synced factor cache -> {md5_key}")
             if purge_h5:
                 FactorLibraryManager._safe_remove_result_h5(h5_file)
-            return True
+            return ok
         except Exception as e:
             logger.debug(f"Sync factor cache failed [{h5_path}]: {e}")
             return False
@@ -235,7 +238,8 @@ class FactorLibraryManager:
             # Check MD5 cache
             elif expr:
                 md5_key = hashlib.md5(expr.encode()).hexdigest()
-                if (cache_dir / f"{md5_key}.pkl").exists():
+                parquet_file, pkl_file = cache_paths(cache_dir, md5_key)
+                if parquet_file.exists() or pkl_file.exists():
                     status = "md5_cached"
                     md5_cached += 1
 
@@ -286,9 +290,8 @@ class FactorLibraryManager:
                 continue
 
             md5_key = hashlib.md5(expr.encode()).hexdigest()
-            pkl_file = cache_dir_path / f"{md5_key}.pkl"
-
-            if pkl_file.exists():
+            parquet_file, pkl_file = cache_paths(cache_dir_path, md5_key)
+            if parquet_file.exists() or pkl_file.exists():
                 already_cached += 1
                 skipped += 1
                 continue
@@ -300,8 +303,10 @@ class FactorLibraryManager:
             try:
                 cache_dir_path.mkdir(parents=True, exist_ok=True)
                 result = pd.read_hdf(str(h5_path))
-                result.to_pickle(pkl_file)
-                synced += 1
+                if write_factor_cache(cache_dir_path, md5_key, result):
+                    synced += 1
+                else:
+                    failed += 1
             except Exception:
                 failed += 1
 

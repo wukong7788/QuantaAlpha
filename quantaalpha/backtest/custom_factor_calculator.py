@@ -55,6 +55,7 @@ class CustomFactorCalculator:
         self._raw_data_df = data_df
         self._data_prepared = False
         self._config = config
+        self._llm_cache_config = (config or {}).get("llm", {}) if isinstance(config, dict) else {}
         self.cache_dir = cache_dir or DEFAULT_CACHE_DIR
         self.auto_extract_cache = auto_extract_cache
         self._cache_extracted = False
@@ -102,17 +103,14 @@ class CustomFactorCalculator:
     
     def _load_from_cache(self, expr: str) -> Optional[pd.Series]:
         """Load factor values from cache."""
+        from quantaalpha.utils.factor_cache import read_factor_cache
+
         cache_key = self._get_cache_key(expr)
-        cache_file = self.cache_dir / f"{cache_key}.pkl"
-        
-        if cache_file.exists():
-            try:
-                result = pd.read_pickle(cache_file)
-                return self._process_cached_result(result, cache_key)
-            except Exception as e:
-                logger.debug(f"Cache load failed [{cache_key}]: {e}")
-                return None
-        return None
+        try:
+            return read_factor_cache(self.cache_dir, cache_key, config=self._llm_cache_config)
+        except Exception as e:
+            logger.debug(f"Cache load failed [{cache_key}]: {e}")
+            return None
     
     def _load_from_cache_location(self, cache_location: Dict) -> Optional[pd.Series]:
         """Load factor from path given in cache_location."""
@@ -161,11 +159,11 @@ class CustomFactorCalculator:
     
     def _save_to_cache(self, expr: str, result: pd.Series):
         """Save factor values to cache."""
+        from quantaalpha.utils.factor_cache import write_factor_cache
+
         try:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
             cache_key = self._get_cache_key(expr)
-            cache_file = self.cache_dir / f"{cache_key}.pkl"
-            result.to_pickle(cache_file)
+            write_factor_cache(self.cache_dir, cache_key, result, config=self._llm_cache_config)
         except Exception as e:
             logger.warning(f"Save to cache failed: {e}")
     

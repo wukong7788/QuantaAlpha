@@ -17,36 +17,120 @@
 
 ---
 
-## 2. 复现参数修改 (configs/experiment.yaml)
+## 2. 快速启动与复现脚本 (Quick Start Scripts)
 
-为了实现论文中 **"发散10个子方向种子，并通过突变交叉演化11轮"** 的最大规模实验配置，你需要对默认项目配置做以下调整。打开 `configs/experiment.yaml`：
+为了方便直接运行复现，本仓库提供了三个层级的启动脚本。您可以直接复制对应的命令到终端执行。
+
+### 脚本 0：冒烟测试 — 优先跑这一步（`minirun.sh`）
+
+> **用途**：验证环境、LLM 调用、数据读取全链路是否通畅，只跑最基础的 2 个回合。  
+> **强烈建议**：每次换模型 / 换配置 / 换机器前，先用此脚本快速验证，再启动正式实验。
+
+```bash
+# 基础冒烟测试
+./minirun.sh "价量因子测试" "smoke_test"
+
+# 冒烟 + 低磁盘模式（推荐，避免测试产生大量缓存）
+./minirun.sh --low-disk "价量因子测试" "smoke_test"
+
+# 冒烟 + 低磁盘 + Zoo 去重（验证 --zoo-dedup 工作是否正常）
+./minirun.sh --low-disk --zoo-dedup "价量因子测试" "smoke_test"
+```
+
+> **说明**：`minirun.sh` 强制使用 `configs/experiment_smoke.yaml`（超小规模参数），仅作验证，不产出有效因子。
+
+---
+
+### 脚本 1：推荐安全模式（Macbook M3 16G / 100G 磁盘专项）
+
+> **用途**：专为空间有限的个人电脑安全跑完 11 轮主实验设计。  
+> **机制**：
+> 1. 强制走 `--low-disk` 模式，算完因子自动清理几十 GB 的缓存文件。
+> 2. 强制走 `--relay` 接力模式（默认每 5 轮存盘并退出，第二次启动同一命令自动补齐剩余轮次）。
+> 3. 已指定专用配置文件（清理庞大演化历史废料，因子假设=3）。
+
+```bash
+# 接力模式机制说明：
+# - 第 1 次执行：跑前 5 轮（QUANTA_RELAY_CHUNK_ROUNDS=5 默认）
+# - 第 2 次执行：同一命令，自动补齐剩余所有轮次（无需改命令）
+# - 按模型区分后缀便于横向比较，例如 deepseek_v3_11r, gpt4o_11r 等
+
+# 基础安全模式（推荐入门）
+CONFIG=configs/experiment_full_11.yaml ./run.sh --low-disk --relay "价量因子挖掘" "deepseek_v3_11r"
+
+# 安全模式 + Zoo 去重（推荐：有历史实验数据时使用，自动跳过已探索过的因子表达式）
+# 前置步骤：首次需先初始化 Zoo（仅首次，此后每轮实验自动更新）：
+#   .venv/bin/python scripts/update_factor_zoo.py build
+CONFIG=configs/experiment_full_11.yaml ./run.sh --low-disk --relay --zoo-dedup "价量因子挖掘" "deepseek_v3_11r"
+```
+
+> **Zoo 去重说明**：
+> - `--zoo-dedup` 会在 calculate/backtest 前将每条因子表达式与 `data/factorlib/factor_zoo.csv` 进行去重，跳过已在历史实验中探索过的表达式，避免重复计算。
+> - 实验结束后自动调用 `scripts/update_factor_zoo.py update`，将本次新因子追加到 Zoo，下次运行即可复用。
+> - **初次使用前**需先执行 `build` 初始化 Zoo（或使用 `status` 查看当前状态）：
+>   ```bash
+>   .venv/bin/python scripts/update_factor_zoo.py build    # 全量重建（首次）
+>   .venv/bin/python scripts/update_factor_zoo.py status   # 查看 Zoo 统计
+>   ```
+
+---
+
+### 脚本 2：土豪拉满模式（23 轮 — 完整论文复现）
+
+> **用途**：完全对齐论文 11-12 Iterations 最佳权衡点（对应代码 23 轮）。  
+> **要求**：磁盘 20-30GB+ 剩余，API 预算 $150–$350，时间约 30 小时（4 段 × 6–8h）。
+
+#### 第 1 步：清理历史数据（推荐，避免旧实验残留混入）
+
+```bash
+./scripts/safe_cleanup.sh
+```
+
+> 清理内容：log、workspace、pickle cache、minirun 临时文件。**不会动** factorlib 因子库、Qlib 数据、Zoo 文件。
+
+#### 第 2 步：直接启动（每段 6 rounds，接力 4 次跑完 23 轮）
+
+```bash
+# 每次运行同一条命令，relay 自动记录断点续跑（23 = 6+6+6+5）
+EXPERIMENT_ID="paper_repro_23r" \
+QUANTA_RELAY_CHUNK_ROUNDS=6 \
+./run.sh --rounds 23 --low-disk --relay --zoo-dedup "价量因子挖掘" "paper_repro_23r" 2>&1 | tee -a run_23r.log
+```
+
+- `--rounds 23`：无需手动改 `experiment.yaml`，自动注入参数
+- `--zoo-dedup`：跳过历史已探索因子（已有 466 个表达式），加速挖掘
+- `--relay`：每 6 rounds 存盘退出，再次执行自动接续
+- 首次运行前若要初始化 Zoo：`.venv/bin/python scripts/update_factor_zoo.py build`
+
+> **纯净对照版（无优化，还原论文基线）：**
+> ```bash
+> EXPERIMENT_ID="paper_repro_23r" \
+> QUANTA_RELAY_CHUNK_ROUNDS=6 \
+> ./run.sh --rounds 23 --low-disk --relay "Price-Volume Factor Mining" "paper_repro_23r" 2>&1 | tee -a run_23r.log
+> ```
+
+
+---
+
+### 2.1 配置文件解析 (configs/experiment_full_11.yaml / experiment.yaml)
+
+如果您决定执行**脚本 1 或 2**且需要微调，以下参数是左右挖掘深度和机器压力的核心要素：
 
 1.  **初始探索规模调大（10个并发方向）**：
-    找到 `planning` 配置区，将子方向数提高：
-    ```yaml
-    planning:
-      enabled: true
-      num_directions: 10   # 从默认的 2 改为论文标准 10
-    ```
-2.  **演化回合数补全（phase-round 合计 11 轮：1 original + 5 mutation + 5 crossover）**：
-    找到 `evolution` 配置区，将最大回合次数提高：
-    ```yaml
-    evolution:
-      enabled: true
-      mutation_enabled: true
-      crossover_enabled: true
-      max_rounds: 11       # 从默认的 3 改为论文标准 11（注意：这里的 round 是 phase-round，不是 epoch）
-    ```
-3.  **受控并行（避免一次性拉满机器）**：
+    找到 `planning.num_directions`，默认为论文标准 `10`。
+2.  **演化回合数补全（11 轮 或 23 轮）**：
+    找到 `evolution.max_rounds`。
+    **重要区别：“代码的 Rounds” vs “论文的 Iterations”**
+    - **论文（Paper）**：1 个 Iteration = `Mutation` + `Crossover` 两个阶段。
+    - **代码（Code）**：1 个 Round = 1 个单阶段（Phase）。
+    - *论文主实验标准 (5 Iterations)*：1 (Original) + 5 × 2 = **11 轮 (Rounds)**。
+    - *论文最优 Trade-off (11-12 Iterations)*：根据论文 Figure 8，收益与风险达到最佳平衡点是在 11-12 Iterations左右，对应代码需要 **23-25 轮 (Rounds)**。
+3.  **受控并行与硬盘卸载配置**：
     ```yaml
     evolution:
       parallel_enabled: true
-      max_parallel_workers: 2   # 8 核机器建议从 2 起步，稳定后再升到 3~4
-      max_empty_retries: 1
-    quality_gate:
-      cheap_filter_enabled: true
-      max_construct_failures_per_branch: 2
-      max_json_parse_failures_per_branch: 2
+      max_parallel_workers: 2   # 16G 内存建议维持 2 并发，跑得动再加
+      cleanup_on_finish: true   # [强烈建议开启] 跑完后清理几百MB的 LLM 工作区轨迹
     ```
 
 > *注意：其它默认配置如基于 Alpha158 模板生成的因子过滤规则、测试回合数据集划分（2016-2020 训练，2021 验证），以及独立回测阶段配置（2022-2025 样本外测试）等均不需要变动。*
@@ -63,30 +147,23 @@ QuantaAlpha 的演化流程中，“round/direction/task/step”很容易混淆�
    - 含义：planning 生成的 10 条“研究方向文本”（主要驱动 original/mutation 的提示）。
 
 3. **Round + Phase（演化轮次与阶段）**
-   - `evolution.max_rounds=11` 的 `round_idx` 取值 `0..10`。
-   - 重要：这里的 **round 是 controller 的 phase-round**，即每跑完一个 phase（original/mutation/crossover）才会 `round += 1`，并不是“一个 epoch=original+mutation+crossover”。
-   - 当 `mutation_enabled=true && crossover_enabled=true` 时，phase 顺序通常是：
-     - `round 0 = original`
-     - `round 1 = mutation`
-     - `round 2 = crossover`
-     - `round 3 = mutation`
-     - `round 4 = crossover`
-     - ...交替直到 `round 10`
-   - 因此 11 个 round 通常对应：`1 次 original + 5 次 mutation + 5 次 crossover`。
+    - 重要：这里的 **round 是 controller 的 phase-round**，即每跑完一个 phase（original/mutation/crossover）才会 `round += 1`，并不是“一个 iteration=original+mutation+crossover”。
+    - 当 `mutation_enabled=true && crossover_enabled=true` 时，phase 顺序通常是：
+      - `round 0 = original`
+      - `round 1 = mutation`
+      - `round 2 = crossover`
+      - `round 3 = mutation`
+      - `round 4 = crossover`
+      - ...交替进行。
+    - 论文中的**1个 Iteration = 2个 Rounds**（一次 mutation 加上一次 crossover）。
+    - **主实验（5 Iterations）**对应：`1 次 original + 5 次 mutation + 5 次 crossover` = `11 Rounds`。
+    - **最优探索（11 Iterations）**对应：`1 次 original + 11 次 mutation + 11 次 crossover` = `23 Rounds`。
 
-4. **Task（一个分支任务）**
-   - task 的标识是 `(phase, round_idx, direction_id)`，日志目录名是：`{phase}_{round:02d}_{direction_id:02d}`（例：`crossover_06_03`）。
-   - 数量（典型值）：
-     - `original`：每个 direction 1 个 task，通常是 `10`。
-     - `mutation`：每个“父轨迹”1 个 task，第一次 mutation 通常也是 `≈10`（后续取决于上一轮产出轨迹数）。
-     - `crossover`：由 `evolution.crossover_n` 控制，通常是 `≤10`（候选不足会更少）。
-
-5. **Step（task 内固定 5 步）**
-   - 顺序固定：`factor_propose -> factor_construct -> factor_calculate -> factor_backtest -> feedback`
-
-6. **Attempt（空因子重试，task 的子层级）**
-   - 若某个 task 产出 `factor_count=0`，会触发空分支重试。
-   - `evolution.max_empty_retries=1` 表示每个 task 最多跑 `2` 次 attempt（第一次 + 1 次重试）。
+4. **Task (任务单元)**  & **Step (单步骤)** & **Attempt (尝试)**
+   - **注意**：Task / Step / Attempt **并不是**演进层级的概念。它们只是代码里为了**分布式执行、错误重试、或者给日志打标签**抽象出来的执行层概念。
+   - **Task**：日志目录里的最小单元。标识为：`{phase}_{round:02d}_{direction_id:02d}`（例如 `crossover_06_03`）。它的范围是“执行单次 phase 内的一条完整链路”。
+     - 链路里固定走 5 个 **Step**：`propose -> construct -> calculate -> backtest -> feedback`。
+   - **Attempt**：如果这个 Task 里的 LLM 返空了，触发的内部原位重试就是一次 attempt（由 `evolution.max_empty_retries=1` 控制）。
 
 ### 2.1 建议：先做配置预检（仅告警，不阻断）
 
@@ -109,7 +186,8 @@ python scripts/preflight_check.py experiment --config configs/experiment.yaml
 ```yaml
 llm:
   # [Optimization Added, not original baseline defaults]
-  json_mode_temperature: 0.0
+  json_mode_strict: true
+  json_mode_temperature: 0.5
   freeform_temperature: 0.5
   json_mode_response_format: json_object
   json_mode_json_schema: ""
@@ -120,11 +198,86 @@ llm:
   failover_base_urls: []
 ```
 
+### 2.3 优化 A/B 测试（推荐流程，先验证再启用）
+
+说明：
+
+- 下述优化都属于“非论文基线默认”。为了避免复现偏差，建议先做 A/B，再决定是否在主复现配置中开启。
+- 本仓库提供了一个 A/B 驱动脚本：`scripts/abtest_experiment.py`。
+- 产物隔离（方案 A）：脚本会把 workspace/pickle cache 放到 `/tmp/quanta_abtest_results/...`，把运行日志/doctor 报告放到 `/tmp/quanta_abtests/...`，避免污染主复现产物目录。
+- LLM 相关 A/B 需要真实 API 可用；如果你在受限/沙盒环境运行，可能出现 “Connection error / DNS 失败”，这不是优化本身失败，换到本机正常网络终端再跑即可。
+
+固定对照命令模板（请保持 direction 与 base-config 一致）：
+
+```bash
+cd /Users/ron/Documents/QuantaAlpha
+```
+
+#### A/B #1：`cheap_filter + duplicate_exact`（3.11 + 3.15）
+
+只改变 `quality_gate.cheap_filter_enabled`（以及 `cheap_filter_require_acceptable`），其他保持一致：
+
+```bash
+cd /Users/ron/Documents/QuantaAlpha
+
+.venv/bin/python scripts/abtest_experiment.py compare \
+  --name opt1_cheap_gate \
+  --base-config configs/experiment_smoke.yaml \
+  --direction "价量因子挖掘" \
+  --step-n 3 \
+  --times 3 \
+  --set-baseline quality_gate.cheap_filter_enabled=false \
+  --set-baseline quality_gate.cheap_filter_require_acceptable=false \
+  --set-optimized quality_gate.cheap_filter_enabled=true \
+  --set-optimized quality_gate.cheap_filter_require_acceptable=true
+```
+
+记录结果：
+
+- 重点对比：`elapsed_s_median`、doctor 中的失败原因分布、以及是否出现 `skip_reason=duplicate_exact` 等信号。
+- 运行日志与 doctor 报告默认落在 `/tmp/quanta_abtests/...`（不会污染主复现产物目录）。
+
+结果（2026-02-28，STEP_N=3）：
+
+- baseline（cheap gate 关闭）：`elapsed_s=277.771`
+- optimized（cheap gate 开启）：`elapsed_s=415.958`（负优化，+49.8%）
+- 详细记录见：`docs/performance_optimization_cn.md` 的 **5.2 opt1**
+
+#### A/B #2：协议层强约束 JSON（3.13）
+
+只改变 `llm.json_mode_strict` 与 `llm.json_mode_response_format`，其他保持一致：
+
+```bash
+cd /Users/ron/Documents/QuantaAlpha
+
+.venv/bin/python scripts/abtest_experiment.py compare \
+  --name opt2_json_protocol \
+  --base-config configs/experiment_smoke.yaml \
+  --direction "价量因子挖掘" \
+  --step-n 3 \
+  --times 3 \
+  --set-baseline llm.json_mode_strict=false \
+  --set-baseline llm.json_mode_response_format=none \
+  --set-optimized llm.json_mode_strict=true \
+  --set-optimized llm.json_mode_response_format=json_object
+```
+
+记录结果：
+
+- 把两次的 `ABTEST_RESULT=...` 原样保存到本节（含 `run_log` / `doctor_md` 路径）。
+- 重点对比：JSON parse/fix 相关失败次数、construct 阶段耗时与重试行为、以及整体 `elapsed_s`。
+
+结果（2026-02-28，STEP_N=3）：
+
+- baseline：`elapsed_s=363.289`
+- optimized：`elapsed_s=334.619`（正优化，-7.9%）
+- 详细记录见：`docs/performance_optimization_cn.md` 的 **5.3 opt2**
+
 说明：
 
 - 这些选项用于降低 JSON 解析失败与网络尾延迟，不改变因子质量门定义。
 - 若需严格贴近“原始基线设置”，可将这些新增选项回退到默认逻辑或关闭。
-- 当前版本还增加了跨轮次 exact 去重：`factor_calculate/factor_backtest` 前若命中历史已见表达式，会标记 `skip_reason=duplicate_exact` 并跳过重复计算。
+- 当前版本还包含跨轮次 exact 去重（`duplicate_exact`）：仅在启用 cheap gate 时生效；在 `factor_calculate/factor_backtest` 前若命中历史已见表达式，会标记 `skip_reason=duplicate_exact` 并跳过重复计算。
 
 ---
 
@@ -272,6 +425,9 @@ python -m quantaalpha.backtest.run_backtest \
   - `N`：只回测 Top-N（按配置排序指标）
   - `all`：不限制数量
   - `default`：沿用配置文件（`backtest_limited.yaml` 默认为 50）
+- `--corr-dedup`：在回测前先做“相关性去重 + 多样性 Top-N”筛选（输出临时库再回测）
+  - `--dedup-per-cluster K`：每个相关性簇保留 K 个冠军（默认 3；设为 1 更严格）
+  - `--dedup-topn N`：最终保留 N 个因子（未指定时尽量从配置 `custom.max_factors` 推断）
 - `--warm-cache`：先同步 `result.h5 -> md5 cache`
 
 默认行为（当前版本）：

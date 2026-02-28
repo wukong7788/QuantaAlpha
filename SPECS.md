@@ -1,7 +1,7 @@
 # SPECS.md
 
 > QuantaAlpha 单一执行文档（Single Source of Truth）  
-> 最后更新：2026-02-27
+> 最后更新：2026-02-28
 
 ## 1. 当前目标（Active Goals）
 
@@ -95,14 +95,14 @@ STEP_N=5 ./minirun.sh
 # evolution.max_empty_retries: 1
 
 # 预计算过滤与分支止损（construct -> calculate 前）
-# quality_gate.cheap_filter_enabled: true
+# quality_gate.cheap_filter_enabled: false  # 默认关闭（A/B（STEP_N=3）为负优化）
 # quality_gate.max_construct_failures_per_branch: 2
 # quality_gate.max_json_parse_failures_per_branch: 2
 
 # LLM 运行时稳态（优化新增选项，非原始基线默认）
 # llm.json_mode_response_format: json_object
 # llm.json_mode_json_schema: ""
-# llm.json_mode_temperature: 0.0
+# llm.json_mode_temperature: 0.5  # 默认与 freeform 保持一致；温度分层需单独 A/B 再启用
 # llm.freeform_temperature: 0.5
 # llm.request_timeout_s: 60.0
 # llm.retry_backoff: exponential
@@ -112,7 +112,23 @@ STEP_N=5 ./minirun.sh
 
 # 安全回测
 ./scripts/run_backtest_safe.sh --library all_factors_library_xxx.json --mode limited
+./scripts/run_backtest_safe.sh --library all_factors_library_xxx.json --mode limited --max-factors 80 --corr-dedup --dedup-per-cluster 1
 ./scripts/run_backtest_safe.sh --bob --bob-libraries "data/factorlib/all_factors_library_*.json" --bob-top 80
+
+# Factor Zoo 管理
+.venv/bin/python scripts/update_factor_zoo.py build    # 全量重建
+.venv/bin/python scripts/update_factor_zoo.py update   # 增量上传最新实验
+.venv/bin/python scripts/update_factor_zoo.py status   # 查看 zoo 状态
+
+# 23 轮完整复现(土豪模式， relay 接力 4 次)
+EXPERIMENT_ID="paper_repro_23r" QUANTA_RELAY_CHUNK_ROUNDS=6 ./run.sh --rounds 23 --low-disk --relay --zoo-dedup "价量因子挖掘" "paper_repro_23r"
+
+# 回测内存 A/B（峰值 RSS + 耗时，baseline=HEAD，optimized=当前工作区）
+.venv/bin/python scripts/abtest_backtest_memory.py baseline -- -c configs/backtest_limited.yaml --factor-source custom --factor-json data/factorlib/all_factors_library_xxx.json --skip-uncached
+.venv/bin/python scripts/abtest_backtest_memory.py optimized -- -c configs/backtest_limited.yaml --factor-source custom --factor-json data/factorlib/all_factors_library_xxx.json --skip-uncached
+
+# 实验流程 A/B（baseline/optimized；可重复 times 次并输出对比汇总）
+.venv/bin/python scripts/abtest_experiment.py compare --name opt2_json_protocol --base-config configs/experiment_smoke.yaml --direction "价量因子挖掘" --step-n 3 --times 3 --set-baseline llm.json_mode_response_format=none --set-optimized llm.json_mode_response_format=json_object
 
 # 横向对比（不重算，直接读结果文件）
 ./scripts/run_backtest_safe.sh --view-results
@@ -147,6 +163,23 @@ STEP_N=5 ./minirun.sh
   - 分阶段温度分层：新增 `llm.json_mode_temperature` 与 `llm.freeform_temperature`，将结构化输出稳定性与自由生成多样性解耦。
   - 网络稳态优化：新增 `llm.request_timeout_s`、指数退避/抖动/最大等待与 `llm.failover_base_urls`，降低尾延迟卡顿。
   - 跨轮次 exact 去重：`factor_calculate/backtest` 前增加历史已见表达式过滤，skip 原因记录 `duplicate_exact`。
+
+- 2026-02-28:
+  - 增加回测内存 A/B 工具：`scripts/abtest_backtest_memory.py`（baseline=HEAD，optimized=当前工作区）。
+  - `run_backtest_safe.sh` 增加相关性去重入口：`--corr-dedup`（支持 `--dedup-per-cluster`，默认 3）。
+  - 第三轮优化（回测降内存）尝试后回滚：A/B Test 显示峰值内存上升，判定为负优化（保留 A/B 工具用于后续验证）。
+  - 增加实验流程 A/B 工具：`scripts/abtest_experiment.py`（按配置开关对照运行 `./run.sh`，产物隔离到 `/tmp`，并生成 doctor 报告）。
+  - opt1（cheap gate + duplicate_exact）在 `STEP_N=3` 用例下 A/B 为负优化，已默认关闭（仍可手动开启并在目标用例上复测）。
+  - opt2（协议层 JSON 强约束）A/B 为正优化，保持默认开启：`llm.json_mode_strict=true`、`llm.json_mode_response_format=json_object`。
+
+- 2026-02-28 (第二批):
+  - **Factor Zoo 跨轮次去重流水线**：新增 `scripts/update_factor_zoo.py`（`build / update / status`），同时输出 JSON（元数据）+ CSV（`factor_zoo.csv`，供 `FactorRegulator` `pd.read_csv` 加载）。
+  - **`run.sh --zoo-dedup`**：新 flag，导出 `FACTOR_CoSTEER_FACTOR_ZOO_PATH`，实验结束后自动调用 `update_factor_zoo.py update`。
+  - **`run.sh --rounds N`**：新 flag，遍历 `experiment.yaml` 创建临时配置（`max_rounds` 覆盖），运行结束后自动清理临时文件。
+  - **`minirun.sh --low-disk / --zoo-dedup`**：新增 flag 解析，透传给内部 `run.sh`。
+  - **`configs/backtest_2021_validate.yaml`**：新增，回测区间对齐 2021-01-01 ~ 2021-12-31（与挖掘期内打分口径一致）。
+  - **`PAPER_REPRODUCTION_GUIDE.md` 脚本区重构**：脚本 0（minirun）、脚本 1（安全模式 + zoo-dedup）、脚本 2（土豪 23 轮，化简为 2 步）。
+  - **`AGENTS.md` / `SPECS.md`** 同步更新以上全部变更。
 
 ## 8. 使用规则（How to Maintain）
 

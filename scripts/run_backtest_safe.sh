@@ -32,6 +32,15 @@ Options:
                                 N = use top N custom factors
                                 all = no limit (null)
                                 default = keep config value
+  --corr-dedup                  Enable correlation-based de-dup + Top-N selection
+                                (runs scripts/select_diverse_factors.py to produce a smaller
+                                diverse library JSON before backtest).
+  --dedup-topn <N>              Final Top-N after correlation de-dup
+                                (default: inferred from config factor_source.custom.max_factors when possible)
+  --dedup-per-cluster <K>       Keep K champions per cluster (default: 3; set 1 for strict diversity)
+  --dedup-corr-threshold <T>    Cluster edge threshold on |Spearman corr| (default: 0.8)
+  --dedup-sample-size <N>       Sample size for correlation computation (default: 8000)
+  --dedup-compute-missing       Compute/cache factor values when missing (can be slow)
   --min-free-gb <N>             Minimum free disk GB required (default: 15)
   --warm-cache                  Sync available result.h5 into MD5 cache before run
   --bob                         Build Best-of-Best (BOB) library from multiple runs, then backtest
@@ -56,6 +65,7 @@ Options:
 Examples:
   ./scripts/run_backtest_safe.sh --library all_factors_library_paper_reproduction.json
   ./scripts/run_backtest_safe.sh --library data/factorlib/all_factors_library_x.json --threads 6 --warm-cache
+  ./scripts/run_backtest_safe.sh --library data/factorlib/all_factors_library_x.json --max-factors 80 --corr-dedup --dedup-per-cluster 1
   ./scripts/run_backtest_safe.sh --bob --bob-libraries "data/factorlib/all_factors_library_*.json" --bob-top 80
   ./scripts/run_backtest_safe.sh --bob --bob-libraries "data/factorlib/all_factors_library_*.json" --bob-grade s
   ./scripts/run_backtest_safe.sh --view-results
@@ -77,6 +87,13 @@ WARM_CACHE="false"
 SKIP_UNCACHED="true"  # fixed by design
 QUALITY_MIN_SOURCE="${BACKTEST_MIN_QUALITY:-auto}"  # auto => limited: high, performance: off
 QUALITY_MIN="$QUALITY_MIN_SOURCE"
+CORR_DEDUP="false"
+DEDUP_TOPN=""
+DEDUP_TOPN_EFFECTIVE=""
+DEDUP_PER_CLUSTER="3"
+DEDUP_CORR_THRESHOLD="0.8"
+DEDUP_SAMPLE_SIZE="8000"
+DEDUP_COMPUTE_MISSING="false"
 BOB_ENABLED="false"
 BOB_LIBRARIES=""
 BOB_TOP="50"
@@ -155,6 +172,30 @@ while [[ $# -gt 0 ]]; do
       MAX_FACTORS_OVERRIDE="${2:-}"
       MAX_FACTORS_SET="true"
       shift 2
+      ;;
+    --corr-dedup)
+      CORR_DEDUP="true"
+      shift
+      ;;
+    --dedup-topn)
+      DEDUP_TOPN="${2:-}"
+      shift 2
+      ;;
+    --dedup-per-cluster)
+      DEDUP_PER_CLUSTER="${2:-}"
+      shift 2
+      ;;
+    --dedup-corr-threshold)
+      DEDUP_CORR_THRESHOLD="${2:-}"
+      shift 2
+      ;;
+    --dedup-sample-size)
+      DEDUP_SAMPLE_SIZE="${2:-}"
+      shift 2
+      ;;
+    --dedup-compute-missing)
+      DEDUP_COMPUTE_MISSING="true"
+      shift
       ;;
     --min-free-gb)
       MIN_FREE_GB="${2:-}"
@@ -283,6 +324,11 @@ validate_max_factors() {
     return 0
   fi
   return 1
+}
+
+validate_positive_int() {
+  local raw="$1"
+  [[ "$raw" =~ ^[0-9]+$ ]] && [[ "$raw" -gt 0 ]]
 }
 
 validate_quality_min() {
@@ -419,6 +465,7 @@ if [[ "$INTERACTIVE" == "true" ]]; then
   echo "  mode=$MODE"
   echo "  factor_source=$FACTOR_SOURCE"
   echo "  max_factors=$MAX_FACTORS_OVERRIDE"
+  echo "  corr_dedup=$CORR_DEDUP dedup_topn_effective=${DEDUP_TOPN_EFFECTIVE:-${DEDUP_TOPN:-auto}} dedup_per_cluster=$DEDUP_PER_CLUSTER"
   echo "  warm_cache=$WARM_CACHE"
   echo "  quality_min=$QUALITY_MIN"
 fi
@@ -452,6 +499,25 @@ fi
 if ! validate_quality_min "$QUALITY_MIN"; then
   echo "Error: BACKTEST_MIN_QUALITY must be one of auto/off/low/medium/high"
   exit 1
+fi
+
+if [[ "$CORR_DEDUP" == "true" ]]; then
+  if [[ "$FACTOR_SOURCE" != "custom" ]]; then
+    echo "Error: --corr-dedup currently supports --factor-source custom only (got '$FACTOR_SOURCE')"
+    exit 1
+  fi
+  if [[ -n "$DEDUP_TOPN" ]] && ! validate_positive_int "$DEDUP_TOPN"; then
+    echo "Error: --dedup-topn must be a positive integer"
+    exit 1
+  fi
+  if ! validate_positive_int "$DEDUP_PER_CLUSTER"; then
+    echo "Error: --dedup-per-cluster must be a positive integer"
+    exit 1
+  fi
+  if ! validate_positive_int "$DEDUP_SAMPLE_SIZE"; then
+    echo "Error: --dedup-sample-size must be a positive integer"
+    exit 1
+  fi
 fi
 
 if [[ "$BOB_ENABLED" == "true" ]]; then
@@ -504,6 +570,8 @@ fi
 RUN_CONFIG_PATH="$CONFIG_PATH"
 TMP_CONFIG_PATH=""
 TMP_FILTERED_LIBRARY_PATH=""
+TMP_DIVERSE_LIBRARY_PATH=""
+TMP_DIVERSE_REPORT_PATH=""
 TMP_BOB_LIBRARY_PATH=""
 TMP_BOB_REPORT_PATH=""
 CMD_PID=""
@@ -519,6 +587,12 @@ cleanup_runtime() {
   fi
   if [[ -n "$TMP_FILTERED_LIBRARY_PATH" && -f "$TMP_FILTERED_LIBRARY_PATH" ]]; then
     rm -f "$TMP_FILTERED_LIBRARY_PATH" 2>/dev/null || true
+  fi
+  if [[ -n "$TMP_DIVERSE_LIBRARY_PATH" && -f "$TMP_DIVERSE_LIBRARY_PATH" ]]; then
+    rm -f "$TMP_DIVERSE_LIBRARY_PATH" 2>/dev/null || true
+  fi
+  if [[ -n "$TMP_DIVERSE_REPORT_PATH" && -f "$TMP_DIVERSE_REPORT_PATH" ]]; then
+    rm -f "$TMP_DIVERSE_REPORT_PATH" 2>/dev/null || true
   fi
   if [[ -n "$TMP_BOB_LIBRARY_PATH" && -f "$TMP_BOB_LIBRARY_PATH" ]]; then
     rm -f "$TMP_BOB_LIBRARY_PATH" 2>/dev/null || true
@@ -1166,6 +1240,83 @@ PY
   fi
 fi
 
+if [[ "$CORR_DEDUP" == "true" ]]; then
+  if [[ ! -f "$PROJECT_ROOT/scripts/select_diverse_factors.py" ]]; then
+    echo "Error: dedup selector script not found: $PROJECT_ROOT/scripts/select_diverse_factors.py"
+    exit 1
+  fi
+
+  TOPN_EFFECTIVE="$DEDUP_TOPN"
+  if [[ -z "$TOPN_EFFECTIVE" ]]; then
+    TOPN_EFFECTIVE="$("$PYTHON_BIN" - "$RUN_CONFIG_PATH" <<'PY'
+import sys
+from pathlib import Path
+import yaml
+
+cfg_path = Path(sys.argv[1])
+with cfg_path.open("r", encoding="utf-8") as f:
+    cfg = yaml.safe_load(f) or {}
+fs = cfg.get("factor_source") or {}
+custom = fs.get("custom") or {}
+mf = custom.get("max_factors")
+if mf in (None, "", 0):
+    print("")
+else:
+    try:
+        print(int(mf))
+    except Exception:
+        print("")
+PY
+)"
+  fi
+
+  if [[ -z "$TOPN_EFFECTIVE" ]]; then
+    echo "Error: --corr-dedup needs a target topn. Provide --dedup-topn <N> or set config factor_source.custom.max_factors."
+    exit 1
+  fi
+  if ! validate_positive_int "$TOPN_EFFECTIVE"; then
+    echo "Error: inferred dedup topn is not a positive integer: '$TOPN_EFFECTIVE'"
+    exit 1
+  fi
+  DEDUP_TOPN_EFFECTIVE="$TOPN_EFFECTIVE"
+
+  if ! "$PYTHON_BIN" - "$DEDUP_CORR_THRESHOLD" <<'PY' >/dev/null 2>&1; then
+import sys
+try:
+    v = float(sys.argv[1])
+    raise SystemExit(0 if (0.0 < v < 1.0) else 1)
+except Exception:
+    raise SystemExit(1)
+PY
+    echo "Error: --dedup-corr-threshold must be a float in (0,1) (got '$DEDUP_CORR_THRESHOLD')"
+    exit 1
+  fi
+
+  TMP_DIVERSE_LIBRARY_PATH="$(mktemp "/tmp/quantaalpha_factorlib_diverse_XXXXXX.json")"
+  TMP_DIVERSE_REPORT_PATH="$(mktemp "/tmp/quantaalpha_factorlib_diverse_report_XXXXXX.json")"
+
+  DEDUP_ARGS=(
+    --library "$LIB_PATH"
+    --config "$RUN_CONFIG_PATH"
+    --out "$TMP_DIVERSE_LIBRARY_PATH"
+    --topn "$TOPN_EFFECTIVE"
+    --per-cluster "$DEDUP_PER_CLUSTER"
+    --corr-threshold "$DEDUP_CORR_THRESHOLD"
+    --sample-size "$DEDUP_SAMPLE_SIZE"
+    --report "$TMP_DIVERSE_REPORT_PATH"
+  )
+  if [[ "$DEDUP_COMPUTE_MISSING" == "true" ]]; then
+    DEDUP_ARGS+=(--compute-missing)
+  fi
+
+  echo "[Diverse] enabled=true topn=$TOPN_EFFECTIVE per_cluster=$DEDUP_PER_CLUSTER corr_threshold=$DEDUP_CORR_THRESHOLD sample_size=$DEDUP_SAMPLE_SIZE compute_missing=$DEDUP_COMPUTE_MISSING"
+  echo "[Diverse] input_library=$LIB_PATH"
+  "$PYTHON_BIN" "$PROJECT_ROOT/scripts/select_diverse_factors.py" "${DEDUP_ARGS[@]}"
+  echo "[Diverse] report=$TMP_DIVERSE_REPORT_PATH"
+  echo "[Diverse] output_library=$TMP_DIVERSE_LIBRARY_PATH"
+  LIB_PATH="$TMP_DIVERSE_LIBRARY_PATH"
+fi
+
 FREE_KB="$(df -Pk "$PROJECT_ROOT" | awk 'NR==2 {print $4}')"
 FREE_GB="$((FREE_KB / 1024 / 1024))"
 if [[ "$FREE_GB" -lt "$MIN_FREE_GB" ]]; then
@@ -1213,13 +1364,14 @@ PID_DIR="$LOG_DIR/pids"
 mkdir -p "$PID_DIR"
 PID_FILE="$PID_DIR/backtest_${TS}.pid"
 
-{
-  echo "[Summary] interactive=$INTERACTIVE target=$TARGET_MODE auto_start=true"
-  echo "[Summary] library=$LIB_PATH"
-  echo "[Summary] mode=$MODE factor_source=$FACTOR_SOURCE quality_min=$QUALITY_MIN max_factors=$MAX_FACTORS_EFFECTIVE"
-  echo "[Summary] bob_enabled=$BOB_ENABLED bob_libraries=$BOB_LIBRARIES bob_metric=$BOB_METRIC bob_grade=$BOB_GRADE_MODE bob_top=$BOB_TOP"
-  echo "[Summary] warm_cache=$WARM_CACHE skip_uncached=$SKIP_UNCACHED free_disk=${FREE_GB}GB"
-} | tee -a "$LOG_FILE"
+  {
+    echo "[Summary] interactive=$INTERACTIVE target=$TARGET_MODE auto_start=true"
+    echo "[Summary] library=$LIB_PATH"
+    echo "[Summary] mode=$MODE factor_source=$FACTOR_SOURCE quality_min=$QUALITY_MIN max_factors=$MAX_FACTORS_EFFECTIVE"
+    echo "[Summary] corr_dedup=$CORR_DEDUP dedup_topn_effective=${DEDUP_TOPN_EFFECTIVE:-${DEDUP_TOPN:-auto}} dedup_per_cluster=$DEDUP_PER_CLUSTER dedup_corr_threshold=$DEDUP_CORR_THRESHOLD dedup_sample_size=$DEDUP_SAMPLE_SIZE"
+    echo "[Summary] bob_enabled=$BOB_ENABLED bob_libraries=$BOB_LIBRARIES bob_metric=$BOB_METRIC bob_grade=$BOB_GRADE_MODE bob_top=$BOB_TOP"
+    echo "[Summary] warm_cache=$WARM_CACHE skip_uncached=$SKIP_UNCACHED free_disk=${FREE_GB}GB"
+  } | tee -a "$LOG_FILE"
 
 log_msg() {
   local msg="$1"
@@ -1252,6 +1404,7 @@ echo "[Run] factor_source=$FACTOR_SOURCE config=$RUN_CONFIG_PATH (base=$CONFIG_P
 echo "[Run] threads=$THREADS skip_uncached=$SKIP_UNCACHED"
 echo "[Run] quality_min=$QUALITY_MIN"
 echo "[Run] max_factors=$MAX_FACTORS_EFFECTIVE"
+echo "[Run] corr_dedup=$CORR_DEDUP dedup_topn_effective=${DEDUP_TOPN_EFFECTIVE:-${DEDUP_TOPN:-auto}} dedup_per_cluster=$DEDUP_PER_CLUSTER dedup_corr_threshold=$DEDUP_CORR_THRESHOLD dedup_sample_size=$DEDUP_SAMPLE_SIZE compute_missing=$DEDUP_COMPUTE_MISSING"
 echo "[Run] bob_enabled=$BOB_ENABLED bob_metric=$BOB_METRIC bob_top=$BOB_TOP bob_grade=$BOB_GRADE_MODE"
 echo "[Run] free_disk=${FREE_GB}GB log=$LOG_FILE"
 
@@ -1290,6 +1443,12 @@ config_base=$CONFIG_PATH
 threads=$THREADS
 quality_min=$QUALITY_MIN
 max_factors=$MAX_FACTORS_EFFECTIVE
+corr_dedup=$CORR_DEDUP
+dedup_topn_effective=${DEDUP_TOPN_EFFECTIVE:-${DEDUP_TOPN:-}}
+dedup_per_cluster=$DEDUP_PER_CLUSTER
+dedup_corr_threshold=$DEDUP_CORR_THRESHOLD
+dedup_sample_size=$DEDUP_SAMPLE_SIZE
+dedup_compute_missing=$DEDUP_COMPUTE_MISSING
 bob_enabled=$BOB_ENABLED
 bob_libraries=$BOB_LIBRARIES
 bob_metric=$BOB_METRIC
