@@ -119,9 +119,30 @@ Only the following operations are allowed in expressions:
         if self.data_df is None:
             raise ValueError("Data not set; call set_data() or provide data_df in __init__")
         
-        results = {}
+        results: Dict[str, pd.Series] = {}
+        used_keys: set[str] = set()
         success_count = 0
         fail_count = 0
+
+        def _reserve_factor_key(factor_info: Dict[str, Any], factor_name: str) -> str:
+            raw_name = str(factor_name or "unknown").strip() or "unknown"
+            raw_id = str(factor_info.get("factor_id") or "").strip()
+            if raw_name not in used_keys:
+                used_keys.add(raw_name)
+                return raw_name
+            if raw_id:
+                key2 = f"{raw_name}__{raw_id}"
+                if key2 not in used_keys:
+                    used_keys.add(key2)
+                    return key2
+            # Fallback: stable numeric suffix.
+            n = 2
+            while True:
+                key2 = f"{raw_name}__dup{n}"
+                if key2 not in used_keys:
+                    used_keys.add(key2)
+                    return key2
+                n += 1
         
         for factor_info in factors:
             factor_name = factor_info.get('factor_name', 'unknown')
@@ -133,7 +154,8 @@ Only the following operations are allowed in expressions:
                 if self.llm_config.get('cache_results', True):
                     cached_result = self._load_from_cache(factor_expr)
                     if cached_result is not None:
-                        results[factor_name] = cached_result
+                        factor_key = _reserve_factor_key(factor_info, factor_name)
+                        results[factor_key] = cached_result
                         success_count += 1
                         valid_count = cached_result.notna().sum()
                         total_count = len(cached_result)
@@ -143,7 +165,8 @@ Only the following operations are allowed in expressions:
                 factor_value = self._calculate_with_parser(factor_expr)
                 
                 if factor_value is not None:
-                    results[factor_name] = factor_value
+                    factor_key = _reserve_factor_key(factor_info, factor_name)
+                    results[factor_key] = factor_value
                     success_count += 1
                     valid_count = factor_value.notna().sum()
                     total_count = len(factor_value)
@@ -154,7 +177,8 @@ Only the following operations are allowed in expressions:
                     if self.llm_config.get('enabled', True):
                         factor_value = self._calculate_with_llm(factor_info)
                         if factor_value is not None:
-                            results[factor_name] = factor_value
+                            factor_key = _reserve_factor_key(factor_info, factor_name)
+                            results[factor_key] = factor_value
                             success_count += 1
                             logger.info(f"    LLM OK")
                         else:

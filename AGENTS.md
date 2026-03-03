@@ -65,6 +65,25 @@ These terms are easy to mix up during paper reproduction and performance optimiz
   - First propose a clearer structure outline (sections + ordering) to keep the doc readable.
   - Apply the restructure **only after** the user explicitly agrees to the proposed new structure.
 
+### Changelog Policy (`CHANGELOG.md`)
+
+- Structure: one section per date (`## YYYY-MM-DD`).
+- Subsections (include only if non-empty; keep order):
+  - `### Highlights` (max 3 lines)
+  - `### Added` / `### Fixed` / `### Performance` / `### Changed` / `### Removed`
+  - Optional: `### Docs` / `### Internal`
+- Every bullet must start with searchable tags:
+  - Format: `[area][impact]` (optionally add severity: `[P0|P1|P2]`)
+  - Suggested areas: `core`, `pipeline`, `factors`, `backtest`, `llm`, `scripts`, `frontend`, `configs`, `docs`, `tests`
+  - Suggested impacts: `feature`, `behavior`, `output`, `reliability`, `perf`, `mem`, `docs`, `internal`
+- `### Performance` / `mem` entries must include measurement context when applicable:
+  - dataset/market/date range, factor count, and metric name (e.g. wall time, peak RSS)
+  - harness/tool used (e.g. `scripts/abtest_backtest_memory.py`)
+- Default/semantic changes must be explicit:
+  - write `A -> B` and name the flag/env/config key(s).
+- Keep entries scannable:
+  - 1-line summary first; add indented sub-bullets only for file paths, keys/flags, tests, or A/B results.
+
 ## Local Runtime (current)
 
 Use `uv + .venv` (no conda required).

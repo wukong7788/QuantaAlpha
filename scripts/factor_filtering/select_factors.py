@@ -38,6 +38,15 @@ def _load_yaml(path: Path) -> Dict[str, Any]:
     return data
 
 
+def _write_factor_library_json(path: Path, *, base_meta: Dict[str, Any], factors: Dict[str, Any], extra_meta: Dict[str, Any]) -> None:
+    meta = dict(base_meta or {})
+    meta.update(extra_meta or {})
+    meta["total_factors"] = len(factors)
+    out = {"metadata": meta, "factors": factors}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def _init_qlib(config: Dict[str, Any]) -> None:
     import qlib  # type: ignore
 
@@ -170,6 +179,17 @@ class Candidate:
     stage2_metrics: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class ExprDedupStats:
+    method: str
+    input_total: int
+    input_with_expr: int
+    kept_unique: int
+    dropped_empty_expr: int
+    duplicates_removed: int
+    ast_parse_failed: int
+
+
 def _metric_from_bt(backtest_results: Dict[str, Any], keys: Tuple[str, ...], contains: Tuple[str, ...] = ()) -> Optional[float]:
     if not isinstance(backtest_results, dict):
         return None
@@ -195,6 +215,93 @@ def _score_stage1(backtest_results: Dict[str, Any], score_key: str) -> float:
             "1day.excess_return_without_cost.annualized_return")
     x = _metric_from_bt(backtest_results, keys)
     return x if x is not None else float("-inf")
+
+
+def _dedup_factor_items_by_expression(
+    factor_items: List[Tuple[str, Dict[str, Any]]],
+    *,
+    method: str,
+    score_key: str,
+) -> Tuple[List[Tuple[str, Dict[str, Any]]], ExprDedupStats]:
+    """
+    Exact-like dedup by expression fingerprint before correlation dedup.
+
+    method:
+      - "none": no-op
+      - "norm": whitespace-normalized expression string
+      - "ast": AST-canonicalized expression (commutative+associative canonicalization)
+    Keep rule:
+      - pick the factor with best stage1 score within the same fingerprint group
+      - tie-breaker: keep the earliest occurrence (stable)
+    """
+    method_lc = str(method or "none").strip().lower()
+    if method_lc == "none":
+        stats = ExprDedupStats(
+            method="none",
+            input_total=len(factor_items),
+            input_with_expr=len([1 for _, info in factor_items if str((info or {}).get("factor_expression") or "").strip()]),
+            kept_unique=len(factor_items),
+            dropped_empty_expr=len([1 for _, info in factor_items if not str((info or {}).get("factor_expression") or "").strip()]),
+            duplicates_removed=0,
+            ast_parse_failed=0,
+        )
+        return factor_items, stats
+
+    if method_lc not in {"norm", "ast"}:
+        raise ValueError(f"Invalid --expr-dedup-method: {method}")
+
+    from quantaalpha.utils.expression_fingerprint import normalize_expression, try_ast_canonical_expression
+
+    best_by_fp: Dict[str, Tuple[int, float, str, Dict[str, Any]]] = {}
+    # fp -> (first_idx, score, factor_id, info)
+
+    input_with_expr = 0
+    dropped_empty = 0
+    ast_failed = 0
+
+    for idx, (factor_id, info) in enumerate(factor_items):
+        if not isinstance(info, dict):
+            continue
+        expr = str(info.get("factor_expression") or "").strip()
+        if not expr:
+            dropped_empty += 1
+            continue
+        input_with_expr += 1
+
+        if method_lc == "norm":
+            fp = normalize_expression(expr)
+        else:
+            res = try_ast_canonical_expression(expr)
+            fp = res.canonical
+            if not res.ok:
+                ast_failed += 1
+
+        score = _score_stage1(info.get("backtest_results") or {}, score_key)
+
+        cur = best_by_fp.get(fp)
+        if cur is None:
+            best_by_fp[fp] = (idx, float(score), str(factor_id), info)
+            continue
+
+        cur_idx, cur_score, _, _ = cur
+        if float(score) > float(cur_score):
+            best_by_fp[fp] = (idx, float(score), str(factor_id), info)
+        elif float(score) == float(cur_score) and idx < cur_idx:
+            best_by_fp[fp] = (idx, float(score), str(factor_id), info)
+
+    kept = [(fid, info) for (idx, score, fid, info) in sorted(best_by_fp.values(), key=lambda x: x[0])]
+    duplicates_removed = max(0, input_with_expr - len(kept))
+
+    stats = ExprDedupStats(
+        method=method_lc,
+        input_total=len(factor_items),
+        input_with_expr=input_with_expr,
+        kept_unique=len(kept),
+        dropped_empty_expr=dropped_empty,
+        duplicates_removed=duplicates_removed,
+        ast_parse_failed=ast_failed,
+    )
+    return kept, stats
 
 
 def _capacity_penalty(backtest_results: Dict[str, Any]) -> float:
@@ -429,6 +536,18 @@ def main() -> int:
     parser.add_argument("--library", required=True, help="Input factor library JSON path")
     parser.add_argument("--config", default="configs/backtest.yaml", help="Backtest config YAML")
     parser.add_argument("--out", required=True, help="Output factor library JSON path")
+    parser.add_argument(
+        "--expr-dedup-method",
+        choices=("none", "norm", "ast"),
+        default="none",
+        help="Stage-0 expression dedup before correlation dedup. norm=whitespace; ast=AST canonical.",
+    )
+    parser.add_argument("--out-stage1", default="", help="Optional output library after expression dedup stage")
+    parser.add_argument(
+        "--out-stage2",
+        default="",
+        help="Optional output library after exposure corr stage (before IC-series stage)",
+    )
 
     parser.add_argument(
         "--topn",
@@ -531,9 +650,24 @@ def main() -> int:
     if args.max_candidates and args.max_candidates > 0:
         factor_items = factor_items[: args.max_candidates]
 
+    factor_items, expr_stats = _dedup_factor_items_by_expression(
+        factor_items,
+        method=args.expr_dedup_method,
+        score_key=args.score_key,
+    )
+    # Always drop empty expressions early (even when expr_dedup_method=none) for stable counts.
+    factor_items = [(fid, info) for fid, info in factor_items if str((info or {}).get("factor_expression") or "").strip()]
+
     print(f"[Input] library={library_path} candidates={len(factor_items)}")
     print(f"[Config] {config_path}")
     print(f"[Dedup] method={args.dedup_method} linkage={args.cluster_linkage}")
+    if expr_stats.method != "none" or args.out_stage1:
+        print(
+            "[ExprDedup] "
+            f"method={expr_stats.method} input_total={expr_stats.input_total} "
+            f"input_with_expr={expr_stats.input_with_expr} kept_unique={expr_stats.kept_unique} "
+            f"duplicates_removed={expr_stats.duplicates_removed} ast_parse_failed={expr_stats.ast_parse_failed}"
+        )
 
     sample_start, sample_end, sample_window_source = _resolve_sample_window(config, args.sample_split)
     full_index = _load_base_index(config, start_time=sample_start, end_time=sample_end)
@@ -549,6 +683,20 @@ def main() -> int:
     if args.dry_run:
         print("[DryRun] exit (no selection performed)")
         return 0
+
+    if args.out_stage1:
+        stage1_factors = {fid: info for fid, info in factor_items if isinstance(info, dict)}
+        _write_factor_library_json(
+            Path(args.out_stage1),
+            base_meta=(data.get("metadata") or {}) if isinstance(data.get("metadata"), dict) else {},
+            factors=stage1_factors,
+            extra_meta={
+                "selection_stage": "stage1_expression_dedup",
+                "expr_dedup": expr_stats.__dict__,
+                "source_library": str(library_path),
+            },
+        )
+        print(f"[Stage1] wrote {len(stage1_factors)} factors -> {args.out_stage1}")
 
     from quantaalpha.backtest.custom_factor_calculator import CustomFactorCalculator
 
@@ -615,6 +763,31 @@ def main() -> int:
         f"[Stage1] threshold={args.corr_threshold} linkage={linkage_used_stage1} "
         f"clusters={len(clusters_stage1)} candidates={len(candidates)} pool={len(selected_stage1)}"
     )
+    exposure_pool = [candidates[i] for i in selected_stage1]
+
+    if args.out_stage2:
+        stage2_factors = {c.factor_id: c.factor_info for c in exposure_pool}
+        _write_factor_library_json(
+            Path(args.out_stage2),
+            base_meta=(data.get("metadata") or {}) if isinstance(data.get("metadata"), dict) else {},
+            factors=stage2_factors,
+            extra_meta={
+                "selection_stage": "stage2_exposure_corr",
+                "expr_dedup": expr_stats.__dict__,
+                "source_library": str(library_path),
+                "selection_snapshot": {
+                    "cluster_linkage_used": linkage_used_stage1,
+                    "corr_threshold": args.corr_threshold,
+                    "per_cluster": args.per_cluster,
+                    "candidates_total": len(factor_items),
+                    "kept_usable": len(candidates),
+                    "dropped_missing_or_low_coverage": dropped_missing,
+                    "clusters": len(clusters_stage1),
+                    "selected": len(exposure_pool),
+                },
+            },
+        )
+        print(f"[Stage2] wrote {len(stage2_factors)} factors -> {args.out_stage2}")
 
     # ----------------------
     # Stage-2: IC series corr
@@ -625,14 +798,13 @@ def main() -> int:
     stage2_dropped = 0
 
     if args.dedup_method == "two_stage":
-        stage1_pool = [candidates[i] for i in selected_stage1]
         label_series = _load_label_series(config, start_time=sample_start, end_time=sample_end)
         total_days = int(label_series.index.get_level_values(0).nunique())
 
         stage2_pool: List[Candidate] = []
         ic_series_map: Dict[str, Any] = {}
 
-        for cand in stage1_pool:
+        for cand in exposure_pool:
             series = _load_factor_series(
                 calc,
                 cand.factor_name,
@@ -686,9 +858,9 @@ def main() -> int:
             )
         else:
             print("[Stage2] pool too small after IC construction, fallback to Stage1 selection")
-            final_candidates = stage1_pool[: args.topn] if args.topn > 0 else stage1_pool
+            final_candidates = exposure_pool[: args.topn] if args.topn > 0 else exposure_pool
     else:
-        final_candidates = [candidates[i] for i in selected_stage1]
+        final_candidates = exposure_pool
 
     # ----------------------
     # Output
@@ -708,6 +880,7 @@ def main() -> int:
     selection_meta: Dict[str, Any] = {
         "method": "two_stage_exposure_then_ic_corr_topn" if args.dedup_method == "two_stage" else "stage1_exposure_corr_topn",
         "dedup_method": args.dedup_method,
+        "expr_dedup": expr_stats.__dict__,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "input_library": str(library_path),
         "config": str(config_path),
