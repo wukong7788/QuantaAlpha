@@ -37,7 +37,7 @@
 ./minirun.sh --low-disk --zoo-dedup "价量因子测试" "smoke_test"
 ```
 
-> **说明**：`minirun.sh` 强制使用 `configs/experiment_smoke.yaml`（超小规模参数），仅作验证，不产出有效因子。
+> **说明**：`minirun.sh` 默认使用轻量配置 `configs/experiment_smoke.yaml`，仅作验证，不产出有效因子。
 
 ---
 
@@ -46,22 +46,22 @@
 > **用途**：专为空间有限的个人电脑安全跑完 11 轮主实验设计。  
 > **机制**：
 > 1. 强制走 `--low-disk` 模式，算完因子自动清理几十 GB 的缓存文件。
-> 2. 强制走 `--relay` 接力模式（默认每 5 轮存盘并退出，第二次启动同一命令自动补齐剩余轮次）。
+> 2. 强制走 `--relay` 接力模式（默认每 6 轮存盘并退出，第二次启动同一命令自动补齐剩余轮次）。
 > 3. 已指定专用配置文件（清理庞大演化历史废料，因子假设=3）。
 
 ```bash
 # 接力模式机制说明：
-# - 第 1 次执行：跑前 5 轮（QUANTA_RELAY_CHUNK_ROUNDS=5 默认）
+# - 第 1 次执行：跑前 6 轮（默认取 evolution.relay_chunk_rounds=6）
 # - 第 2 次执行：同一命令，自动补齐剩余所有轮次（无需改命令）
 # - 按模型区分后缀便于横向比较，例如 deepseek_v3_11r, gpt4o_11r 等
 
 # 基础安全模式（推荐入门）
-CONFIG=configs/experiment_full_11.yaml ./run.sh --low-disk --relay "价量因子挖掘" "deepseek_v3_11r"
+./run.sh --low-disk --relay "Price-Volume Factor Mining" "deepseek_v3_11r"
 
 # 安全模式 + Zoo 去重（推荐：有历史实验数据时使用，自动跳过已探索过的因子表达式）
 # 前置步骤：首次需先初始化 Zoo（仅首次，此后每轮实验自动更新）：
 #   .venv/bin/python scripts/update_factor_zoo.py build
-CONFIG=configs/experiment_full_11.yaml ./run.sh --low-disk --relay --zoo-dedup "价量因子挖掘" "deepseek_v3_11r"
+./run.sh --low-disk --relay --zoo-dedup "Price-Volume Factor Mining" "deepseek_v3_11r"
 ```
 
 > **Zoo 去重说明**：
@@ -88,52 +88,45 @@ CONFIG=configs/experiment_full_11.yaml ./run.sh --low-disk --relay --zoo-dedup "
 
 > 清理内容：log、workspace、pickle cache、minirun 临时文件。**不会动** factorlib 因子库、Qlib 数据、Zoo 文件。
 
-#### 第 2 步：直接启动（每段 6 rounds，接力 4 次跑完 23 轮）
+#### 第 2 步：直接启动（默认每段 6 rounds，接力 4 次跑完 23 轮）
 
 ```bash
-# 每次运行同一条命令，relay 自动记录断点续跑（23 = 6+6+6+5）
-EXPERIMENT_ID="paper_repro_23r" \
-QUANTA_RELAY_CHUNK_ROUNDS=6 \
-./run.sh --rounds 23 --low-disk --relay --zoo-dedup "价量因子挖掘" "paper_repro_23r" 2>&1 | tee -a run_23r.log
+# 自动读取底层的 6 轮断点机制和 23 轮总长，每次只需重复执行这同一条命令即可
+EXPERIMENT_ID="paper_repro_23r" ./run.sh --low-disk --relay --zoo-dedup "Price-Volume Factor Mining" "paper_repro_23r" 2>&1 | tee -a run_23r.log
 ```
 
-- `--rounds 23`：无需手动改 `experiment.yaml`，自动注入参数
 - `--zoo-dedup`：跳过历史已探索因子（已有 466 个表达式），加速挖掘
-- `--relay`：每 6 rounds 存盘退出，再次执行自动接续
+- `--relay`：基于底层的 6 rounds 自动存盘退出机制，跑完后只需再次执行本命令即可自动接续
 - 首次运行前若要初始化 Zoo：`.venv/bin/python scripts/update_factor_zoo.py build`
 
 > **纯净对照版（无优化，还原论文基线）：**
+> 不使用 `--zoo-dedup`，完全从零探索，严格对齐论文：
 > ```bash
-> EXPERIMENT_ID="paper_repro_23r" \
-> QUANTA_RELAY_CHUNK_ROUNDS=6 \
-> ./run.sh --rounds 23 --low-disk --relay "Price-Volume Factor Mining" "paper_repro_23r" 2>&1 | tee -a run_23r.log
+> EXPERIMENT_ID="paper_repro_23r2" ./run.sh --low-disk --relay "Price-Volume Factor Mining" "paper_repro_23r2" 2>&1 | tee -a run_23r2.log
 > ```
 
 
 ---
 
-### 2.1 配置文件解析 (configs/experiment_full_11.yaml / experiment.yaml)
+### 2.1 底层满配参数说明 (configs/experiment.yaml)
 
-如果您决定执行**脚本 1 或 2**且需要微调，以下参数是左右挖掘深度和机器压力的核心要素：
+为了避免配置混乱，**本项目已统一使用 `configs/experiment.yaml` 作为唯一配置入口，并将论文满血版参数作为推荐默认值**。
+在执行复现时，建议对比以下两种模式（在 `experiment.yaml` 中设置）：
 
-1.  **初始探索规模调大（10个并发方向）**：
-    找到 `planning.num_directions`，默认为论文标准 `10`。
-2.  **演化回合数补全（11 轮 或 23 轮）**：
-    找到 `evolution.max_rounds`。
-    **重要区别：“代码的 Rounds” vs “论文的 Iterations”**
-    - **论文（Paper）**：1 个 Iteration = `Mutation` + `Crossover` 两个阶段。
-    - **代码（Code）**：1 个 Round = 1 个单阶段（Phase）。
-    - *论文主实验标准 (5 Iterations)*：1 (Original) + 5 × 2 = **11 轮 (Rounds)**。
-    - *论文最优 Trade-off (11-12 Iterations)*：根据论文 Figure 8，收益与风险达到最佳平衡点是在 11-12 Iterations左右，对应代码需要 **23-25 轮 (Rounds)**。
-3.  **受控并行与硬盘卸载配置**：
-    ```yaml
-    evolution:
-      parallel_enabled: true
-      max_parallel_workers: 2   # 16G 内存建议维持 2 并发，跑得动再加
-      cleanup_on_finish: true   # [强烈建议开启] 跑完后清理几百MB的 LLM 工作区轨迹
-    ```
+| 参数项 (Parameter) | **深度模式 (Depth Mode) - 严格复现** | **平衡模式 (Balanced Mode) - 当前默认** |
+| :--- | :--- | :--- |
+| `planning.num_directions` | **5** (种子方向更聚焦) | 10 (探索更广) |
+| `evolution.max_rounds` | **23** (对齐论文 11-12 Iterations) | 23 (对齐论文) |
+| `evolution.crossover_n` | **5** (每轮产生因子较少) | 10 (每轮产生因子较多) |
+| `selection_strategy` | `best` (严格按表现筛选) | `best` (按表现筛选) |
+| **预期产出** | 约 350 个因子 | 约 700+ 个因子 |
 
-> *注意：其它默认配置如基于 Alpha158 模板生成的因子过滤规则、测试回合数据集划分（2016-2020 训练，2021 验证），以及独立回测阶段配置（2022-2025 样本外测试）等均不需要变动。*
+**为什么要定 23 轮？**
+- 论文中 1 个 Iteration = `Mutation` + `Crossover` 两个阶段。
+- 代码中 1 个 Round = 1 个单阶段（Phase）。
+- *论文最优 Trade-off*：收益与风险在 11-12 Iterations 达到平衡，换算到代码就是 **23 轮**（1 次 Original + 11 次 Mutation + 11 次 Crossover）。为了防崩溃，底层强制每 6 轮断点落盘。
+
+> *注意：其它配置如基于 Alpha158 模板生成的因子过滤规则等均不需要变动。*
 
 ### 2.0 术语与层级（强烈建议先对齐这段）
 
@@ -319,10 +312,10 @@ EXPERIMENT_ID="paper_repro_r2" ./run.sh --relay "Price-Volume Factor Mining" "pa
 
 ### 4.1 接力模式 `--relay`（分段跑）
 
-适用场景：计划分段执行（例如先跑 5 轮，后面再补齐）。
+适用场景：计划分段执行（例如先跑一段 relay chunk，后面再补齐）。
 
 ```bash
-# 首段接力（默认先跑 5 轮）
+# 首段接力（当前主配置默认先跑 6 轮）
 EXPERIMENT_ID="paper_repro_r2" ./run.sh --relay "Price-Volume Factor Mining" "paper_reproduction_r2" 2>&1 | tee run_output_r2.log
 
 # 第二次接力（同一 EXPERIMENT_ID，自动补齐到 max_rounds）
@@ -331,8 +324,8 @@ EXPERIMENT_ID="paper_repro_r2" ./run.sh --relay "Price-Volume Factor Mining" "pa
 
 当前 `--relay` 调度策略：
 
-- 首段按 `QUANTA_RELAY_CHUNK_ROUNDS` 运行（默认 5）
-- 后续再次执行 `--relay` 自动补齐到 `evolution.max_rounds`（默认 11）
+- 首段按 `QUANTA_RELAY_CHUNK_ROUNDS` 运行（默认取配置中的 `evolution.relay_chunk_rounds`，当前主配置为 6）
+- 后续再次执行 `--relay` 自动补齐到 `evolution.max_rounds`（取当前配置值）
 
 ### 4.2 续跑模式 `--resume`（直达目标轮次）
 
@@ -419,13 +412,21 @@ python -m quantaalpha.backtest.run_backtest \
 
 关键选项：
 
-- `--mode limited|performance`：资源模式（笔记本建议 `limited`）
 - `--threads N`：线程数上限
+- `--factors-filter`：只执行过滤链路并退出（不跑回测），用于快速查看“最终剩余因子数”
+  - 输出 `experiment / quality_range / final_selected`
+  - 结果落盘到 `data/factorlib/selected/<experiment>_factors_filter_q<quality>_n<count>_<timestamp>.json`
+  - 同时更新 `data/factorlib/selected/<experiment>_factors_filter_latest.json`
 - `--max-factors <N|all|default>`：控制 custom 因子数量
   - `N`：只回测 Top-N（按配置排序指标）
   - `all`：不限制数量
-  - `default`：沿用配置文件（`backtest_limited.yaml` 默认为 50）
+  - `default`：沿用当前配置文件值（默认 `configs/backtest.yaml`）
 - `--corr-dedup`：在回测前先做“相关性去重 + 多样性 Top-N”筛选（输出临时库再回测）
+  - Stage-1 不做全局 TopN 截断，仅做同簇粗去重，避免过早损失多样性
+  - 默认 `--dedup-method two_stage`：Stage-1 暴露相关粗筛 + Stage-2 IC 序列相关精筛
+  - `--dedup-linkage complete|connected`：聚类联接策略（默认 `complete`）
+  - `--dedup-sample-split train_valid|full`：相关性采样范围（默认 `train_valid`，避免 test 泄漏）
+  - `--dedup-stage2-corr-threshold T`：Stage-2 的 IC 序列相关阈值（默认 `0.8`）
   - `--dedup-per-cluster K`：每个相关性簇保留 K 个冠军（默认 3；设为 1 更严格）
   - `--dedup-topn N`：最终保留 N 个因子（未指定时尽量从配置 `custom.max_factors` 推断）
 - `--warm-cache`：先同步 `result.h5 -> md5 cache`
@@ -433,11 +434,11 @@ python -m quantaalpha.backtest.run_backtest \
 默认行为（当前版本）：
 
 - 启动时自动做 backtest 配置预检（仅告警，不阻断）
-- `--mode limited` + `--factor-source custom` 时，默认执行“质量先筛选，再 TopN”
-  - 默认质量阈值：`high`
-  - 顺序：`质量筛选 -> max_factors 截断`
+- `--interactive` 第 1 步目标包含 `EXP / BOB / VIEW / FILTER`
+- `--factor-source custom` 且未锁定质量档位时，默认 `quality_min=off`（不做质量预筛选）
+  - 若将 `quality_min` 设置为 `low|medium|high`，且显式设置 `--max-factors N`，则顺序为：`质量筛选 -> max_factors 截断`
   - 可通过环境变量覆盖：`BACKTEST_MIN_QUALITY=off|low|medium|high|auto`
-    - `auto`：`limited=high`，`performance=off`
+    - `auto`：当前等价于 `off`
 - BOB 模式下 `--bob-metric auto` 先解析本次运行的统一主指标，再执行排序（避免跨指标量纲混排）
 - 安全脚本临时文件在正常退出与中断场景都会自动清理
 
@@ -539,3 +540,32 @@ python -m quantaalpha.backtest.run_backtest \
    export OPENBLAS_NUM_THREADS=4
    export NUMEXPR_NUM_THREADS=4
    ```
+
+## 9. 核心技术细节与评价标准 (Technical Details & Evaluation Standards)
+
+为了确保复现的严谨性，请注意以下文档中识别的关键细节：
+
+### 9.1 评价指标：全是“超额” (Excess Metrics Only)
+⚠️ **重要**：复现过程中看到的所有收益指标（Annualized Return, Max Drawdown, IR, Calmar）**均为超额指标**（相对于沪深300指数）。
+- **超额收益** = 组合收益 - 基准收益 - 交易成本。
+- 如果年化收益显示为 15%，这意味着你的因子组合每年跑赢沪深300 **15个百分点**，而不是总收益 15%。
+
+### 9.2 复杂度正则化 (Complexity Regularization)
+系统通过 `FactorRegulator` 严格限制因子的“过拟合”风险，这是复现论文中“鲁棒因子”的关键：
+- **符号长度 (SL)**：单个因子表达式字符数 ≤ 300。
+- **基础特征数 (ER)**：单个因子最多引用 6 个基础量价指标（如 $close, $volume 等）。
+- **自由参数比例**：数值常量（如 10, 20, 0.5）在表达式中的占比需 < 50%。
+- **重复性校验**：新因子与已有因子的重复子树大小不能超过阈值（通常为 8）。
+
+### 9.3 基础因子 (Base Factors)
+在挖掘时的初步回测阶段，新因子会与以下 **4 个基础因子** 组合进行评估：
+1. `OPEN_RET`: `($close-$open)/$open` (日内涨幅)
+2. `VOL_RATIO`: `$volume/Mean($volume, 20)` (量比)
+3. `RANGE_RET`: `($high-$low)/Ref($close, 1)` (振幅)
+4. `CLOSE_RET`: `$close/Ref($close, 1)-1` (涨跌幅)
+
+### 9.4 时间周期 (Time Periods)
+请确保你的数据覆盖以下三个标准区间：
+- **训练集 (2016-01-01 ~ 2020-12-31)**：模型学习历史规律。
+- **验证集 (2021-01-01 ~ 2021-12-31)**：挖掘过程中的初步筛选（对应 `round` 评估）。
+- **测试集 (2022-01-01 ~ 2025-12-26)**：样本外最终评估（对应“独立回测”）。

@@ -65,8 +65,9 @@ while [[ $# -gt 0 ]]; do
             echo "                Low-disk mode disables pickle cache, compresses parquet,"
             echo "                and purges large temporary files after backtest/cache sync."
             echo "  --relay       Relay mode: run in planned chunks."
-            echo "                Default chunk is 5 rounds; next run auto-completes remaining rounds"
-            echo "                up to evolution.max_rounds (default 11)."
+            echo "                Default chunk comes from config evolution.relay_chunk_rounds"
+            echo "                (fallback: 5 when not configured), next run auto-completes"
+            echo "                remaining rounds up to evolution.max_rounds from config."
             echo "  --resume      Resume mode: continue from saved state directly to max_rounds."
             echo "  --zoo-dedup   Zoo dedup mode: skip factor expressions already explored in any"
             echo "                previous run. Sets factor_zoo_path to data/factorlib/factor_zoo.json"
@@ -75,7 +76,7 @@ while [[ $# -gt 0 ]]; do
             echo "                Creates a temporary config with max_rounds replaced; original config is unchanged."
             echo ""
             echo "Environment override:"
-            echo "  QUANTA_RELAY_CHUNK_ROUNDS=5   first relay leg rounds (default 5)"
+            echo "  QUANTA_RELAY_CHUNK_ROUNDS=N   first relay leg rounds (overrides config value)"
             echo "  QUANTA_FACTOR_ZOO_PATH=...    override zoo path (default: data/factorlib/factor_zoo.json)"
             exit 0
             ;;
@@ -203,6 +204,21 @@ if [ -n "${ROUNDS_OVERRIDE}" ]; then
     CONFIG_PATH="${_TEMP_CONFIG}"
 fi
 
+CONFIG_RELAY_CHUNK_ROUNDS="$("${PYTHON_BIN}" -c "
+import yaml
+try:
+    with open('${CONFIG_PATH}', 'r', encoding='utf-8') as f:
+        cfg = yaml.safe_load(f) or {}
+    val = cfg.get('evolution', {}).get('relay_chunk_rounds', 5)
+    val = int(val)
+    print(val if val > 0 else 5)
+except Exception:
+    print(5)
+")"
+if ! [[ "${CONFIG_RELAY_CHUNK_ROUNDS}" =~ ^[1-9][0-9]*$ ]]; then
+    CONFIG_RELAY_CHUNK_ROUNDS=5
+fi
+
 if [ -z "${EXPERIMENT_ID}" ]; then
     if [ "${RELAY_MODE}" = true ] || [ "${RESUME_MODE}" = true ]; then
         EXPERIMENT_ID="relay_shared"
@@ -226,7 +242,7 @@ if [ "${RELAY_MODE}" = true ] || [ "${RESUME_MODE}" = true ]; then
     export QUANTA_ENABLE_RELAY=1
     if [ "${RELAY_MODE}" = true ]; then
         export QUANTA_RELAY_MODE="relay"
-        export QUANTA_RELAY_CHUNK_ROUNDS="${QUANTA_RELAY_CHUNK_ROUNDS:-5}"
+        export QUANTA_RELAY_CHUNK_ROUNDS="${QUANTA_RELAY_CHUNK_ROUNDS:-${CONFIG_RELAY_CHUNK_ROUNDS}}"
         if ! [[ "${QUANTA_RELAY_CHUNK_ROUNDS}" =~ ^[1-9][0-9]*$ ]]; then
             echo "Error: QUANTA_RELAY_CHUNK_ROUNDS must be a positive integer (got '${QUANTA_RELAY_CHUNK_ROUNDS}')."
             exit 1
@@ -249,7 +265,7 @@ if [ "${RELAY_MODE}" = true ] || [ "${RESUME_MODE}" = true ]; then
         echo "  QUANTA_RELAY_CHUNK_ROUNDS=${QUANTA_RELAY_CHUNK_ROUNDS}"
         echo "  Relay schedule: first leg uses chunk; later leg auto-finish to target"
     fi
-    echo "  Relay target rounds: evolution.max_rounds from config (default 11)"
+    echo "  Relay target rounds: evolution.max_rounds from config"
     echo "  LOG_TRACE_PATH=${LOG_TRACE_PATH}"
 fi
 
@@ -301,7 +317,7 @@ if [ "${LOW_DISK_MODE}" = true ]; then
     export QUANTA_LOW_DISK_MODE=1
     export CACHE_WITH_PICKLE=false
     export QUANTA_PARQUET_COMPRESSION="${QUANTA_PARQUET_COMPRESSION:-zstd}"
-    export QUANTA_LOW_DISK_FLOAT32="${QUANTA_LOW_DISK_FLOAT32:-true}"
+    export QUANTA_LOW_DISK_FLOAT32="${QUANTA_LOW_DISK_FLOAT32:-false}"
     export QUANTA_LOW_DISK_PURGE_PARQUET="${QUANTA_LOW_DISK_PURGE_PARQUET:-true}"
     export QUANTA_LOW_DISK_PURGE_H5="${QUANTA_LOW_DISK_PURGE_H5:-true}"
     echo "Low disk mode: ON"
@@ -326,6 +342,53 @@ echo "Config: ${CONFIG_PATH}"
 echo "Data: ${QLIB_DATA}"
 echo "Results: ${RESULTS_BASE}"
 echo "----------------------------------------"
+
+# --- Paper Reproduction Parameter Check ---
+"${PYTHON_BIN}" -c "
+import os
+import yaml
+try:
+    with open('${CONFIG_PATH}', 'r') as f:
+        cfg = yaml.safe_load(f)
+    rounds = cfg.get('evolution', {}).get('max_rounds', 0)
+    factors = cfg.get('factor', {}).get('factors_per_hypothesis', 0)
+    chunk = getattr(cfg.get('evolution'), 'get', lambda k, d: 0)('relay_chunk_rounds', 0) if isinstance(cfg.get('evolution'), dict) else 0
+    low_disk_mode = os.getenv('QUANTA_LOW_DISK_MODE', '0')
+    low_disk_float32 = os.getenv('QUANTA_LOW_DISK_FLOAT32', 'false')
+    parquet_compression = os.getenv('QUANTA_PARQUET_COMPRESSION', '')
+    purge_parquet = os.getenv('QUANTA_LOW_DISK_PURGE_PARQUET', '')
+    purge_h5 = os.getenv('QUANTA_LOW_DISK_PURGE_H5', '')
+    paper_factor_match = (factors == 3)
+
+    if rounds == 23 and factors == 3 and chunk == 6:
+        print('\n' + '='*60)
+        print(' 🚀 [PAPER REPRODUCTION MODE] ✅ FULL CAPACITY ENABLED!')
+        print('    - factor.factors_per_hypothesis: 3')
+        print('    - evolution.max_rounds: 23')
+        print('    - evolution.relay_chunk_rounds: 6')
+        print('    - paper.factor_setting_match: YES (factors_per_hypothesis=3)')
+        print('    - runtime.QUANTA_LOW_DISK_MODE: ' + str(low_disk_mode))
+        print('    - runtime.QUANTA_LOW_DISK_FLOAT32: ' + str(low_disk_float32))
+        print('    - runtime.QUANTA_PARQUET_COMPRESSION: ' + str(parquet_compression))
+        print('    - runtime.QUANTA_LOW_DISK_PURGE_PARQUET: ' + str(purge_parquet))
+        print('    - runtime.QUANTA_LOW_DISK_PURGE_H5: ' + str(purge_h5))
+        print('='*60 + '\n')
+    else:
+        print('\n' + '-'*60)
+        print(' ⚠️  [STANDARD MODE] Running with parameters:')
+        print(f'    - factor.factors_per_hypothesis: {factors}')
+        print(f'    - evolution.max_rounds: {rounds}')
+        print(f'    - evolution.relay_chunk_rounds: {chunk}')
+        print('    - paper.factor_setting_match: ' + ('YES' if paper_factor_match else 'NO'))
+        print('    - runtime.QUANTA_LOW_DISK_MODE: ' + str(low_disk_mode))
+        print('    - runtime.QUANTA_LOW_DISK_FLOAT32: ' + str(low_disk_float32))
+        print('    - runtime.QUANTA_PARQUET_COMPRESSION: ' + str(parquet_compression))
+        print('    - runtime.QUANTA_LOW_DISK_PURGE_PARQUET: ' + str(purge_parquet))
+        print('    - runtime.QUANTA_LOW_DISK_PURGE_H5: ' + str(purge_h5))
+        print('-'*60 + '\n')
+except Exception as e:
+    pass
+"
 
 if [ -f "${SCRIPT_DIR}/scripts/preflight_check.py" ]; then
     "${PYTHON_BIN}" "${SCRIPT_DIR}/scripts/preflight_check.py" experiment --config "${CONFIG_PATH}" || true
@@ -376,4 +439,3 @@ if [ "${ZOO_DEDUP_MODE}" = true ]; then
 fi
 
 exit ${MINE_EXIT_CODE}
-

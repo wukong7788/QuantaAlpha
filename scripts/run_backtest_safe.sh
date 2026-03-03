@@ -16,30 +16,39 @@ usage() {
 Usage:
   ./scripts/run_backtest_safe.sh --library <factor_json>
   ./scripts/run_backtest_safe.sh --interactive
+  ./scripts/run_backtest_safe.sh --factors-filter --library <factor_json>
   ./scripts/run_backtest_safe.sh --view-results
 
 Options:
   --library <name-or-path>      Factor library JSON filename or path
                                 (required unless --bob-libraries is provided in BOB mode)
-  --mode <performance|limited>  Run mode (default: limited)
-                                performance = higher threads, faster but heavier
-                                limited = fewer threads, safer on laptop
   --factor-source <custom|combined>
                                 Factor source for backtest (default: custom)
   --config <path>               Backtest config path (default: configs/backtest.yaml)
-  --threads <N>                 Override thread count manually (optional)
+  --threads <N>                 Thread cap (default: 6)
   --max-factors <N|all|default> Override custom max factors in config:
                                 N = use top N custom factors
                                 all = no limit (null)
                                 default = keep config value
-  --corr-dedup                  Enable correlation-based de-dup + Top-N selection
-                                (runs scripts/select_diverse_factors.py to produce a smaller
+  --corr-dedup                  Enable factor dedup + Top-N selection
+                                (runs scripts/factor_filtering/select_factors.py to produce a smaller
                                 diverse library JSON before backtest).
-  --dedup-topn <N>              Final Top-N after correlation de-dup
-                                (default: inferred from config factor_source.custom.max_factors when possible)
+  --dedup-method <mode>         Dedup method: stage1 | two_stage (default: two_stage)
+                                stage1 = exposure corr only
+                                two_stage = exposure corr coarse + IC-series corr fine
+  --dedup-linkage <mode>        Cluster linkage: complete | connected (default: complete)
+  --dedup-topn <N|all>          Final keep count after correlation de-dup
+                                N = keep top N
+                                all = no final TopN cap (stage2 cluster champions only)
+                                default: inferred from config factor_source.custom.max_factors when possible
   --dedup-per-cluster <K>       Keep K champions per cluster (default: 3; set 1 for strict diversity)
   --dedup-corr-threshold <T>    Cluster edge threshold on |Spearman corr| (default: 0.8)
+  --dedup-stage2-corr-threshold <T>
+                                Stage-2 edge threshold on |corr(IC-series)| (default: 0.8)
   --dedup-sample-size <N>       Sample size for correlation computation (default: 8000)
+  --dedup-sample-split <mode>   Sampling split for dedup corr (default: train_valid)
+                                train_valid = use dataset train+valid only (anti-leakage)
+                                full = use full data.start_time~data.end_time
   --dedup-compute-missing       Compute/cache factor values when missing (can be slow)
   --min-free-gb <N>             Minimum free disk GB required (default: 15)
   --warm-cache                  Sync available result.h5 into MD5 cache before run
@@ -56,6 +65,7 @@ Options:
                                 all = keep S/A/B/C
   --log-file <path>             Custom log file path (default: log/backtest_manual/<timestamp>.log)
   --interactive                 Interactive wizard mode
+  --factors-filter              Run filter pipeline only (quality prefilter + dedup), print kept count, then exit
   --view-results                Open horizontal comparison of existing result files and exit
   --view-pick <spec>            View mode: compare selected indexes, e.g. 1,2,3 or all
   --view-latest <N>             View mode: show latest N candidates in selector list
@@ -65,7 +75,8 @@ Options:
 Examples:
   ./scripts/run_backtest_safe.sh --library all_factors_library_paper_reproduction.json
   ./scripts/run_backtest_safe.sh --library data/factorlib/all_factors_library_x.json --threads 6 --warm-cache
-  ./scripts/run_backtest_safe.sh --library data/factorlib/all_factors_library_x.json --max-factors 80 --corr-dedup --dedup-per-cluster 1
+  ./scripts/run_backtest_safe.sh --library data/factorlib/all_factors_library_x.json --max-factors 80 --corr-dedup --dedup-method two_stage --dedup-linkage complete --dedup-sample-split train_valid --dedup-per-cluster 1
+  ./scripts/run_backtest_safe.sh --factors-filter --library data/factorlib/all_factors_library_x.json
   ./scripts/run_backtest_safe.sh --bob --bob-libraries "data/factorlib/all_factors_library_*.json" --bob-top 80
   ./scripts/run_backtest_safe.sh --bob --bob-libraries "data/factorlib/all_factors_library_*.json" --bob-grade s
   ./scripts/run_backtest_safe.sh --view-results
@@ -74,25 +85,29 @@ USAGE
 }
 
 LIBRARY=""
-MODE="limited"
 FACTOR_SOURCE="custom"
 CONFIG_PATH="configs/backtest.yaml"
 CONFIG_SET="false"
-THREADS="8"
+THREADS="6"
 THREADS_SET="false"
 MAX_FACTORS_OVERRIDE="default"
 MAX_FACTORS_SET="false"
 MIN_FREE_GB="15"
 WARM_CACHE="false"
 SKIP_UNCACHED="true"  # fixed by design
-QUALITY_MIN_SOURCE="${BACKTEST_MIN_QUALITY:-auto}"  # auto => limited: high, performance: off
+QUALITY_MIN_SOURCE="${BACKTEST_MIN_QUALITY:-off}"  # off|low|medium|high|auto
 QUALITY_MIN="$QUALITY_MIN_SOURCE"
+QUALITY_MIN_LOCKED="false"
 CORR_DEDUP="false"
 DEDUP_TOPN=""
 DEDUP_TOPN_EFFECTIVE=""
 DEDUP_PER_CLUSTER="3"
 DEDUP_CORR_THRESHOLD="0.8"
+DEDUP_STAGE2_CORR_THRESHOLD="0.8"
 DEDUP_SAMPLE_SIZE="8000"
+DEDUP_SAMPLE_SPLIT="train_valid"
+DEDUP_METHOD="two_stage"
+DEDUP_LINKAGE="complete"
 DEDUP_COMPUTE_MISSING="false"
 BOB_ENABLED="false"
 BOB_LIBRARIES=""
@@ -101,6 +116,7 @@ BOB_METRIC="auto"
 BOB_GRADE_MODE="sa"
 CUSTOM_LOG_FILE=""
 INTERACTIVE="false"
+FACTORS_FILTER_ONLY="false"
 VIEW_RESULTS_ONLY="false"
 VIEW_PICK=""
 VIEW_LATEST=""
@@ -150,10 +166,6 @@ while [[ $# -gt 0 ]]; do
       LIBRARY="${2:-}"
       shift 2
       ;;
-    --mode)
-      MODE="${2:-}"
-      shift 2
-      ;;
     --factor-source)
       FACTOR_SOURCE="${2:-}"
       shift 2
@@ -181,6 +193,14 @@ while [[ $# -gt 0 ]]; do
       DEDUP_TOPN="${2:-}"
       shift 2
       ;;
+    --dedup-method)
+      DEDUP_METHOD="${2:-}"
+      shift 2
+      ;;
+    --dedup-linkage)
+      DEDUP_LINKAGE="${2:-}"
+      shift 2
+      ;;
     --dedup-per-cluster)
       DEDUP_PER_CLUSTER="${2:-}"
       shift 2
@@ -189,8 +209,16 @@ while [[ $# -gt 0 ]]; do
       DEDUP_CORR_THRESHOLD="${2:-}"
       shift 2
       ;;
+    --dedup-stage2-corr-threshold)
+      DEDUP_STAGE2_CORR_THRESHOLD="${2:-}"
+      shift 2
+      ;;
     --dedup-sample-size)
       DEDUP_SAMPLE_SIZE="${2:-}"
+      shift 2
+      ;;
+    --dedup-sample-split)
+      DEDUP_SAMPLE_SPLIT="${2:-}"
       shift 2
       ;;
     --dedup-compute-missing)
@@ -233,6 +261,10 @@ while [[ $# -gt 0 ]]; do
       INTERACTIVE="true"
       shift
       ;;
+    --factors-filter)
+      FACTORS_FILTER_ONLY="true"
+      shift
+      ;;
     --view-results)
       VIEW_RESULTS_ONLY="true"
       shift
@@ -270,25 +302,8 @@ if [[ "$ORIGINAL_ARGC" -eq 0 ]]; then
   INTERACTIVE="true"
 fi
 
-if [[ "$MODE" != "performance" && "$MODE" != "limited" ]]; then
-  echo "Error: --mode must be performance or limited"
-  exit 1
-fi
-
 if [[ "$CONFIG_SET" != "true" ]]; then
-  if [[ "$MODE" == "limited" ]]; then
-    CONFIG_PATH="configs/backtest_limited.yaml"
-  else
-    CONFIG_PATH="configs/backtest.yaml"
-  fi
-fi
-
-if [[ "$THREADS_SET" != "true" ]]; then
-  if [[ "$MODE" == "performance" ]]; then
-    THREADS="12"
-  else
-    THREADS="6"
-  fi
+  CONFIG_PATH="configs/backtest.yaml"
 fi
 
 normalize_lower() {
@@ -297,21 +312,19 @@ normalize_lower() {
 
 resolve_quality_min() {
   local raw="$1"
-  local mode="$2"
   local v
   v="$(normalize_lower "$raw")"
   if [[ "$v" == "auto" ]]; then
-    if [[ "$mode" == "limited" ]]; then
-      echo "high"
-    else
-      echo "off"
-    fi
+    echo "off"
     return 0
   fi
   echo "$v"
 }
 
-QUALITY_MIN="$(resolve_quality_min "$QUALITY_MIN_SOURCE" "$MODE")"
+QUALITY_MIN="$(resolve_quality_min "$QUALITY_MIN_SOURCE")"
+DEDUP_SAMPLE_SPLIT="$(normalize_lower "$DEDUP_SAMPLE_SPLIT")"
+DEDUP_METHOD="$(normalize_lower "$DEDUP_METHOD")"
+DEDUP_LINKAGE="$(normalize_lower "$DEDUP_LINKAGE")"
 
 validate_max_factors() {
   local raw="$1"
@@ -361,24 +374,78 @@ validate_bob_grade_mode() {
   esac
 }
 
+validate_dedup_sample_split() {
+  local raw="$1"
+  local v
+  v="$(normalize_lower "$raw")"
+  case "$v" in
+    train_valid|full) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_dedup_method() {
+  local raw="$1"
+  local v
+  v="$(normalize_lower "$raw")"
+  case "$v" in
+    stage1|two_stage) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_dedup_linkage() {
+  local raw="$1"
+  local v
+  v="$(normalize_lower "$raw")"
+  case "$v" in
+    complete|connected) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_dedup_topn() {
+  local raw="$1"
+  local v
+  v="$(normalize_lower "$raw")"
+  if [[ "$v" == "all" ]]; then
+    return 0
+  fi
+  validate_positive_int "$v"
+}
+
 TARGET_MODE="single"
 if [[ "$BOB_ENABLED" == "true" ]]; then
   TARGET_MODE="bob"
+elif [[ "$FACTORS_FILTER_ONLY" == "true" ]]; then
+  TARGET_MODE="factors_filter"
 fi
 
 if [[ "$INTERACTIVE" == "true" ]]; then
   echo "== QuantaAlpha Backtest Quick Start =="
-  echo "Step 1/1: choose target (single experiment library or BOB)"
+  echo "Step 1/2: choose target (single experiment library / BOB / VIEW / FILTER)"
   echo
 
   shopt -s nullglob
-  LIB_PATHS=( "$PROJECT_ROOT"/data/factorlib/*.json )
+  LIB_PATHS=( "$PROJECT_ROOT"/data/factorlib/all_factors_library*.json )
   shopt -u nullglob
+  if [[ "${#LIB_PATHS[@]}" -gt 0 ]]; then
+    EXP_LIB_PATHS=()
+    for p in "${LIB_PATHS[@]}"; do
+      bn="$(basename "$p")"
+      # Hide generated filter artifacts from EXP picker; EXP must map to source experiment library.
+      if [[ "$bn" == *_factors_filter_latest.json ]] || [[ "$bn" == *_factors_filter_latest_report.json ]]; then
+        continue
+      fi
+      EXP_LIB_PATHS+=( "$p" )
+    done
+    LIB_PATHS=( "${EXP_LIB_PATHS[@]}" )
+  fi
   if [[ "${#LIB_PATHS[@]}" -gt 0 ]]; then
     SORTED_LIB_PATHS=()
     while IFS= read -r line; do
       SORTED_LIB_PATHS+=( "$line" )
-    done < <(printf '%s\n' "${LIB_PATHS[@]}" | sort -r)
+    done < <(ls -1t "${LIB_PATHS[@]}" 2>/dev/null || true)
     LIB_PATHS=( "${SORTED_LIB_PATHS[@]}" )
   fi
 
@@ -392,6 +459,8 @@ if [[ "$INTERACTIVE" == "true" ]]; then
   echo "  $bob_idx) [BOB] aggregate libraries (defaults: grade=sa, top=50)"
   view_idx="$((bob_idx + 1))"
   echo "  $view_idx) [VIEW] horizontal compare existing result files"
+  filter_idx="$((view_idx + 1))"
+  echo "  $filter_idx) [FILTER] run factors-filter only (no backtest)"
   echo
 
   default_pick="$view_idx"
@@ -406,9 +475,52 @@ if [[ "$INTERACTIVE" == "true" ]]; then
   if [[ "$pick_lc" == "view" || "$pick_lc" == "v" || "$pick_lc" == "compare" || "$pick" == "$view_idx" ]]; then
     run_view_results
     exit $?
+  elif [[ "$pick_lc" == "factors-filter" || "$pick_lc" == "filter" || "$pick_lc" == "ff" || "$pick" == "$filter_idx" ]]; then
+    TARGET_MODE="factors_filter"
+    FACTORS_FILTER_ONLY="true"
+    BOB_ENABLED="false"
+    FACTOR_SOURCE="custom"
+    if [[ "${#LIB_PATHS[@]}" -eq 0 ]]; then
+      echo "Error: no experiment libraries found under data/factorlib/all_factors_library*.json"
+      exit 1
+    fi
+    read -r -p "Experiment index for factors-filter [1]: " filter_pick
+    filter_pick="${filter_pick:-1}"
+    if [[ "$filter_pick" =~ ^[0-9]+$ ]] && [[ "$filter_pick" -ge 1 ]] && [[ "$filter_pick" -le "${#LIB_PATHS[@]}" ]]; then
+      LIBRARY="${LIB_PATHS[$((filter_pick-1))]}"
+    else
+      echo "Error: invalid experiment index for factors-filter: '$filter_pick'"
+      exit 1
+    fi
+    echo "Factor quality range:"
+    echo "  1) 高      (high)"
+    echo "  2) 高中    (high+medium)"
+    echo "  3) 高中低  (high+medium+low)"
+    read -r -p "Select quality range [1]: " filter_quality_pick
+    filter_quality_pick="${filter_quality_pick:-1}"
+    case "$(normalize_lower "$filter_quality_pick")" in
+      1|high|h)
+        QUALITY_MIN="high"
+        QUALITY_MIN_LOCKED="true"
+        ;;
+      2|medium|hm|high_medium)
+        QUALITY_MIN="medium"
+        QUALITY_MIN_LOCKED="true"
+        ;;
+      3|low|hml|all|high_medium_low)
+        QUALITY_MIN="low"
+        QUALITY_MIN_LOCKED="true"
+        ;;
+      *)
+        echo "  Invalid quality range, fallback to high."
+        QUALITY_MIN="high"
+        QUALITY_MIN_LOCKED="true"
+        ;;
+    esac
   elif [[ "$pick_lc" == "bob" || "$pick_lc" == "b" || "$pick" == "$bob_idx" ]]; then
     TARGET_MODE="bob"
     BOB_ENABLED="true"
+    FACTORS_FILTER_ONLY="false"
     LIBRARY=""
     if [[ -z "$BOB_LIBRARIES" ]]; then
       BOB_LIBRARIES="data/factorlib/all_factors_library*.json"
@@ -422,52 +534,123 @@ if [[ "$INTERACTIVE" == "true" ]]; then
   elif [[ "$pick" =~ ^[0-9]+$ ]] && [[ "$pick" -ge 1 ]] && [[ "$pick" -le "${#LIB_PATHS[@]}" ]]; then
     TARGET_MODE="single"
     BOB_ENABLED="false"
+    FACTORS_FILTER_ONLY="false"
     LIBRARY="${LIB_PATHS[$((pick-1))]}"
   else
-    TARGET_MODE="single"
-    BOB_ENABLED="false"
-    LIBRARY="$pick"
+    echo "Error: invalid selection '$pick'. Interactive mode only allows listed experiment indexes or BOB/VIEW/FILTER."
+    exit 1
   fi
 
   # Keep everything else on defaults in interactive quick-start mode.
   if [[ "$FACTOR_SOURCE" != "custom" && "$FACTOR_SOURCE" != "combined" ]]; then
     FACTOR_SOURCE="custom"
   fi
-  if [[ "$MODE" != "performance" && "$MODE" != "limited" ]]; then
-    MODE="limited"
+  if [[ "$QUALITY_MIN_LOCKED" != "true" ]]; then
+    QUALITY_MIN="$(resolve_quality_min "$QUALITY_MIN_SOURCE")"
   fi
-  QUALITY_MIN="$(resolve_quality_min "$QUALITY_MIN_SOURCE" "$MODE")"
   if [[ "$CONFIG_SET" != "true" ]]; then
-    if [[ "$MODE" == "limited" ]]; then
-      CONFIG_PATH="configs/backtest_limited.yaml"
-    else
-      CONFIG_PATH="configs/backtest.yaml"
-    fi
-  fi
-  if [[ "$THREADS_SET" != "true" ]]; then
-    if [[ "$MODE" == "performance" ]]; then
-      THREADS="12"
-    else
-      THREADS="6"
-    fi
+    CONFIG_PATH="configs/backtest.yaml"
   fi
   if ! validate_max_factors "$MAX_FACTORS_OVERRIDE"; then
     MAX_FACTORS_OVERRIDE="default"
   fi
 
+  if [[ "$TARGET_MODE" == "factors_filter" ]]; then
+    # FILTER mode always previews the production dedup path and does not run backtest.
+    CORR_DEDUP="true"
+    DEDUP_TOPN="all"
+    if [[ "$DEDUP_PER_CLUSTER" == "3" ]]; then
+      DEDUP_PER_CLUSTER="1"
+    fi
+    if [[ "$DEDUP_SAMPLE_SIZE" == "8000" ]]; then
+      DEDUP_SAMPLE_SIZE="12000"
+    fi
+    if [[ "$DEDUP_COMPUTE_MISSING" != "true" ]]; then
+      DEDUP_COMPUTE_MISSING="true"
+    fi
+  fi
+
+  if [[ "$TARGET_MODE" == "single" && "$FACTOR_SOURCE" == "custom" ]]; then
+    echo
+    echo "Step 2/2: choose factor mode"
+    echo "  1) all           (no factor_filter)"
+    echo "  2) factor_filter (two-stage dedup before backtest)"
+    read -r -p "Select mode [1]: " factor_mode_pick
+    factor_mode_pick="$(normalize_lower "${factor_mode_pick:-1}")"
+    if [[ "$factor_mode_pick" == "2" || "$factor_mode_pick" == "factor_filter" || "$factor_mode_pick" == "fator_filter" || "$factor_mode_pick" == "filter" ]]; then
+      EXP_BASE="$(basename "$LIBRARY")"
+      EXP_STEM="${EXP_BASE%.json}"
+      EXP_LATEST_FILTER_PATH="$PROJECT_ROOT/data/factorlib/selected/${EXP_STEM}_factors_filter_latest.json"
+      if [[ ! -f "$EXP_LATEST_FILTER_PATH" ]]; then
+        echo "Error: no filtered factors found for experiment '$EXP_BASE'."
+        echo "Run FILTER first: target=FILTER -> pick this experiment -> choose quality range."
+        exit 1
+      fi
+
+      # Filtering and backtest are separated: use existing filtered output, then choose backtest factor count.
+      CORR_DEDUP="false"
+      QUALITY_MIN="off"
+      LIBRARY="$EXP_LATEST_FILTER_PATH"
+      read -r -p "Backtest factor count [50/all]: " bt_topn_pick
+      bt_topn_pick="${bt_topn_pick:-50}"
+      bt_topn_lc="$(normalize_lower "$bt_topn_pick")"
+      if [[ "$bt_topn_lc" == "all" ]]; then
+        MAX_FACTORS_OVERRIDE="all"
+      elif validate_positive_int "$bt_topn_pick"; then
+        MAX_FACTORS_OVERRIDE="$bt_topn_pick"
+      else
+        echo "  Invalid backtest factor count, fallback to 50."
+        MAX_FACTORS_OVERRIDE="50"
+      fi
+    else
+      CORR_DEDUP="false"
+      DEDUP_TOPN=""
+    fi
+  fi
+
   echo
   echo "Quick summary (auto-start, no confirm):"
-  echo "  target=$TARGET_MODE"
-  echo "  library=$LIBRARY"
-  echo "  bob_libraries=$BOB_LIBRARIES"
-  echo "  bob_grade=$BOB_GRADE_MODE"
-  echo "  bob_top=$BOB_TOP"
-  echo "  mode=$MODE"
-  echo "  factor_source=$FACTOR_SOURCE"
-  echo "  max_factors=$MAX_FACTORS_OVERRIDE"
-  echo "  corr_dedup=$CORR_DEDUP dedup_topn_effective=${DEDUP_TOPN_EFFECTIVE:-${DEDUP_TOPN:-auto}} dedup_per_cluster=$DEDUP_PER_CLUSTER"
-  echo "  warm_cache=$WARM_CACHE"
-  echo "  quality_min=$QUALITY_MIN"
+  if [[ "$TARGET_MODE" == "factors_filter" ]]; then
+    SOURCE_BASE="$(basename "$LIBRARY")"
+    SOURCE_STEM="${SOURCE_BASE%.json}"
+    echo "  target=factors_filter"
+    echo "  experiment=$SOURCE_STEM"
+    echo "  quality_range=$QUALITY_MIN"
+    echo "  final_selected=(run to see result)"
+  else
+    echo "  target=$TARGET_MODE"
+    echo "  library=$LIBRARY"
+    echo "  bob_libraries=$BOB_LIBRARIES"
+    echo "  bob_grade=$BOB_GRADE_MODE"
+    echo "  bob_top=$BOB_TOP"
+    echo "  factor_source=$FACTOR_SOURCE"
+    echo "  factors_filter_only=$FACTORS_FILTER_ONLY"
+    echo "  max_factors=$MAX_FACTORS_OVERRIDE"
+    echo "  corr_dedup=$CORR_DEDUP dedup_method=$DEDUP_METHOD dedup_linkage=$DEDUP_LINKAGE dedup_topn_effective=${DEDUP_TOPN_EFFECTIVE:-${DEDUP_TOPN:-auto}} dedup_per_cluster=$DEDUP_PER_CLUSTER dedup_corr_threshold=$DEDUP_CORR_THRESHOLD dedup_stage2_corr_threshold=$DEDUP_STAGE2_CORR_THRESHOLD dedup_sample_size=$DEDUP_SAMPLE_SIZE dedup_sample_split=$DEDUP_SAMPLE_SPLIT compute_missing=$DEDUP_COMPUTE_MISSING"
+    echo "  warm_cache=$WARM_CACHE"
+    echo "  quality_min=$QUALITY_MIN"
+  fi
+fi
+
+if [[ "$FACTORS_FILTER_ONLY" == "true" ]]; then
+  TARGET_MODE="factors_filter"
+  FACTOR_SOURCE="custom"
+  CORR_DEDUP="true"
+  DEDUP_TOPN="all"
+  if [[ "$DEDUP_PER_CLUSTER" == "3" ]]; then
+    DEDUP_PER_CLUSTER="1"
+  fi
+  if [[ "$DEDUP_SAMPLE_SIZE" == "8000" ]]; then
+    DEDUP_SAMPLE_SIZE="12000"
+  fi
+  if [[ "$DEDUP_COMPUTE_MISSING" != "true" ]]; then
+    DEDUP_COMPUTE_MISSING="true"
+  fi
+fi
+
+if [[ "$BOB_ENABLED" == "true" && "$FACTORS_FILTER_ONLY" == "true" ]]; then
+  echo "Error: --bob and --factors-filter cannot be used together"
+  exit 1
 fi
 
 if [[ "$BOB_ENABLED" != "true" && -z "$LIBRARY" ]]; then
@@ -506,8 +689,8 @@ if [[ "$CORR_DEDUP" == "true" ]]; then
     echo "Error: --corr-dedup currently supports --factor-source custom only (got '$FACTOR_SOURCE')"
     exit 1
   fi
-  if [[ -n "$DEDUP_TOPN" ]] && ! validate_positive_int "$DEDUP_TOPN"; then
-    echo "Error: --dedup-topn must be a positive integer"
+  if [[ -n "$DEDUP_TOPN" ]] && ! validate_dedup_topn "$DEDUP_TOPN"; then
+    echo "Error: --dedup-topn must be a positive integer or 'all'"
     exit 1
   fi
   if ! validate_positive_int "$DEDUP_PER_CLUSTER"; then
@@ -516,6 +699,18 @@ if [[ "$CORR_DEDUP" == "true" ]]; then
   fi
   if ! validate_positive_int "$DEDUP_SAMPLE_SIZE"; then
     echo "Error: --dedup-sample-size must be a positive integer"
+    exit 1
+  fi
+  if ! validate_dedup_sample_split "$DEDUP_SAMPLE_SPLIT"; then
+    echo "Error: --dedup-sample-split must be one of train_valid/full"
+    exit 1
+  fi
+  if ! validate_dedup_method "$DEDUP_METHOD"; then
+    echo "Error: --dedup-method must be one of stage1/two_stage"
+    exit 1
+  fi
+  if ! validate_dedup_linkage "$DEDUP_LINKAGE"; then
+    echo "Error: --dedup-linkage must be one of complete/connected"
     exit 1
   fi
 fi
@@ -579,6 +774,7 @@ TEE_PID=""
 LOG_PIPE=""
 LOG_FILE=""
 PID_FILE=""
+SOURCE_LIBRARY_PATH=""
 
 cleanup_runtime() {
   trap - TERM INT HUP EXIT
@@ -641,7 +837,6 @@ fi
 if [[ -f "$PROJECT_ROOT/scripts/preflight_check.py" ]]; then
   "$PYTHON_BIN" "$PROJECT_ROOT/scripts/preflight_check.py" backtest \
     --config "$RUN_CONFIG_PATH" \
-    --mode "$MODE" \
     --factor-source "$FACTOR_SOURCE" || true
 fi
 
@@ -661,6 +856,27 @@ resolve_library_path() {
   fi
   return 1
 }
+
+count_factors_in_library() {
+  local path="$1"
+  "$PYTHON_BIN" - "$path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+p = Path(sys.argv[1])
+with p.open("r", encoding="utf-8") as f:
+    data = json.load(f) or {}
+factors = data.get("factors") or {}
+if not isinstance(factors, dict):
+    factors = {}
+print(len(factors))
+PY
+}
+
+FILTER_INPUT_TOTAL=0
+FILTER_AFTER_QUALITY=0
+FILTER_FINAL_TOTAL=0
 
 LIB_PATH=""
 if [[ "$BOB_ENABLED" == "true" ]]; then
@@ -1139,6 +1355,12 @@ else
   fi
 fi
 
+SOURCE_LIBRARY_PATH="$LIB_PATH"
+
+FILTER_INPUT_TOTAL="$(count_factors_in_library "$LIB_PATH")"
+FILTER_AFTER_QUALITY="$FILTER_INPUT_TOTAL"
+FILTER_FINAL_TOTAL="$FILTER_INPUT_TOTAL"
+
 if [[ "$FACTOR_SOURCE" == "custom" && "$QUALITY_MIN" != "off" ]]; then
   ORIGINAL_LIB_PATH="$LIB_PATH"
   TMP_FILTERED_LIBRARY_PATH="$(mktemp "/tmp/quantaalpha_factorlib_filtered_XXXXXX")"
@@ -1229,9 +1451,11 @@ PY
   FILTER_KEPT="$(echo "$FILTER_SUMMARY" | "$PYTHON_BIN" -c "import json,sys; d=json.load(sys.stdin); print(d.get('kept_total', 0))")"
   if [[ "$FILTER_KEPT" -gt 0 ]]; then
     LIB_PATH="$TMP_FILTERED_LIBRARY_PATH"
+    FILTER_AFTER_QUALITY="$FILTER_KEPT"
     echo "[Quality] min=${QUALITY_MIN}: $FILTER_SUMMARY"
     echo "[Quality] using prefiltered library: $LIB_PATH"
   else
+    FILTER_AFTER_QUALITY="$FILTER_INPUT_TOTAL"
     echo "[Quality] min=${QUALITY_MIN}: $FILTER_SUMMARY"
     echo "[Quality] prefilter kept 0 factors, fallback to original library: $ORIGINAL_LIB_PATH"
     rm -f "$TMP_FILTERED_LIBRARY_PATH" 2>/dev/null || true
@@ -1241,14 +1465,19 @@ PY
 fi
 
 if [[ "$CORR_DEDUP" == "true" ]]; then
-  if [[ ! -f "$PROJECT_ROOT/scripts/select_diverse_factors.py" ]]; then
-    echo "Error: dedup selector script not found: $PROJECT_ROOT/scripts/select_diverse_factors.py"
+  if [[ ! -f "$PROJECT_ROOT/scripts/factor_filtering/select_factors.py" ]]; then
+    echo "Error: dedup selector script not found: $PROJECT_ROOT/scripts/factor_filtering/select_factors.py"
     exit 1
   fi
 
   TOPN_EFFECTIVE="$DEDUP_TOPN"
-  if [[ -z "$TOPN_EFFECTIVE" ]]; then
-    TOPN_EFFECTIVE="$("$PYTHON_BIN" - "$RUN_CONFIG_PATH" <<'PY'
+  TOPN_EFFECTIVE_LC="$(normalize_lower "$TOPN_EFFECTIVE")"
+  if [[ "$TOPN_EFFECTIVE_LC" == "all" ]]; then
+    TOPN_EFFECTIVE="0"
+    DEDUP_TOPN_EFFECTIVE="all"
+  else
+    if [[ -z "$TOPN_EFFECTIVE" ]]; then
+      TOPN_EFFECTIVE="$("$PYTHON_BIN" - "$RUN_CONFIG_PATH" <<'PY'
 import sys
 from pathlib import Path
 import yaml
@@ -1268,17 +1497,18 @@ else:
         print("")
 PY
 )"
-  fi
+    fi
 
-  if [[ -z "$TOPN_EFFECTIVE" ]]; then
-    echo "Error: --corr-dedup needs a target topn. Provide --dedup-topn <N> or set config factor_source.custom.max_factors."
-    exit 1
+    if [[ -z "$TOPN_EFFECTIVE" ]]; then
+      echo "Error: --corr-dedup needs a target topn. Provide --dedup-topn <N|all> or set config factor_source.custom.max_factors."
+      exit 1
+    fi
+    if ! validate_positive_int "$TOPN_EFFECTIVE"; then
+      echo "Error: inferred dedup topn is not a positive integer: '$TOPN_EFFECTIVE'"
+      exit 1
+    fi
+    DEDUP_TOPN_EFFECTIVE="$TOPN_EFFECTIVE"
   fi
-  if ! validate_positive_int "$TOPN_EFFECTIVE"; then
-    echo "Error: inferred dedup topn is not a positive integer: '$TOPN_EFFECTIVE'"
-    exit 1
-  fi
-  DEDUP_TOPN_EFFECTIVE="$TOPN_EFFECTIVE"
 
   if ! "$PYTHON_BIN" - "$DEDUP_CORR_THRESHOLD" <<'PY' >/dev/null 2>&1; then
 import sys
@@ -1291,6 +1521,17 @@ PY
     echo "Error: --dedup-corr-threshold must be a float in (0,1) (got '$DEDUP_CORR_THRESHOLD')"
     exit 1
   fi
+  if ! "$PYTHON_BIN" - "$DEDUP_STAGE2_CORR_THRESHOLD" <<'PY' >/dev/null 2>&1; then
+import sys
+try:
+    v = float(sys.argv[1])
+    raise SystemExit(0 if (0.0 < v < 1.0) else 1)
+except Exception:
+    raise SystemExit(1)
+PY
+    echo "Error: --dedup-stage2-corr-threshold must be a float in (0,1) (got '$DEDUP_STAGE2_CORR_THRESHOLD')"
+    exit 1
+  fi
 
   TMP_DIVERSE_LIBRARY_PATH="$(mktemp "/tmp/quantaalpha_factorlib_diverse_XXXXXX.json")"
   TMP_DIVERSE_REPORT_PATH="$(mktemp "/tmp/quantaalpha_factorlib_diverse_report_XXXXXX.json")"
@@ -1299,22 +1540,83 @@ PY
     --library "$LIB_PATH"
     --config "$RUN_CONFIG_PATH"
     --out "$TMP_DIVERSE_LIBRARY_PATH"
+    --dedup-method "$DEDUP_METHOD"
+    --cluster-linkage "$DEDUP_LINKAGE"
     --topn "$TOPN_EFFECTIVE"
     --per-cluster "$DEDUP_PER_CLUSTER"
     --corr-threshold "$DEDUP_CORR_THRESHOLD"
+    --stage2-ic-corr-threshold "$DEDUP_STAGE2_CORR_THRESHOLD"
     --sample-size "$DEDUP_SAMPLE_SIZE"
+    --sample-split "$DEDUP_SAMPLE_SPLIT"
     --report "$TMP_DIVERSE_REPORT_PATH"
   )
   if [[ "$DEDUP_COMPUTE_MISSING" == "true" ]]; then
     DEDUP_ARGS+=(--compute-missing)
   fi
 
-  echo "[Diverse] enabled=true topn=$TOPN_EFFECTIVE per_cluster=$DEDUP_PER_CLUSTER corr_threshold=$DEDUP_CORR_THRESHOLD sample_size=$DEDUP_SAMPLE_SIZE compute_missing=$DEDUP_COMPUTE_MISSING"
+  TOPN_LOG="$TOPN_EFFECTIVE"
+  if [[ "${DEDUP_TOPN_EFFECTIVE:-}" == "all" ]]; then
+    TOPN_LOG="all"
+  fi
+  echo "[Diverse] enabled=true method=$DEDUP_METHOD linkage=$DEDUP_LINKAGE topn=$TOPN_LOG per_cluster=$DEDUP_PER_CLUSTER corr_threshold=$DEDUP_CORR_THRESHOLD stage2_corr_threshold=$DEDUP_STAGE2_CORR_THRESHOLD sample_size=$DEDUP_SAMPLE_SIZE sample_split=$DEDUP_SAMPLE_SPLIT compute_missing=$DEDUP_COMPUTE_MISSING"
   echo "[Diverse] input_library=$LIB_PATH"
-  "$PYTHON_BIN" "$PROJECT_ROOT/scripts/select_diverse_factors.py" "${DEDUP_ARGS[@]}"
+  "$PYTHON_BIN" "$PROJECT_ROOT/scripts/factor_filtering/select_factors.py" "${DEDUP_ARGS[@]}"
   echo "[Diverse] report=$TMP_DIVERSE_REPORT_PATH"
   echo "[Diverse] output_library=$TMP_DIVERSE_LIBRARY_PATH"
   LIB_PATH="$TMP_DIVERSE_LIBRARY_PATH"
+fi
+
+FILTER_FINAL_TOTAL="$(count_factors_in_library "$LIB_PATH")"
+
+if [[ "$FACTORS_FILTER_ONLY" == "true" ]]; then
+  OUTPUT_DIR="$PROJECT_ROOT/data/factorlib/selected"
+  mkdir -p "$OUTPUT_DIR"
+  FILTER_TS="$(date +%Y%m%d_%H%M%S)"
+  SOURCE_BASE="$(basename "$SOURCE_LIBRARY_PATH")"
+  SOURCE_STEM="${SOURCE_BASE%.json}"
+  case "$QUALITY_MIN" in
+    high) FILTER_QUALITY_PROFILE="high" ;;
+    medium) FILTER_QUALITY_PROFILE="high_medium" ;;
+    low) FILTER_QUALITY_PROFILE="high_medium_low" ;;
+    *) FILTER_QUALITY_PROFILE="$QUALITY_MIN" ;;
+  esac
+  FILTER_BASENAME="${SOURCE_STEM}_factors_filter_q${FILTER_QUALITY_PROFILE}_n${FILTER_FINAL_TOTAL}_${FILTER_TS}"
+  FILTER_OUTPUT_PATH="$OUTPUT_DIR/${FILTER_BASENAME}.json"
+  cp "$LIB_PATH" "$FILTER_OUTPUT_PATH"
+
+  FILTER_REPORT_PATH=""
+  if [[ -n "$TMP_DIVERSE_REPORT_PATH" && -f "$TMP_DIVERSE_REPORT_PATH" ]]; then
+    FILTER_REPORT_PATH="$OUTPUT_DIR/${FILTER_BASENAME}_report.json"
+    cp "$TMP_DIVERSE_REPORT_PATH" "$FILTER_REPORT_PATH"
+  fi
+
+  echo "[FactorsFilter] enabled=true (no backtest)"
+  echo "[FactorsFilter] experiment=$SOURCE_STEM quality_range=$FILTER_QUALITY_PROFILE final_selected=$FILTER_FINAL_TOTAL"
+  echo "[FactorsFilter] output_library=$FILTER_OUTPUT_PATH"
+  if [[ -n "$FILTER_REPORT_PATH" ]]; then
+    echo "[FactorsFilter] output_report=$FILTER_REPORT_PATH"
+  fi
+
+  # Stable alias bound to source experiment.
+  LATEST_OUTPUT_PATH="$OUTPUT_DIR/${SOURCE_STEM}_factors_filter_latest.json"
+  cp "$FILTER_OUTPUT_PATH" "$LATEST_OUTPUT_PATH"
+  echo "[FactorsFilter] latest_output_library=$LATEST_OUTPUT_PATH"
+  LATEST_META_PATH="$OUTPUT_DIR/${SOURCE_STEM}_factors_filter_latest.meta"
+  {
+    echo "source_experiment=$SOURCE_STEM"
+    echo "quality_profile=$FILTER_QUALITY_PROFILE"
+    echo "quality_min=$QUALITY_MIN"
+    echo "final_selected=$FILTER_FINAL_TOTAL"
+    echo "generated_at=$FILTER_TS"
+    echo "output_file=$(basename "$FILTER_OUTPUT_PATH")"
+  } > "$LATEST_META_PATH"
+  echo "[FactorsFilter] latest_output_meta=$LATEST_META_PATH"
+  if [[ -n "$FILTER_REPORT_PATH" ]]; then
+    LATEST_REPORT_PATH="$OUTPUT_DIR/${SOURCE_STEM}_factors_filter_latest_report.json"
+    cp "$FILTER_REPORT_PATH" "$LATEST_REPORT_PATH"
+    echo "[FactorsFilter] latest_output_report=$LATEST_REPORT_PATH"
+  fi
+  exit 0
 fi
 
 FREE_KB="$(df -Pk "$PROJECT_ROOT" | awk 'NR==2 {print $4}')"
@@ -1366,9 +1668,10 @@ PID_FILE="$PID_DIR/backtest_${TS}.pid"
 
   {
     echo "[Summary] interactive=$INTERACTIVE target=$TARGET_MODE auto_start=true"
+    echo "[Summary] factors_filter_only=$FACTORS_FILTER_ONLY"
     echo "[Summary] library=$LIB_PATH"
-    echo "[Summary] mode=$MODE factor_source=$FACTOR_SOURCE quality_min=$QUALITY_MIN max_factors=$MAX_FACTORS_EFFECTIVE"
-    echo "[Summary] corr_dedup=$CORR_DEDUP dedup_topn_effective=${DEDUP_TOPN_EFFECTIVE:-${DEDUP_TOPN:-auto}} dedup_per_cluster=$DEDUP_PER_CLUSTER dedup_corr_threshold=$DEDUP_CORR_THRESHOLD dedup_sample_size=$DEDUP_SAMPLE_SIZE"
+    echo "[Summary] factor_source=$FACTOR_SOURCE quality_min=$QUALITY_MIN max_factors=$MAX_FACTORS_EFFECTIVE"
+    echo "[Summary] corr_dedup=$CORR_DEDUP dedup_method=$DEDUP_METHOD dedup_linkage=$DEDUP_LINKAGE dedup_topn_effective=${DEDUP_TOPN_EFFECTIVE:-${DEDUP_TOPN:-auto}} dedup_per_cluster=$DEDUP_PER_CLUSTER dedup_corr_threshold=$DEDUP_CORR_THRESHOLD dedup_stage2_corr_threshold=$DEDUP_STAGE2_CORR_THRESHOLD dedup_sample_size=$DEDUP_SAMPLE_SIZE dedup_sample_split=$DEDUP_SAMPLE_SPLIT"
     echo "[Summary] bob_enabled=$BOB_ENABLED bob_libraries=$BOB_LIBRARIES bob_metric=$BOB_METRIC bob_grade=$BOB_GRADE_MODE bob_top=$BOB_TOP"
     echo "[Summary] warm_cache=$WARM_CACHE skip_uncached=$SKIP_UNCACHED free_disk=${FREE_GB}GB"
   } | tee -a "$LOG_FILE"
@@ -1399,12 +1702,12 @@ trap 'on_signal INT' INT
 trap 'on_signal HUP' HUP
 
 echo "[Run] library=$LIB_PATH"
-echo "[Run] mode=$MODE"
+echo "[Run] factors_filter_only=$FACTORS_FILTER_ONLY"
 echo "[Run] factor_source=$FACTOR_SOURCE config=$RUN_CONFIG_PATH (base=$CONFIG_PATH)"
 echo "[Run] threads=$THREADS skip_uncached=$SKIP_UNCACHED"
 echo "[Run] quality_min=$QUALITY_MIN"
 echo "[Run] max_factors=$MAX_FACTORS_EFFECTIVE"
-echo "[Run] corr_dedup=$CORR_DEDUP dedup_topn_effective=${DEDUP_TOPN_EFFECTIVE:-${DEDUP_TOPN:-auto}} dedup_per_cluster=$DEDUP_PER_CLUSTER dedup_corr_threshold=$DEDUP_CORR_THRESHOLD dedup_sample_size=$DEDUP_SAMPLE_SIZE compute_missing=$DEDUP_COMPUTE_MISSING"
+echo "[Run] corr_dedup=$CORR_DEDUP dedup_method=$DEDUP_METHOD dedup_linkage=$DEDUP_LINKAGE dedup_topn_effective=${DEDUP_TOPN_EFFECTIVE:-${DEDUP_TOPN:-auto}} dedup_per_cluster=$DEDUP_PER_CLUSTER dedup_corr_threshold=$DEDUP_CORR_THRESHOLD dedup_stage2_corr_threshold=$DEDUP_STAGE2_CORR_THRESHOLD dedup_sample_size=$DEDUP_SAMPLE_SIZE dedup_sample_split=$DEDUP_SAMPLE_SPLIT compute_missing=$DEDUP_COMPUTE_MISSING"
 echo "[Run] bob_enabled=$BOB_ENABLED bob_metric=$BOB_METRIC bob_top=$BOB_TOP bob_grade=$BOB_GRADE_MODE"
 echo "[Run] free_disk=${FREE_GB}GB log=$LOG_FILE"
 
@@ -1423,7 +1726,7 @@ fi
 LOG_PIPE="$(mktemp -u "/tmp/quantaalpha_backtest_${TS}_XXXXXX")"
 mkfifo "$LOG_PIPE"
 
-tee "$LOG_FILE" < "$LOG_PIPE" &
+tee -a "$LOG_FILE" < "$LOG_PIPE" &
 TEE_PID=$!
 
 "${CMD[@]}" > "$LOG_PIPE" 2>&1 &
@@ -1436,18 +1739,22 @@ tee_pid=$TEE_PID
 started_at=$(date '+%F %T')
 log_file=$LOG_FILE
 library=$LIB_PATH
-mode=$MODE
 factor_source=$FACTOR_SOURCE
 config=$RUN_CONFIG_PATH
 config_base=$CONFIG_PATH
 threads=$THREADS
 quality_min=$QUALITY_MIN
 max_factors=$MAX_FACTORS_EFFECTIVE
+factors_filter_only=$FACTORS_FILTER_ONLY
 corr_dedup=$CORR_DEDUP
 dedup_topn_effective=${DEDUP_TOPN_EFFECTIVE:-${DEDUP_TOPN:-}}
+dedup_method=$DEDUP_METHOD
+dedup_linkage=$DEDUP_LINKAGE
 dedup_per_cluster=$DEDUP_PER_CLUSTER
 dedup_corr_threshold=$DEDUP_CORR_THRESHOLD
+dedup_stage2_corr_threshold=$DEDUP_STAGE2_CORR_THRESHOLD
 dedup_sample_size=$DEDUP_SAMPLE_SIZE
+dedup_sample_split=$DEDUP_SAMPLE_SPLIT
 dedup_compute_missing=$DEDUP_COMPUTE_MISSING
 bob_enabled=$BOB_ENABLED
 bob_libraries=$BOB_LIBRARIES

@@ -267,6 +267,7 @@ class CustomFactorCalculator:
         factors = data.get('factors', {})
         
         results = {}
+        used_keys = set()
         success_count = 0
         fail_count = 0
         
@@ -284,6 +285,12 @@ class CustomFactorCalculator:
             if not factor_expr:
                 fail_count += 1
                 continue
+
+            # Ensure unique column names even if factor_name repeats.
+            col_key = str(factor_name or factor_id or "unknown").strip()
+            if col_key in used_keys:
+                col_key = f"{col_key}__{factor_id}"
+            used_keys.add(col_key)
             
             if (i + 1) % 10 == 0 or i == 0:
                 logger.debug(f"  Progress: {i+1}/{total}")
@@ -291,7 +298,7 @@ class CustomFactorCalculator:
             result = self.calculate_factor(factor_name, factor_expr)
             
             if result is not None:
-                results[factor_name] = result
+                results[col_key] = result
                 success_count += 1
             else:
                 fail_count += 1
@@ -313,16 +320,69 @@ class CustomFactorCalculator:
         
         if use_cache and self.auto_extract_cache:
             self._auto_extract_cache_from_logs()
-        
-        results = {}
+
+        # IMPORTANT:
+        # Cache entries are keyed only by expression MD5, so different runs (market/date range/data version)
+        # may produce different indexes. We must align everything to the *current* target index; otherwise
+        # we will silently drop factors or blow up memory by constructing a huge union index.
+        target_index: Optional[pd.Index] = None
+        if factors:
+            try:
+                target_index = self.data_df.index
+                if isinstance(target_index, pd.MultiIndex) and target_index.duplicated().any():
+                    target_index = target_index[~target_index.duplicated(keep='last')]
+            except Exception as e:
+                logger.debug(f"Target index unavailable, will align by cached index only: {e}")
+                target_index = None
+
+        results: Dict[str, pd.Series] = {}
+        used_keys: set[str] = set()
+        renamed_duplicates: List[Tuple[str, str]] = []
         success_count = 0
         fail_count = 0
         cache_hit_count = 0
         cache_location_hit_count = 0
         compute_count = 0
-        failed_names = []
+        failed_names: List[str] = []
         total = len(factors)
-        need_compute_factors = []
+        need_compute_factors: List[Tuple[int, str, Dict]] = []
+
+        def _validate(series: Optional[pd.Series], name: str) -> Optional[pd.Series]:
+            if series is None:
+                return None
+            if target_index is not None:
+                return self._validate_and_align_result(series, name, target_index)
+            # Fallback: at least filter out empty/all-NaN results when target index is unavailable.
+            return series if len(series) > 0 and not series.isna().all() else None
+
+        def _reserve_factor_key(factor_info: Dict, factor_name: str) -> str:
+            """Return a unique column key for this factor.
+
+            Some factor libraries contain duplicate factor_name values. If we key results by
+            factor_name, later factors overwrite earlier ones silently and the effective
+            factor count becomes smaller than requested.
+            """
+            raw_name = str(factor_name or "unknown").strip() or "unknown"
+            raw_id = str(factor_info.get("factor_id") or "").strip()
+            key = raw_name
+            if key not in used_keys:
+                used_keys.add(key)
+                return key
+            if raw_id:
+                key2 = f"{raw_name}__{raw_id}"
+                if key2 not in used_keys:
+                    used_keys.add(key2)
+                    renamed_duplicates.append((raw_name, key2))
+                    return key2
+            # Fallback: keep appending a numeric suffix.
+            n = 2
+            while True:
+                key2 = f"{raw_name}__dup{n}"
+                if key2 not in used_keys:
+                    used_keys.add(key2)
+                    renamed_duplicates.append((raw_name, key2))
+                    return key2
+                n += 1
         
         # Pass 1: load from cache
         for i, factor_info in enumerate(factors):
@@ -334,6 +394,8 @@ class CustomFactorCalculator:
                 fail_count += 1
                 failed_names.append(factor_name)
                 continue
+
+            factor_key = _reserve_factor_key(factor_info, factor_name)
             
             result = None
             
@@ -342,36 +404,42 @@ class CustomFactorCalculator:
                 if h5_path:
                     result = self._load_from_cache_location(cache_location)
                     if result is not None:
-                        cache_location_hit_count += 1
-                        results[factor_name] = result
-                        success_count += 1
-                        print(f"  [{i+1}/{total}] ✓ H5 cache: {factor_name}")
-                        continue
+                        validated = _validate(result, factor_name)
+                        if validated is not None:
+                            cache_location_hit_count += 1
+                            results[factor_key] = validated
+                            success_count += 1
+                            print(f"  [{i+1}/{total}] ✓ H5 cache: {factor_name}")
+                            continue
+                        print(f"  [{i+1}/{total}] ⚠ Invalid H5 cache: {factor_name} (index mismatch)")
             
             if use_cache:
                 result = self._load_from_cache(factor_expr)
                 if result is not None:
-                    cache_hit_count += 1
-                    results[factor_name] = result
-                    success_count += 1
-                    print(f"  [{i+1}/{total}] ✓ MD5 cache: {factor_name}")
-                    continue
+                    validated = _validate(result, factor_name)
+                    if validated is not None:
+                        cache_hit_count += 1
+                        results[factor_key] = validated
+                        success_count += 1
+                        print(f"  [{i+1}/{total}] ✓ MD5 cache: {factor_name}")
+                        continue
+                    print(f"  [{i+1}/{total}] ⚠ Invalid MD5 cache: {factor_name} (index mismatch)")
             
-            need_compute_factors.append((i, factor_info))
+            need_compute_factors.append((i, factor_key, factor_info))
             print(f"  [{i+1}/{total}] ⏳ Pending: {factor_name}")
         
         # Pass 2: compute uncached factors
         if need_compute_factors:
             if skip_compute:
                 skipped_count = len(need_compute_factors)
-                skipped_names = [f.get('factor_name', 'unknown') for _, f in need_compute_factors]
+                skipped_names = [f.get('factor_name', 'unknown') for _, _, f in need_compute_factors]
                 print(f"  Skipping {skipped_count} uncached factors (skip_compute=True)")
                 if skipped_names:
                     print(f"  Skipped: {', '.join(skipped_names)}")
             else:
                 print(f"  Computing {len(need_compute_factors)} factors from expressions...")
                 
-                for idx, (orig_i, factor_info) in enumerate(need_compute_factors):
+                for idx, (orig_i, factor_key, factor_info) in enumerate(need_compute_factors):
                     factor_name = factor_info.get('factor_name', 'unknown')
                     factor_expr = factor_info.get('factor_expression', '')
                     
@@ -426,12 +494,18 @@ class CustomFactorCalculator:
                     
                     if result is not None and len(result) > 0:
                         if not result.isna().all():
-                            results[factor_name] = result
-                            success_count += 1
-                            compute_count += 1
-                            print(f" ✓ ({elapsed:.1f}s)")
-                            if use_cache:
-                                self._save_to_cache(factor_expr, result)
+                            validated = _validate(result, factor_name)
+                            if validated is not None:
+                                results[factor_key] = validated
+                                success_count += 1
+                                compute_count += 1
+                                print(f" ✓ ({elapsed:.1f}s)")
+                                if use_cache:
+                                    self._save_to_cache(factor_expr, validated)
+                            else:
+                                fail_count += 1
+                                failed_names.append(factor_name)
+                                print(f" ✗ Invalid index ({elapsed:.1f}s)")
                         else:
                             fail_count += 1
                             failed_names.append(factor_name)
@@ -443,28 +517,34 @@ class CustomFactorCalculator:
         
         print(f"Factor load done: success {success_count}, failed {fail_count} | "
               f"H5 cache {cache_location_hit_count}, MD5 cache {cache_hit_count}, computed {compute_count}")
+        if renamed_duplicates:
+            print(f"  Note: renamed {len(renamed_duplicates)} duplicate factor_name(s) to keep columns unique.")
         if failed_names:
             print(f"  Failed: {', '.join(failed_names)}")
         
         if not results:
             return pd.DataFrame()
-        
-        # Align results to common index
-        aligned_results = {}
+
+        if target_index is not None:
+            # Force output on target index to avoid accidental union index expansion.
+            result_df = pd.DataFrame(results, index=target_index)
+            logger.debug(f"  Result DataFrame: {result_df.shape}")
+            return result_df
+
+        # Fallback: original behavior when we can't determine a target index.
+        aligned_results: Dict[str, pd.Series] = {}
         reference_index = None
-        
         for name, series in results.items():
             if reference_index is None:
                 reference_index = series.index
             validated = self._validate_and_align_result(series, name, reference_index)
             if validated is not None:
                 aligned_results[name] = validated
-        
         if aligned_results:
             result_df = pd.DataFrame(aligned_results)
             logger.debug(f"  Result DataFrame: {result_df.shape}")
             return result_df
-        
+
         return pd.DataFrame()
     
     def _validate_and_align_result(self, result: pd.Series, factor_name: str, 
@@ -584,6 +664,16 @@ def get_qlib_stock_data(config: Dict) -> pd.DataFrame:
     )
     
     df.columns = fields
+
+    # Normalize to canonical MultiIndex(datetime, instrument) to match cached factor format
+    # and downstream backtest alignment logic.
+    if isinstance(df.index, pd.MultiIndex) and df.index.nlevels >= 2:
+        expected = ["datetime", "instrument"]
+        names = list(df.index.names[:2])
+        if names != expected and set(names) == set(expected):
+            df = df.swaplevel().sort_index()
+        # Ensure stable level names (qlib sometimes uses the same names but different order).
+        df.index = df.index.set_names(expected)
     
     logger.debug(f"Loaded stock data: {len(df)} rows")
     

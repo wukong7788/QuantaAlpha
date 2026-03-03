@@ -126,15 +126,15 @@ def _project_root_from_here() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def _find_processes(project_root: Path) -> list[ProcessInfo]:
+def _find_processes(project_root: Path) -> tuple[list[ProcessInfo], str | None]:
     try:
         out = subprocess.check_output(
             ["ps", "-ax", "-o", "pid=,etime=,command="],
             text=True,
             stderr=subprocess.DEVNULL,
         )
-    except Exception:
-        return []
+    except Exception as exc:
+        return [], str(exc)
 
     procs: list[ProcessInfo] = []
     root_text = str(project_root)
@@ -166,7 +166,7 @@ def _find_processes(project_root: Path) -> list[ProcessInfo]:
         procs.append(ProcessInfo(pid=pid, etime=etime, command=command))
 
     procs.sort(key=lambda p: p.pid)
-    return procs
+    return procs, None
 
 
 def _has_task_dirs(path: Path) -> bool:
@@ -629,7 +629,7 @@ def _build_report(
     pool_path = log_root / "trajectory_pool.json"
     state = _safe_read_json(state_path)
     pool = _safe_read_json(pool_path)
-    processes = _find_processes(project_root)
+    processes, process_scan_error = _find_processes(project_root)
     tasks = _discover_tasks(log_root)
     latest_task = tasks[0] if tasks else None
 
@@ -705,6 +705,7 @@ def _build_report(
             {"pid": p.pid, "etime": p.etime, "command": p.command}
             for p in processes
         ],
+        "process_scan_error": process_scan_error,
         "state": {
             "current_phase": phase_state,
             "current_round": round_state,
@@ -743,6 +744,7 @@ def _render_text(report: dict[str, Any]) -> str:
     lines.append("")
 
     procs = report.get("active_processes", [])
+    scan_error = str(report.get("process_scan_error") or "").strip()
     if procs:
         lines.append(f"active_processes={len(procs)}")
         for p in procs[:3]:
@@ -750,6 +752,9 @@ def _render_text(report: dict[str, Any]) -> str:
                 f"  - pid={p.get('pid')} etime={p.get('etime')} "
                 f"cmd={_shorten(str(p.get('command', '')), 120)}"
             )
+    elif scan_error:
+        lines.append("active_processes=unknown")
+        lines.append(f"process_scan_error={scan_error}")
     else:
         lines.append("active_processes=0")
 
@@ -895,12 +900,16 @@ def _render_markdown(report: dict[str, Any]) -> str:
 
     lines.append("## 1. 进程健康扫描")
     procs = report.get("active_processes", [])
+    scan_error = str(report.get("process_scan_error") or "").strip()
     if procs:
         lines.append(f"- 状态: 运行中（active_processes={len(procs)}）")
         for p in procs[:3]:
             lines.append(
                 f"- 进程: pid={p.get('pid')} etime={p.get('etime')} cmd=`{_shorten(str(p.get('command', '')), 120)}`"
             )
+    elif scan_error:
+        lines.append("- 状态: 无法扫描进程（权限/环境限制）")
+        lines.append(f"- process_scan_error: `{_shorten(scan_error, 180)}`")
     else:
         lines.append("- 状态: 未检测到活跃 `run.sh/quantaalpha mine` 进程（可能已结束或当前未运行）")
     lines.append("")

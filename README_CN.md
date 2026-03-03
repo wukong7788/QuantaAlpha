@@ -205,6 +205,7 @@ EXPERIMENT_ID="paper_repro_r2" ./run.sh --resume "价量因子挖掘" "paper_rep
 ```
 
 `run.sh` 现在默认开启 low-disk 模式。如需关闭，请显式加 `--no-low-disk`。
+在 low-disk 模式下，`QUANTA_LOW_DISK_FLOAT32` 默认值改为 `false`（除非手动覆盖，否则保持 `float64`）。
 
 命名安全提示（重要）：
 
@@ -221,8 +222,8 @@ EXPERIMENT_ID="paper_repro_r2" ./run.sh --resume "价量因子挖掘" "paper_rep
 
 预计算 cheap gate + 构造止损：
 
-- `quality_gate.cheap_filter_enabled: true`：在 calculate/backtest 前拦截静态不合格表达式。
-- `quality_gate.cheap_filter_require_acceptable: true`：仅保留 regulator 判定可接受的表达式。
+- `quality_gate.cheap_filter_enabled: false`：默认关闭（`STEP_N=3` 的 A/B 显示耗时负优化）。
+- `quality_gate.cheap_filter_require_acceptable: false`：默认关闭；仅建议在特定负载下配合 `cheap_filter_enabled=true` 复测后启用。
 - `quality_gate.max_construct_failures_per_branch: 2`：限制分支连续构造失败预算。
 - `quality_gate.max_json_parse_failures_per_branch: 2`：限制分支 JSON 解析失败预算。
 
@@ -230,7 +231,7 @@ LLM 运行时稳态（优化新增选项，不是原始基线默认项）：
 
 - `llm.json_mode_response_format: json_object`：在 `json_mode=true` 调用启用协议层 JSON 输出约束。
 - `llm.json_mode_json_schema: ""`：可按 provider 能力配置 JSON Schema 字符串。
-- `llm.json_mode_temperature: 0.0` 与 `llm.freeform_temperature: 0.5`：结构化调用与自由文本调用分层控温。
+- 默认保持 `llm.json_mode_temperature: 0.5` 与 `llm.freeform_temperature: 0.5` 一致；温度分层建议在目标用例做 A/B 后再启用。
 - `llm.request_timeout_s: 60.0`、`llm.retry_backoff: exponential`、`llm.retry_jitter: true`、`llm.retry_max_wait_seconds: 30.0`：降低尾延迟与卡顿空耗。
 - `llm.failover_base_urls: []`：可选备用链路，在连续失败时切换 endpoint。
 
@@ -260,11 +261,11 @@ LLM 运行时稳态（优化新增选项，不是原始基线默认项）：
 
 `--relay` 用于“分段接力”：
 
-- 首段按 `QUANTA_RELAY_CHUNK_ROUNDS`（默认 5）运行
+- 首段按 `QUANTA_RELAY_CHUNK_ROUNDS`（默认取配置里的 `evolution.relay_chunk_rounds`，当前主配置为 6）运行
 - 后续再次执行 `--relay` 会自动补齐到 `max_rounds`
 
 ```bash
-# 首段接力（默认先跑 5 轮）
+# 首段接力（当前主配置默认先跑 6 轮）
 EXPERIMENT_ID="paper_repro_r2" ./run.sh --relay "价量因子挖掘" "paper_reproduction_r2" 2>&1 | tee run_output_r2.log
 
 # 第二次接力（自动补齐到 max_rounds）
@@ -367,14 +368,22 @@ python -m quantaalpha.backtest.run_backtest \
 ./scripts/run_backtest_safe.sh --interactive
 ```
 
+交互向导行为：
+
+- 第 1 步目标新增 `FILTER`（或 `factors-filter`）：只执行过滤链路并退出（不跑回测）。
+  终端会打印 `experiment`、`quality_range`、`final_selected`，并在
+  `data/factorlib/selected/<experiment>_factors_filter_q<quality>_n<count>_<timestamp>.json` 落盘，
+  同时更新稳定别名 `<experiment>_factors_filter_latest.json`。
+- 选择单个 custom 因子库后，向导会提供“一键实盘去重预设”，自动填充：
+  `--corr-dedup --dedup-method two_stage --dedup-linkage complete --dedup-sample-split train_valid --dedup-topn 50 --dedup-per-cluster 1 --dedup-corr-threshold 0.8 --dedup-stage2-corr-threshold 0.8 --dedup-sample-size 12000 --dedup-compute-missing`。
+
 常用参数：
 
 ```bash
-# limited 模式 + Top50 custom 因子
+# 显式限制线程数执行回测
 ./scripts/run_backtest_safe.sh \
   --library data/factorlib/all_factors_library_paper_reproduction_ds.json \
-  --mode limited \
-  --max-factors 50 \
+  --threads 6 \
   --warm-cache
 
 # 不限制因子数量（max_factors = null）
@@ -385,16 +394,27 @@ python -m quantaalpha.backtest.run_backtest \
 # 相关性去重 + 多样性 Top-N（per-cluster 默认 3；设为 1 更严格）
 ./scripts/run_backtest_safe.sh \
   --library data/factorlib/all_factors_library_paper_reproduction_ds.json \
-  --mode limited \
   --max-factors 80 \
   --corr-dedup \
+  --dedup-method two_stage \
+  --dedup-linkage complete \
+  --dedup-sample-split train_valid \
+  --dedup-stage2-corr-threshold 0.8 \
   --dedup-per-cluster 1
+
+# 只跑过滤链路（不执行回测）：查看最终剩余因子数
+./scripts/run_backtest_safe.sh \
+  --factors-filter \
+  --library data/factorlib/all_factors_library_paper_reproduction_ds.json
 ```
 
 补充说明：
 
 - BOB 模式下 `--bob-metric auto` 现在会先为本次运行确定一个全局主指标，再统一排序（不再混用不同量纲）。
 - 脚本产生的临时文件会在正常退出和异常中断时都自动清理。
+- 相关性去重默认已升级为 `two_stage`：Stage-1 暴露相关粗筛 + Stage-2 IC 序列相关精筛。
+- Stage-1 不再按全局 TopN 截断；`--dedup-topn` 只在 Stage-2 后生效，优先保证多样性广度。
+- 聚类支持 `complete|connected`（默认 `complete`），以降低链式并簇导致的误杀风险。
 
 说明：
 

@@ -59,16 +59,16 @@ uv sync
 tmux new -s backtest_task
 
 # 执行 BOB 聚合回测
-./scripts/run_backtest_safe.sh --bob \
-  --bob-libraries "all_factors_library_mac_run_01.json" \
-  --bob-top 50 \
-  --bob-metric "information_ratio" \
-  --mode performance
+ ./scripts/run_backtest_safe.sh --bob \
+   --bob-libraries "all_factors_library_mac_run_01.json" \
+   --bob-top 50 \
+   --bob-metric "information_ratio" \
+   --threads 16
 ```
 
 *   `--bob`：开启 Best-of-Best 精英合成模式，它将抽取因子池中胜出者。
 *   `--bob-top 50`：从所有上传的 JSON 候选者里筛选出信息比率 (IR) 最高的 50 个优质因子。
-*   `--mode performance`：解锁高线程限制，吃满服务器全部 CPU 核心。
+*   `--threads 16`：显式设置线程上限，云端可按 CPU 核心数调大以提高吞吐。
 
 > 如果你想手动进行交互式引导而不是输入长长的参数：
 > 可以直接输入 `./scripts/run_backtest_safe.sh --interactive` 跟着提示走。

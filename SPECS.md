@@ -1,7 +1,7 @@
 # SPECS.md
 
 > QuantaAlpha 单一执行文档（Single Source of Truth）  
-> 最后更新：2026-02-28
+> 最后更新：2026-03-03
 
 ## 1. 当前目标（Active Goals）
 
@@ -111,8 +111,10 @@ STEP_N=5 ./minirun.sh
 # llm.failover_base_urls: []
 
 # 安全回测
-./scripts/run_backtest_safe.sh --library all_factors_library_xxx.json --mode limited
-./scripts/run_backtest_safe.sh --library all_factors_library_xxx.json --mode limited --max-factors 80 --corr-dedup --dedup-per-cluster 1
+./scripts/run_backtest_safe.sh --library all_factors_library_xxx.json --threads 6
+./scripts/run_backtest_safe.sh --library all_factors_library_xxx.json --threads 6 --max-factors 80 --corr-dedup --dedup-method two_stage --dedup-linkage complete --dedup-sample-split train_valid --dedup-per-cluster 1
+./scripts/run_backtest_safe.sh --interactive   # 选择单库后可一键启用实盘去重预设
+./scripts/run_backtest_safe.sh --factors-filter --library all_factors_library_xxx.json   # 仅执行过滤并输出最终剩余因子数
 ./scripts/run_backtest_safe.sh --bob --bob-libraries "data/factorlib/all_factors_library_*.json" --bob-top 80
 
 # Factor Zoo 管理
@@ -124,8 +126,8 @@ STEP_N=5 ./minirun.sh
 EXPERIMENT_ID="paper_repro_23r" QUANTA_RELAY_CHUNK_ROUNDS=6 ./run.sh --rounds 23 --low-disk --relay --zoo-dedup "价量因子挖掘" "paper_repro_23r"
 
 # 回测内存 A/B（峰值 RSS + 耗时，baseline=HEAD，optimized=当前工作区）
-.venv/bin/python scripts/abtest_backtest_memory.py baseline -- -c configs/backtest_limited.yaml --factor-source custom --factor-json data/factorlib/all_factors_library_xxx.json --skip-uncached
-.venv/bin/python scripts/abtest_backtest_memory.py optimized -- -c configs/backtest_limited.yaml --factor-source custom --factor-json data/factorlib/all_factors_library_xxx.json --skip-uncached
+.venv/bin/python scripts/abtest_backtest_memory.py baseline -- -c configs/backtest.yaml --factor-source custom --factor-json data/factorlib/all_factors_library_xxx.json --skip-uncached
+.venv/bin/python scripts/abtest_backtest_memory.py optimized -- -c configs/backtest.yaml --factor-source custom --factor-json data/factorlib/all_factors_library_xxx.json --skip-uncached
 
 # 实验流程 A/B（baseline/optimized；可重复 times 次并输出对比汇总）
 .venv/bin/python scripts/abtest_experiment.py compare --name opt2_json_protocol --base-config configs/experiment_smoke.yaml --direction "价量因子挖掘" --step-n 3 --times 3 --set-baseline llm.json_mode_response_format=none --set-optimized llm.json_mode_response_format=json_object
@@ -152,7 +154,7 @@ EXPERIMENT_ID="paper_repro_23r" QUANTA_RELAY_CHUNK_ROUNDS=6 ./run.sh --rounds 23
   - `run.sh` 默认开启 low-disk 模式；新增 `--no-low-disk` 显式关闭入口
   - 运行进度 doctor 入口统一为 `scripts/run_doctor.sh`（默认单次 Markdown 报告，含进度与报错诊断）。
   - LLM JSON 输出稳态化：空响应快速重试；修复失败后触发一次 JSON-only 跟进；失败原因结构化日志输出。
-  - 构造阶段上下文瘦身：`DEFAULT_HISTORY_LIMIT` 从 `6` 调整到 `4`，失败反馈改为短摘要（错误类型 + 修复指令 + 反例）。
+  - 构造阶段上下文窗口恢复：`DEFAULT_HISTORY_LIMIT` 已回到 `6`（初始默认值）；失败反馈仍使用短摘要（错误类型 + 修复指令 + 反例）。
   - 受控并行上线：新增 `evolution.max_parallel_workers`，避免并行阶段一次性拉满所有任务。
   - 预计算 cheap gate 前置：在 `factor_calculate` 前过滤静态不合格表达式，减少无效 calculate/backtest。
   - 分支止损预算外置：新增 `evolution.max_empty_retries`、`quality_gate.max_construct_failures_per_branch`、`quality_gate.max_json_parse_failures_per_branch`。
@@ -180,6 +182,26 @@ EXPERIMENT_ID="paper_repro_23r" QUANTA_RELAY_CHUNK_ROUNDS=6 ./run.sh --rounds 23
   - **`configs/backtest_2021_validate.yaml`**：新增，回测区间对齐 2021-01-01 ~ 2021-12-31（与挖掘期内打分口径一致）。
   - **`PAPER_REPRODUCTION_GUIDE.md` 脚本区重构**：脚本 0（minirun）、脚本 1（安全模式 + zoo-dedup）、脚本 2（土豪 23 轮，化简为 2 步）。
   - **`AGENTS.md` / `SPECS.md`** 同步更新以上全部变更。
+- 2026-02-28 (第三批):
+  - **配置入口收敛**：删除冗余的 `configs/experiment_full_11.yaml`；主实验统一使用 `configs/experiment.yaml`。
+  - **满血基线硬编码**：在 `experiment.yaml` 中硬编码论文最强探索配置：`factor.factors_per_hypothesis: 3`，`evolution.max_rounds: 23`，并内置分段存盘 `evolution.relay_chunk_rounds: 6`，彻底免除向 CLI 传超长环境变量的负担。
+  - **冒烟配置恢复**：恢复 `configs/experiment_smoke.yaml` 作为专用轻量配置；`minirun.sh` 默认使用该配置，避免误触发主实验级参数。
+- 2026-03-01:
+  - **低磁盘精度默认值调整**：`QUANTA_LOW_DISK_FLOAT32` 默认改为 `false`，包括 `--low-disk` 模式下也默认保持 `float64`；仅在显式设置环境变量时才启用 `float32` 降精度。
+  - **启动参数可观测性增强**：`run.sh` 启动时新增打印 low-disk 运行参数，并增加 `paper.factor_setting_match`（检查 `factor.factors_per_hypothesis=3` 是否与论文复现基线一致）。
+- 2026-03-02:
+  - **因子过滤脚本归档**：将因子去重主脚本迁移到 `scripts/factor_filtering/select_factors.py`（专用目录）。
+  - **相关性去重防泄漏口径上线**：`scripts/factor_filtering/select_factors.py` 新增 `--sample-split train_valid|full`，默认 `train_valid`（仅使用 train+valid 估计去重相关性）。
+  - **回测安全脚本参数透传**：`scripts/run_backtest_safe.sh` 新增 `--dedup-sample-split` 并写入 summary/pid 元数据。
+  - **两阶段去重落地**：默认 `--dedup-method two_stage`，执行 Stage-1（暴露相关粗筛）+ Stage-2（IC 序列相关精筛）。
+  - **聚类策略升级**：新增 `--dedup-linkage complete|connected`（默认 `complete`），替代单一连通分量逻辑。
+  - **冠军打分升级**：Stage-2 采用组合分数 `abs(mean_ic)*max(ir,0)*coverage*stability*capacity_penalty`。
+  - **交互入口一键预设**：`run_backtest_safe.sh --interactive` 在单库 custom 模式下新增“实盘去重预设”开关，可一键填充 two_stage 推荐参数。
+  - **交互入口新增 FILTER 模式**：`run_backtest_safe.sh --interactive` 第 1 步新增 `FILTER` 目标，仅执行“质量预筛 + 去重”并退出，输出 `experiment/quality_range/final_selected`，并将结果写入 `data/factorlib/selected/`。
+  - **Stage-1 截断口径修正**：`select_factors.py` 中 Stage-1 仅做粗去重池化，不再按 `--dedup-topn` 做全局截断；`--dedup-topn` 只在 Stage-2 后执行，避免早期损失多样性。
+- 2026-03-03:
+  - **安全回测配置收敛**：移除 `configs/backtest_limited.yaml`，`run_backtest_safe.sh` 在未显式传 `--config` 时统一使用 `configs/backtest.yaml`。
+  - **安全回测参数收敛**：移除 `--mode` 入口，资源控制统一通过 `--threads` 显式设置；`limited/performance` 双模式不再保留。
 
 ## 8. 使用规则（How to Maintain）
 

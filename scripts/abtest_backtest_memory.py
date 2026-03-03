@@ -11,8 +11,8 @@ into `sys.modules` before running the backtest, so you can compare current worki
 changes against the repo HEAD without requiring git checkout/stash.
 
 Usage:
-  uv run python scripts/abtest_backtest_memory.py baseline -- -c configs/backtest_limited.yaml --factor-source custom --factor-json data/factorlib/all_factors_library.json
-  uv run python scripts/abtest_backtest_memory.py optimized -- -c configs/backtest_limited.yaml --factor-source custom --factor-json data/factorlib/all_factors_library.json
+  uv run python scripts/abtest_backtest_memory.py baseline -- -c configs/backtest.yaml --factor-source custom --factor-json data/factorlib/all_factors_library.json
+  uv run python scripts/abtest_backtest_memory.py optimized -- -c configs/backtest.yaml --factor-source custom --factor-json data/factorlib/all_factors_library.json
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ def _usage() -> None:
         "  python scripts/abtest_backtest_memory.py <baseline|optimized> -- <backtest args...>\n"
         "\n"
         "Example:\n"
-        "  uv run python scripts/abtest_backtest_memory.py baseline -- -c configs/backtest_limited.yaml --factor-source custom --factor-json data/factorlib/all_factors_library.json\n"
+        "  uv run python scripts/abtest_backtest_memory.py baseline -- -c configs/backtest.yaml --factor-source custom --factor-json data/factorlib/all_factors_library.json\n"
     )
 
 
@@ -132,4 +132,3 @@ def main(argv: List[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv))
-

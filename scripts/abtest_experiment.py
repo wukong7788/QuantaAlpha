@@ -133,12 +133,22 @@ def _extract_metrics_from_run_log(run_log: Path) -> Dict[str, Any]:
     step_time_p90_s = {k: round(_p90(v), 3) for k, v in step_time_s.items()}
 
     # Common JSON instability signals (case-insensitive substring counts).
+    #
+    # NOTE: QuantaAlpha logs often emit structured events like:
+    #   {"event": "llm_json_response_issue", "issue": "json_fix_failed", ...}
+    # so we must match both legacy "json fix failed" wording and underscore-style issue names.
     lowered = text.lower()
+
+    def _count_any(*needles: str) -> int:
+        return sum(lowered.count(n) for n in needles if n)
+
     json_fail_counts = {
-        "json_parse_failed": lowered.count("json parse failed"),
-        "json_fix_failed": lowered.count("json fix failed"),
-        "json_fix_success": lowered.count("json fix success"),
-        "empty_json_response": lowered.count("empty response"),
+        "json_parse_failed": _count_any("json parse failed", "json_parse_failed"),
+        "json_fix_failed": _count_any("json fix failed", "json_fix_failed"),
+        "json_fix_success": _count_any("json fix success", "json_fix_success"),
+        "empty_json_response": _count_any("empty response", "empty_response"),
+        # Additional signal used by some runtimes (not always surfaced as a parse failure).
+        "json_boundary_missing": _count_any("json boundary missing", "json_boundary_missing"),
     }
 
     return {

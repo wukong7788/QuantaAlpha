@@ -55,6 +55,7 @@ These terms are easy to mix up during paper reproduction and performance optimiz
 - Use first-principles reasoning: keep the simplest structure that satisfies the real user goal.
 - If requirements are ambiguous, ask the user for clarification before implementing structural changes.
 - If the user is brainstorming or "just want to discuss options", provide a concrete proposal first and do not start modifying code/files until the user explicitly asks to implement.
+- Process lifetime guardrail: only add `timeout` to short-lived diagnostic/probing commands. Do not apply `timeout` by default to long-running experiment/backtest/data jobs unless the user explicitly requests a hard stop.
 
 ## Documentation Hygiene (non-spec docs)
 
@@ -106,7 +107,7 @@ Scope: human-facing entry scripts used in day-to-day operation.
 1. Confirm `.env` + `.venv` are ready.
 2. Run `./run.sh "方向" "suffix"` (low-disk ON by default; see flag table below).
 3. Check printed `EXPERIMENT_ID`, `WORKSPACE_PATH`, and log output.
-4. Relay/resume semantics (`--relay` and `--resume` are mutually exclusive): first relay leg uses chunk (`QUANTA_RELAY_CHUNK_ROUNDS`, default 5), later leg auto-finishes to `max_rounds`; `--resume` requires existing `evolution_state.json` and fails fast if missing.
+4. Relay/resume semantics (`--relay` and `--resume` are mutually exclusive): first relay leg uses chunk (`QUANTA_RELAY_CHUNK_ROUNDS`, default follows `evolution.relay_chunk_rounds`, current main config is 6), later leg auto-finishes to `max_rounds`; `--resume` requires existing `evolution_state.json` and fails fast if missing.
 5. Round terminology: `evolution.max_rounds` uses **phase-round** (each phase completion increments `round`), not “epoch=original+mutation+crossover”.
 6. Fine-grained resume: on restart via `--relay/--resume`, each task directory will resume from the latest `__session__` snapshot and continue from the next unfinished step (within the 5-step loop). If the task enters an “empty-factor retry attempt”, it will re-run fresh (not resume the previous attempt).
 7. Naming safety: change both `EXPERIMENT_ID` and suffix for a new run; reusing suffix appends to same `all_factors_library_<suffix>.json`.
@@ -120,7 +121,7 @@ Scope: human-facing entry scripts used in day-to-day operation.
 | `--zoo-dedup` | — | Skip expressions in `factor_zoo.csv`; auto-update zoo after run |
 | `--rounds N` | — | Override `evolution.max_rounds` without editing yaml (temp config) |
 
-Env: `QUANTA_RELAY_CHUNK_ROUNDS` (default 5), `QUANTA_FACTOR_ZOO_PATH`, `EXPERIMENT_ID`.
+Env: `QUANTA_RELAY_CHUNK_ROUNDS` (overrides config value), `QUANTA_FACTOR_ZOO_PATH`, `EXPERIMENT_ID`.
 
 
 ### 2) Smoke pipeline: `minirun.sh`
@@ -134,9 +135,9 @@ Env: `QUANTA_RELAY_CHUNK_ROUNDS` (default 5), `QUANTA_FACTOR_ZOO_PATH`, `EXPERIM
 ### 3) Offline/safe backtest: `scripts/run_backtest_safe.sh`
 
 1. Start wizard with `./scripts/run_backtest_safe.sh --interactive` (or pass `--library ...` directly).
-2. In wizard step 1, choose one concrete experiment library / `BOB` / `VIEW` (horizontal compare).
+2. In wizard step 1, choose one concrete experiment library / `BOB` / `VIEW` (horizontal compare) / `FILTER` (filter-only preview, no backtest).
 3. Script applies defaults automatically (BOB defaults: `grade=sa`, `top=50`) and starts without extra confirm.
-4. Check run summary and logs under `log/backtest_manual/` (BOB `auto` metric resolves one global metric before ranking and writes `metric_resolved`; temp files are cleaned up on normal/early exit).
+4. Check run summary and logs under `log/backtest_manual/` (BOB `auto` metric resolves one global metric before ranking and writes `metric_resolved`; FILTER mode writes preview library/report under `data/factorlib/selected/`; temp files are cleaned up on normal/early exit).
 
 ### 4) Safe cleanup: `scripts/safe_cleanup.sh` (wrapper of `scripts/safe_cleanup.py`)
 
@@ -226,7 +227,7 @@ Qlib data path must contain:
   - `--max-factors <N|all|default>`
   - `N`: use top N custom factors
   - `all`: set `factor_source.custom.max_factors=null`
-  - `default`: keep config value (`backtest_limited.yaml` is typically 50)
+  - `default`: keep config value (default base config is `configs/backtest.yaml`)
 - Script behavior:
   - generates a temporary config (when override is set),
   - writes full run logs under `log/backtest_manual/`,
@@ -288,7 +289,7 @@ Used in local automation:
 ## Recommended Workflow
 
 1. **冒烟验证**：`./minirun.sh --low-disk "价量因子测试" "smoke_test"`
-2. **安全模式（11 轮）**：`CONFIG=configs/experiment_full_11.yaml ./run.sh --low-disk --relay --zoo-dedup "价量因子挖掘" "r3"`
+2. **安全模式（11 轮）**：`./run.sh --rounds 11 --low-disk --relay --zoo-dedup "价量因子挖掘" "r3"`
 3. **土豪模式（23 轮）**：  
-   `./scripts/safe_cleanup.sh` → `EXPERIMENT_ID="paper_repro_23r" QUANTA_RELAY_CHUNK_ROUNDS=6 ./run.sh --rounds 23 --low-disk --relay --zoo-dedup "价量因子挖掘" "paper_repro_23r"`
+   `./scripts/safe_cleanup.sh` → `EXPERIMENT_ID="paper_repro_23r" ./run.sh --rounds 23 --low-disk --relay --zoo-dedup "价量因子挖掘" "paper_repro_23r"`
 4. **独立回测**：`./scripts/run_backtest_safe.sh --interactive`

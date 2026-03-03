@@ -16,7 +16,7 @@ from quantaalpha.log import logger
 from quantaalpha.factors.regulator.factor_regulator import FactorRegulator
 from quantaalpha.core.exception import FactorEmptyError
 
-DEFAULT_HISTORY_LIMIT = 4
+DEFAULT_HISTORY_LIMIT = 6
 MIN_HISTORY_LIMIT = 1
 MAX_RETRY_SUMMARY_ITEMS = 3
 MAX_RETRY_BAD_EXAMPLE_CHARS = 180

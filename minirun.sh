@@ -1,6 +1,6 @@
 #!/bin/bash
 # Minimal full-flow smoke run for QuantaAlpha.
-# - Uses lightweight config (configs/experiment_smoke.yaml)
+# - Uses lightweight smoke config (configs/experiment_smoke.yaml)
 # - Runs one complete 5-step loop (propose/construct/calculate/backtest/feedback)
 # - Tags artifacts for easy cleanup later
 

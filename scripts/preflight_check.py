@@ -117,7 +117,7 @@ def check_experiment(cfg_path: Path) -> int:
     return 0
 
 
-def check_backtest(cfg_path: Path, mode: str, factor_source: str) -> int:
+def check_backtest(cfg_path: Path, factor_source: str) -> int:
     cfg = _load_yaml(cfg_path)
     factor_cfg = cfg.get("factor_source") or {}
     custom = factor_cfg.get("custom") or {}
@@ -136,17 +136,14 @@ def check_backtest(cfg_path: Path, mode: str, factor_source: str) -> int:
                 "custom.max_factors is set but custom.ranking_metric is empty; "
                 "topN will depend on JSON insertion order."
             )
-        if mode == "limited" and qf in (None, "", "null"):
-            _warn(
-                "custom.quality_filter is empty. Safe script prefilter should be enabled "
-                "to apply quality-first selection before topN."
-            )
+        if qf in (None, "", "null"):
+            _warn("custom.quality_filter is empty.")
 
     threads = _to_int(model_params.get("num_threads"), -1)
-    if mode == "limited" and threads > 8:
+    if threads > 8:
         _warn(
-            f"model.params.num_threads={threads} looks high for limited mode; "
-            "consider lower thread count for stability."
+            f"model.params.num_threads={threads} looks high for local runs; "
+            "consider lowering threads for stability."
         )
 
     _info("Backtest preflight completed (warn-only).")
@@ -163,12 +160,6 @@ def main() -> int:
     p_bt = subparsers.add_parser("backtest", help="Check backtest config")
     p_bt.add_argument("--config", required=True, help="Path to backtest config YAML")
     p_bt.add_argument(
-        "--mode",
-        default="limited",
-        choices=["limited", "performance"],
-        help="Run mode context",
-    )
-    p_bt.add_argument(
         "--factor-source",
         default="custom",
         choices=["custom", "combined", "alpha158", "alpha158_20", "alpha360"],
@@ -180,9 +171,7 @@ def main() -> int:
     try:
         if args.command == "experiment":
             return check_experiment(_resolve_config_path(args.config))
-        return check_backtest(
-            _resolve_config_path(args.config), args.mode, args.factor_source
-        )
+        return check_backtest(_resolve_config_path(args.config), args.factor_source)
     except Exception as exc:
         _warn(f"Preflight check failed unexpectedly: {exc}")
         return 0

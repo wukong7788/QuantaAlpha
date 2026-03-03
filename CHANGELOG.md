@@ -1,5 +1,56 @@
 # Changelog
 
+## 2026-03-03
+
+### Changed
+- Simplified safe backtest config layout:
+  - Removed `configs/backtest_limited.yaml`.
+  - `scripts/run_backtest_safe.sh` now uses `configs/backtest.yaml` by default unless `--config` is explicitly provided.
+- Simplified safe backtest runtime controls:
+  - Removed `--mode` from `scripts/run_backtest_safe.sh`.
+  - Resource control now uses explicit `--threads <N>`.
+
+## 2026-03-02
+
+### Changed
+- Restored factor proposal history window default to the initial value:
+  - `DEFAULT_HISTORY_LIMIT` changed from `4` back to `6`.
+  - This keeps O3 "history window optimization" disabled by default while preserving compact retry-summary feedback.
+- Updated correlation de-dup sampling scope to prevent test leakage:
+  - Dedup selector moved to `scripts/factor_filtering/select_factors.py`.
+  - `select_factors.py` supports `--sample-split train_valid|full` and defaults to `train_valid`.
+  - Stage metadata now includes sample window fields and linkage/method details.
+- Implemented two-stage dedup pipeline:
+  - Stage-1 exposure correlation coarse filter.
+  - Stage-2 IC-series correlation fine filter.
+  - New method switch: `--dedup-method stage1|two_stage` (default `two_stage`).
+- Upgraded clustering and ranking in dedup:
+  - New linkage switch: `--dedup-linkage complete|connected` (default `complete`).
+  - Stage-2 champion score upgraded to composite:
+    `abs(mean_ic)*max(ir,0)*coverage*stability*capacity_penalty`.
+- Updated safe backtest wrapper for dedup split control:
+  - `scripts/run_backtest_safe.sh` now supports:
+    - `--dedup-sample-split <train_valid|full>`
+    - `--dedup-method <stage1|two_stage>`
+    - `--dedup-linkage <complete|connected>`
+    - `--dedup-stage2-corr-threshold <T>`
+  - Run summary and PID metadata now include method/linkage/stage2 threshold fields.
+- Updated interactive backtest entry:
+  - `scripts/run_backtest_safe.sh --interactive` now includes a one-click production dedup preset in single-library custom mode.
+  - Preset values: `corr_dedup=true`, `dedup_method=two_stage`, `dedup_linkage=complete`, `sample_split=train_valid`, `topn=50`, `per_cluster=1`, `corr_threshold=0.8`, `stage2_corr_threshold=0.8`, `sample_size=12000`, `compute_missing=true`.
+  - Step-1 target now includes `FILTER` (`factors-filter`): run filter pipeline only (no backtest), print concise filter summary, and save outputs to `data/factorlib/selected/`.
+- Simplified FILTER-mode output naming and summary:
+  - FILTER quick summary now emphasizes only `experiment`, `quality_range`, and final selected count.
+  - FILTER result file naming is now concise and experiment-bound:
+    `<experiment>_factors_filter_q<quality>_n<count>_<timestamp>.json`.
+  - Stable alias remains `<experiment>_factors_filter_latest.json` for backtest re-use.
+- Added filter-only CLI mode in safe script:
+  - `--factors-filter` forces custom dedup path, skips backtest, and writes preview artifacts for quick inspection.
+- Corrected Stage-1 truncation behavior in dedup:
+  - Stage-1 no longer applies global TopN truncation.
+  - `--dedup-topn` is now applied only after Stage-2 selection.
+  - This preserves cross-cluster diversity before IC-series fine filtering.
+
 ## 2026-02-26
 
 ### Added
@@ -117,6 +168,22 @@
   - `llm.json_mode_response_format=json_object`
 - Reverted temperature-split default after A/B (STEP_N=3) showed worse wall-time:
   - default keeps `llm.json_mode_temperature=0.5` aligned with `llm.freeform_temperature=0.5`
+
+### Removed
+- Removed redundant config file `experiment_full_11.yaml`; use `--rounds` with `configs/experiment.yaml` for 11-round relay runs.
+
+### Changed
+- Hardcoded full paper reproduction parameters into the default `experiment.yaml`:
+  - `factor.factors_per_hypothesis: 3`
+  - `evolution.max_rounds: 23`
+  - `evolution.relay_chunk_rounds: 6`
+- Restored `configs/experiment_smoke.yaml` and switched `minirun.sh` back to smoke-only config by default.
+- Changed low-disk precision default to keep `float64`:
+  - `QUANTA_LOW_DISK_FLOAT32` now defaults to `false` (including `--low-disk` mode)
+  - `float32` cast is now opt-in only via explicit env override
+- Enhanced `run.sh` startup paper-mode summary:
+  - prints low-disk runtime knobs (`QUANTA_LOW_DISK_MODE/FLOAT32/PARQUET_COMPRESSION/PURGE_*`)
+  - prints explicit `paper.factor_setting_match` status for `factors_per_hypothesis=3`
 
 ## 2026-02-25
 

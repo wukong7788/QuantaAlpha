@@ -1,11 +1,13 @@
-# TODO / Fix / 优化清单（含 A/B 结论）
+# TODO / Fix / 优化清单
 
-更新时间：2026-02-28
+更新时间：2026-03-03
 
 ## 背景
 
 在 relay / 常规运行日志中，部分因子候选会在 `factor_calculate` 因表达式语法/格式问题失败。
 这不是系统崩溃，但属于可规避的表达式格式问题。
+
+在离线回测中，也发现过因子池 JSON 内 `factor_name` 重名导致回测实际使用因子数少于请求数量的问题。
 
 ## 已修复（表达式稳定性）
 
@@ -44,73 +46,22 @@
 2. 不再出现由 `$var` 与 `var` 混用导致的新增语法失败。
 3. 与表达式语法相关的 `d/evolving feedback` false 决策显著下降。
 
----
+## 待确认 / 待修复（回测一致性）
 
-## 已落地的优化（做了什么 + 结果是什么）
+- [ ] Backtest: `factor_name` 重名导致因子列被覆盖，实际回测因子数 < library 数
+  - 现象：`success 350` 但 `Result DataFrame: (727818, 340)`（log: `log/backtest_manual/backtest_20260303_115808.log`）
+  - 根因：`CustomFactorCalculator.calculate_factors_batch()` 使用 `results[factor_name] = series` 作为 key，
+    当 `factor_name` 重复时会静默覆盖前一个因子。
+  - 影响：论文复现/AB test/指标对比会出现“名义 350 实际 340”的隐性偏差。
+  - 可选修复口径（需要明确策略）：
+    - A) 保留全部：对重复 name 自动重命名（例如：`<factor_name>__<factor_id>`），保证列唯一。
+    - B) 认为重名即同一因子：对重复 name 直接去重（只保留第一次/或按规则挑最好的一条）。
+    - C) Fail-fast：检测到重复 name 直接报错，要求上游因子池先处理命名/去重。
+  - 代码触点：`quantaalpha/backtest/custom_factor_calculator.py`
 
-说明：
-- 这里的“已落地”指仓库里已经有代码/配置支持（不代表都已 A/B 验证）。
-- A/B 结果只引用已在 `docs/performance_optimization_cn.md` 记录的跑数。
-
-### 已 A/B 验证（有明确正/负结果）
-
-1. **协议层强约束 JSON（3.13）**
-   - 开关：`configs/experiment.yaml -> llm.json_mode_strict` / `llm.json_mode_response_format`
-   - 结果：正优化（2026-02-28，`STEP_N=3`：`363.289s -> 334.619s`，差 `-28.670s` / `-7.9%`）
-   - 结论：**保留并默认开启**
-   - 参考：`docs/performance_optimization_cn.md` 的 **5.3 opt2**
-
-2. **Pre-calc cheap gate + exact 去重（3.11 + 3.15，绑在一起）**
-   - 开关：`quality_gate.cheap_filter_enabled` / `quality_gate.cheap_filter_require_acceptable`
-   - 结果：负优化（2026-02-28，`STEP_N=3`：`277.771s -> 415.958s`，差 `+138.187s` / `+49.8%`）
-   - 结论：**默认关闭**（仅建议在包含 backtest 的用例上另做 A/B，再决定是否开启）
-   - 参考：`docs/performance_optimization_cn.md` 的 **5.2 opt1**
-
-3. **上下文瘦身 / 历史窗口（3.2）**
-   - 开关：`quantaalpha/factors/proposal.py -> DEFAULT_HISTORY_LIMIT`（需改代码；当前主分支固定为 4）
-   - 结果：本用例下未提速（2026-02-28，`STEP_N=3`：median `119.433s -> 123.209s`，差 `+3.776s` / `+3.16%`；两组 JSON 失败计数均为 0）
-   - 结论：暂不作为“提速优化”成立；已恢复原始固定窗口行为（不做运行时覆盖）；若目标是降 token/费用，**建议单独分支改代码再复测**
-   - 参考：`docs/performance_optimization_cn.md` 的 **5.4 opt3**
-
-4. **温度分层（json vs freeform）（3.18）**
-   - 开关：`llm.json_mode_temperature` / `llm.freeform_temperature`
-   - 结果：本用例下耗时变差（2026-02-28，`STEP_N=3`：median `169.201s -> 193.420s`，差 `+24.219s` / `+14.31%`；两组 JSON 失败计数均为 0）
-   - 结论：暂不作为“提速优化”成立；**默认不启用分层**；是否保留需在“JSON 不稳定/网络抖动明显”的用例上复测
-   - 参考：`docs/performance_optimization_cn.md` 的 **5.5 opt4**
-
-5. **第三轮：回测峰值内存优化尝试**
-   - 结果：负优化（峰值 RSS 上升），已回滚
-   - 结论：**不保留该轮优化代码**（保留 A/B 工具用于后续验证）
-   - 参考：`docs/performance_optimization_cn.md` 的 **10.3 A/B Test**
-
-6. **缓存格式升级（3.6，Parquet + ZSTD）**
-   - 开关：`configs/backtest*.yaml -> llm.cache_format/cache_compression/cache_dual_write_pkl`
-   - 结果：空间占用显著下降（无需每次都做 A/B；已有抽样体积对照）
-   - 结论：**保留并默认开启**（不改精度/逻辑时风险较低；读失败可回退到 `*.pkl`）
-   - 参考：`docs/performance_optimization_cn.md` 的 **5.1 3.6**
-
-7. **分支止损预算（3.10）**
-   - 开关：`quality_gate.max_construct_failures_per_branch` / `quality_gate.max_json_parse_failures_per_branch` / `evolution.max_empty_retries`
-   - 结果：负优化（2026-02-28，`STEP_N=3`：median `247.684s -> 274.327s`，差 `+26.643s` / `+10.76%`）
-   - 结论：**默认不收紧**（保持 `2 / 2 / 1`）；若复测建议切到更长链路并补充质量指标
-   - 参考：`docs/performance_optimization_cn.md` 的 **5.6 opt5**
-
-### 已落地但未系统性 A/B（先标清默认策略与风险）
-
-- **3.19 网络稳态（timeout/backoff/jitter/failover）**：已落地；默认开启；风险低-中（多在网络不稳时影响明显）。
-- **3.5 受控并行**：已落地；默认关闭；风险中（时序/外部服务导致漂移，且要看 16GB 峰值内存）。
-- **3.9 warm start（复用 trajectory pool）**：已支持；默认关闭（`fresh_start=true`）；风险高（搜索路径变）。
-- **3.7 动态预算 / 3.4 多保真筛选**：未落地（仅文档规划）。
-
----
-
-## 待优化 / 待 A/B（按建议顺序排列）
-
-说明：
-- 已在“已 A/B 验证”中明确判定为负优化且默认关闭/回滚的项（如 3.18、3.11+3.15、3.2、3.10）不再放入本待办列表。
-
-1. **网络稳态（3.19）**：主看长尾卡顿（p90/p99 step 耗时）是否下降；稳定网络下可能不显著。
-2. **受控并行（3.5）**：主看吞吐（tasks/hour）提升 vs 稳定性（OOM/失败率/峰值内存/交换）。
-3. **warm start（3.9）**：对照 `fresh_start=true/false`，主看“收敛速度 vs 多样性”。
-4. **动态预算（3.7）**：未落地（需要先定义预算/分配策略与质量护栏）。
-5. **多保真筛选（3.4）**：未落地（需要先定义保真层级与误杀护栏）。
+- [ ] Backtest: `CustomFactorCalculator.calculate_factors_batch()` 内置硬编码超时（`signal.alarm(120)`）
+  - 现象：慢但有效的因子可能被判定为 `timeout` 而丢弃；不同运行方式（主线程 vs 子线程）行为不一致。
+  - 根因：超时逻辑依赖 `signal.SIGALRM`，在非主线程会抛 `ValueError` 并被忽略；不同平台/环境可用性不同。
+  - 影响：同一因子库在不同机器/执行方式下可能产生不同的“最终因子集合”（影响回测可复现性）。
+  - 建议：将超时改为可配置（例如 env `QUANTA_FACTOR_COMPUTE_TIMEOUT_S`）或默认关闭，仅在诊断/卡死排查时启用。
+  - 代码触点：`quantaalpha/backtest/custom_factor_calculator.py`

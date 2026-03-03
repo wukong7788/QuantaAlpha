@@ -81,7 +81,7 @@ class QlibFactorRunner(CachedRunner[QlibFactorExperiment]):
         """
         low_disk_mode = str(os.getenv("QUANTA_LOW_DISK_MODE", "0")).lower() in ("1", "true", "yes", "on")
         low_disk_float32 = str(
-            os.getenv("QUANTA_LOW_DISK_FLOAT32", "true" if low_disk_mode else "false")
+            os.getenv("QUANTA_LOW_DISK_FLOAT32", "false")
         ).lower() in ("1", "true", "yes", "on")
         low_disk_purge_parquet = str(
             os.getenv("QUANTA_LOW_DISK_PURGE_PARQUET", "true" if low_disk_mode else "false")
