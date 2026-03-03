@@ -328,6 +328,20 @@ QUANTA_FORCE_RELAY_RESUME=1 EXPERIMENT_ID="paper_repro_r2" ./run.sh --relay "价
 ./scripts/run_doctor.sh --experiment-id paper_repro_r2
 ```
 
+### 4.6 因子库总览 / 合并助手
+
+使用交互脚本管理历史 `all_factors_library*.json`：
+
+```bash
+./scripts/run_factors.sh
+```
+
+交互选项：
+- `1` 列表汇总（`n`、`H/M/L`、`ARR(p50)`）。
+- `2` 按 id 删除（支持 `1+3+5`）。
+- `3` 按 id 合并（支持 `1+2` 和 `all`），可选 `zoo-method=ast|norm|both|none`，输出文件自动命名为 `<prefix>_n<count>_<timestamp>.json`，完成后打印合并库汇总（`n`、`H/M/L`）和 `FACTOR_CoSTEER_FACTOR_ZOO_PATH` 导出提示。
+- `5` 按 id 执行可观测过滤流水线（`stage0→stage3`，支持 `all`），可选导出 `stage0|stage1|stage2|stage3|all`，产物文件名带 `n + 时间戳 + stage` 后缀，并生成 `manifest.json` 便于阶段对比。固定默认：`expr_dedup=ast`、`stage3_topn=all`、输出前缀 `data/factorlib/selected/<source>_filter_pipeline`（不再额外交互）。
+
 ### 5. 独立回测
 
 挖掘完成后，从因子库中组合因子进行全周期回测：

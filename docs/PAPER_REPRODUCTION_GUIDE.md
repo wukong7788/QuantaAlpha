@@ -20,6 +20,11 @@
 ## 2. 快速启动与复现脚本 (Quick Start Scripts)
 
 为了方便直接运行复现，本仓库提供了三个层级的启动脚本。您可以直接复制对应的命令到终端执行。
+此外，复现后建议使用 `./scripts/run_factors.sh` 做因子库管理：
+- `1` 列表汇总（`n`、`H/M/L`、`ARR(p50)`）
+- `2` 按 id 删除（支持 `1+3+5`）
+- `3` 按 id 合并（支持 `1+2` 或 `all`；可选 `zoo-method=ast|norm|both|none`，输出文件自动带 `n` 和时间戳，并输出 `FACTOR_CoSTEER_FACTOR_ZOO_PATH` 导出提示）
+- `5` 按 id 执行可观测过滤流水线（`stage0→stage3`；可选只导出某个 stage 或 all，输出带 stage 后缀，并生成 `manifest.json`；默认固定 `expr_dedup=ast`、`stage3_topn=all` 与标准输出前缀）
 
 ### 脚本 0：冒烟测试 — 优先跑这一步（`minirun.sh`）
 

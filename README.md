@@ -336,6 +336,20 @@ Note on restricted/sandboxed environments (including some Codex runtimes):
 ./scripts/run_doctor.sh --experiment-id paper_repro_r2
 ```
 
+### 4.6 Factor Library Inspector / Merge
+
+Use the interactive helper to manage historical `all_factors_library*.json` files:
+
+```bash
+./scripts/run_factors.sh
+```
+
+Interactive options:
+- `1` list library summary (`n`, `H/M/L`, `ARR(p50)`).
+- `2` delete libraries by id (supports `1+3+5`).
+- `3` merge libraries by id (supports `1+2` and `all`), choose `zoo-method=ast|norm|both|none`, output file auto-named as `<prefix>_n<count>_<timestamp>.json`, then print merged summary (`n`, `H/M/L`) and export hint for `FACTOR_CoSTEER_FACTOR_ZOO_PATH`.
+- `5` run observable filter pipeline (`stage0→stage3`) by ids (supports `all`), choose output stage (`stage0|stage1|stage2|stage3|all`), save files with `n + timestamp + stage` suffix, and generate `manifest.json` for per-stage comparison. Defaults are fixed to `expr_dedup=ast`, `stage3_topn=all`, and output prefix `data/factorlib/selected/<source>_filter_pipeline`.
+
 ### 5. Independent Backtesting
 
 After mining, combine factors from the library for a full-period backtest:

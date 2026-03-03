@@ -1,6 +1,6 @@
 # TODO / Fix / 优化清单
 
-更新时间：2026-03-03
+更新时间：2026-03-04
 
 ## 背景
 
@@ -48,16 +48,17 @@
 
 ## 待确认 / 待修复（回测一致性）
 
-- [ ] Backtest: `factor_name` 重名导致因子列被覆盖，实际回测因子数 < library 数
+- [x] Backtest: `factor_name` 重名不再覆盖列（自动改名保留全部）
   - 现象：`success 350` 但 `Result DataFrame: (727818, 340)`（log: `log/backtest_manual/backtest_20260303_115808.log`）
-  - 根因：`CustomFactorCalculator.calculate_factors_batch()` 使用 `results[factor_name] = series` 作为 key，
-    当 `factor_name` 重复时会静默覆盖前一个因子。
-  - 影响：论文复现/AB test/指标对比会出现“名义 350 实际 340”的隐性偏差。
-  - 可选修复口径（需要明确策略）：
-    - A) 保留全部：对重复 name 自动重命名（例如：`<factor_name>__<factor_id>`），保证列唯一。
-    - B) 认为重名即同一因子：对重复 name 直接去重（只保留第一次/或按规则挑最好的一条）。
-    - C) Fail-fast：检测到重复 name 直接报错，要求上游因子池先处理命名/去重。
-  - 代码触点：`quantaalpha/backtest/custom_factor_calculator.py`
+  - 处理口径：A) 保留全部。对重复 name 自动重命名（`<factor_name>__<factor_id>`），保证列唯一。
+  - 落点：
+    - `quantaalpha/backtest/custom_factor_calculator.py`：`calculate_factors_batch()` 内部统一通过唯一 `factor_key` 写入结果列。
+    - 单测：`tests/backtest/test_custom_factor_calculator_duplicate_factor_name.py`
+
+- [x] Backtest: 修复 cache index 不一致导致 `pd.DataFrame(results)` 触发巨大 union index（内存暴涨）
+  - 现象：MD5 cache 仅按表达式哈希命中；不同 run 的市场/区间可能导致缓存因子 index 不同，`DataFrame(results)` 会构造 union index（峰值 RSS 上升）。
+  - 处理口径：以当前回测的 `target_index` 为准，对 cache 命中结果先对齐并强制 `DataFrame(..., index=target_index)` 输出，避免 union index 扩张。
+  - 落点：`quantaalpha/backtest/custom_factor_calculator.py`：`calculate_factors_batch()`（`target_index` + 强制输出 index；注释含 “blow up memory by constructing a huge union index”）。
 
 - [ ] Backtest: `CustomFactorCalculator.calculate_factors_batch()` 内置硬编码超时（`signal.alarm(120)`）
   - 现象：慢但有效的因子可能被判定为 `timeout` 而丢弃；不同运行方式（主线程 vs 子线程）行为不一致。
@@ -65,3 +66,12 @@
   - 影响：同一因子库在不同机器/执行方式下可能产生不同的“最终因子集合”（影响回测可复现性）。
   - 建议：将超时改为可配置（例如 env `QUANTA_FACTOR_COMPUTE_TIMEOUT_S`）或默认关闭，仅在诊断/卡死排查时启用。
   - 代码触点：`quantaalpha/backtest/custom_factor_calculator.py`
+
+- [ ] 交互回测流程：优先在 `scripts/run_backtest_safe.sh` 内自动接入 Zoo 路径，不依赖 `run.sh` 和手动 `export`
+  - 目标：用户后续可直接用 `run_backtest_safe.sh` 完成回测与去重相关配置，无需手动声明 `FACTOR_CoSTEER_FACTOR_ZOO_PATH`。
+  - 现状痛点：当前 Zoo 路径通常在 `run.sh --zoo-dedup` 或手动 `export` 下生效，离线回测脚本链路可用性不够顺滑。
+  - 建议方向：
+    - 在 `run_backtest_safe.sh` 增加“使用 merged zoo（ast/norm）”交互项或参数；
+    - 自动解析最近一次合并产物（如 `data/factorlib/merged/*_zoo*.csv`）并注入环境；
+    - 在运行摘要中明确打印最终生效的 Zoo CSV 路径。
+  - 代码触点：`scripts/run_backtest_safe.sh`、`scripts/run_factors.sh`（可选联动）。

@@ -88,6 +88,22 @@ STEP_N=5 ./minirun.sh
 ./scripts/run_doctor.sh
 ./scripts/run_doctor.sh --experiment-id paper_repro_r2
 
+# 因子库总览（历史 all_factors_library*.json 汇总）
+./scripts/run_factors.sh
+# 交互选项：
+# - 1: 列表（显示 n + H/M/L + ARR(p50)）
+# - 2: 按 id 删除（支持 1+3+5）
+# - 3: 按 id 合并（支持 1+2 或 all；可选 zoo-method=ast|norm|both|none）
+#   合并输出文件自动带因子数+时间戳：<prefix>_n<count>_<YYYYMMDD_HHMMSS>.json
+#   合并后会输出 merged 库摘要（n + H/M/L），并打印可直接 export 的 Zoo 路径。
+#   FACTOR_CoSTEER_FACTOR_ZOO_PATH 用于指向去重基准 Zoo CSV（FactorRegulator 读取该文件做跨轮次表达式去重）。
+# - 5: 过滤流水线（stage0→stage3，可观测）
+#   - 输入支持单库或多库 ids（含 all；多库先聚合成总因子池）
+#   - Stage0 全量池、Stage1 公式去重、Stage2 暴露相关去重、Stage3 IC 序列去重
+#   - 固定默认：Stage1 expr dedup = ast，Stage3 topn = all，输出前缀 = data/factorlib/selected/<source>_filter_pipeline（交互不再单独询问这三项）
+#   - 可选仅导出某个 stage 或 all；产物文件名带 n + 时间戳 + stage 后缀
+#   - 同时产出 manifest.json，记录每阶段 input/kept/dropped/reasons/path 便于横向对照
+
 # 可控并行（建议 8 核机器先用 2）
 # configs/experiment.yaml
 # evolution.parallel_enabled: true
@@ -121,6 +137,27 @@ STEP_N=5 ./minirun.sh
 .venv/bin/python scripts/update_factor_zoo.py build    # 全量重建
 .venv/bin/python scripts/update_factor_zoo.py update   # 增量上传最新实验
 .venv/bin/python scripts/update_factor_zoo.py status   # 查看 zoo 状态
+
+# 多轮因子池合并（不做 Top；输出 pool + Zoo（norm/ast）用于 A/B）
+.venv/bin/python scripts/factor_filtering/merge_factor_libraries.py \
+  --libraries "data/factorlib/all_factors_library_*.json" \
+  --out data/factorlib/merged/factor_pool_all.json \
+  --zoo-method both --skip-unparsable
+
+# 分阶段过滤名单（全量对照 + stage1(expr) + stage2(exposure) + stage3(IC)）
+.venv/bin/python scripts/factor_filtering/select_factors.py \
+  --library data/factorlib/merged/factor_pool_all.json \
+  --config configs/backtest.yaml \
+  --expr-dedup-method norm \
+  --out-stage1 data/factorlib/selected/factor_pool_all_stage1_expr.json \
+  --out-stage2 data/factorlib/selected/factor_pool_all_stage2_exposure.json \
+  --out data/factorlib/selected/factor_pool_all_stage3_final.json \
+  --dedup-method two_stage --cluster-linkage complete --per-cluster 1 --topn 80 --compute-missing
+
+# 缓存修复（删除坏缓存 + 重算）
+.venv/bin/python scripts/factor_filtering/repair_factor_cache.py \
+  --library data/factorlib/merged/factor_pool_all.json \
+  --warm-cache --delete-invalid --recompute-missing --recompute-invalid --apply
 
 # 23 轮完整复现(土豪模式， relay 接力 4 次)
 EXPERIMENT_ID="paper_repro_23r" QUANTA_RELAY_CHUNK_ROUNDS=6 ./run.sh --rounds 23 --low-disk --relay --zoo-dedup "价量因子挖掘" "paper_repro_23r"
@@ -202,6 +239,10 @@ EXPERIMENT_ID="paper_repro_23r" QUANTA_RELAY_CHUNK_ROUNDS=6 ./run.sh --rounds 23
 - 2026-03-03:
   - **安全回测配置收敛**：移除 `configs/backtest_limited.yaml`，`run_backtest_safe.sh` 在未显式传 `--config` 时统一使用 `configs/backtest.yaml`。
   - **安全回测参数收敛**：移除 `--mode` 入口，资源控制统一通过 `--threads` 显式设置；`limited/performance` 双模式不再保留。
+  - **多轮因子池合并 + Zoo A/B**：新增 `scripts/factor_filtering/merge_factor_libraries.py`，可合并多库为 pool，并生成 `norm/ast` 两种 Zoo CSV/JSON 供新实验名单过滤。
+  - **过滤分阶段导出**：`scripts/factor_filtering/select_factors.py` 新增 `--expr-dedup-method`（Stage-0 表达式去重）与 `--out-stage1/--out-stage2`（导出 stage1/2 名单）用于对照。
+  - **缓存修复脚本**：新增 `scripts/factor_filtering/repair_factor_cache.py`（删除坏缓存 + 重算）。
+  - **回测重名列不覆盖**：统一采用“自动改名保留全部”（`<factor_name>__<factor_id>`）策略，并增加回归测试覆盖。
 
 ## 8. 使用规则（How to Maintain）
 

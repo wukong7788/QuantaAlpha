@@ -1,280 +1,210 @@
-# 因子去重系统（面向量化基金实盘）
+# 因子合并与过滤工程说明（`run_factors.sh`）
 
-## 1. 目标与范围
+## 1. 文档目的
 
-本文档基于 QuantaAlpha 当前代码的**真实可用能力**，给出一套可落地的因子去重方案，目标是：
+本文档只记录两类工程能力：
 
-1. 降低重复表达式与高相关因子进入实盘池，减少拥挤交易和回撤同质化风险。
-2. 降低重复计算和无效回测成本，提高挖掘-回测效率。
-3. 在 16GB 级别研发机上可稳定执行，不依赖额外大规模基础设施。
+1. 多个因子库的合并（含 Zoo 产物）
+2. 因子过滤流水线与缓存重算
 
-本文不定义“全新系统重写”，只描述项目中已经存在并可直接调用的链路。
+统一快速入口是：
 
-## 1.1 文件位置（当前）
+```bash
+./scripts/run_factors.sh
+```
 
-当前“因子过滤系统”相关文件位置：
-
-1. 主脚本：`scripts/factor_filtering/select_factors.py`
-2. 主文档：`docs/factors_filter_system.md`
-
-说明：
-
-1. `scripts/run_backtest_safe.sh` 仍是统一交互入口（不迁移），内部调用上述主脚本完成去重筛选。
+不包含独立回测执行说明（`run_backtest_safe.sh` 不在本文档范围内）。
 
 ---
 
-## 2. 独立回测阶段（优先执行）
-
-### 2.1 独立回测阶段（当前可执行基线）
+## 2. 快速上手（交互入口）
 
 ```bash
-BACKTEST_MIN_QUALITY=high ./scripts/run_backtest_safe.sh \
-  --library data/factorlib/all_factors_library_prod_dedup_v1.json \
-  --factor-source custom \
-  --threads 6 \
-  --max-factors 120 \
-  --corr-dedup \
-  --dedup-method two_stage \
-  --dedup-linkage complete \
-  --dedup-topn 60 \
-  --dedup-per-cluster 1 \
-  --dedup-corr-threshold 0.8 \
-  --dedup-stage2-corr-threshold 0.8 \
-  --dedup-sample-size 12000 \
-  --dedup-sample-split train_valid \
-  --dedup-compute-missing
+./scripts/run_factors.sh
 ```
 
-解释：
+核心选项：
 
-1. `--dedup-per-cluster 1`：强约束多样性，更贴近实盘去拥挤需求。
-2. `--dedup-topn`：控制最终可交易因子池规模。
-3. `BACKTEST_MIN_QUALITY=high`：启用质量预筛（`high|medium|low|off|auto`），不显式设置时默认 `off`。
-4. `--dedup-compute-missing`：降低因缓存缺失导致的筛选偏差（但会更慢）。
-5. `--dedup-sample-split train_valid`：去重相关性估计仅用 train+valid，避免 test 泄漏。
-
-### 2.2 独立回测阶段（升级路线，结合基金实践）
-
-以下是“专业意见”与当前项目结合后的优先级路线：
-
-1. `P0` 防止筛选时间泄漏
-   - `已完成`：默认 `sample_split=train_valid`，仅用 train+valid 估计去重相关性。
-2. `P1` 二阶段去重
-   - `已完成`：默认 `dedup_method=two_stage`，Stage-1 粗筛后执行 Stage-2 IC 序列精筛。
-3. `P1` 聚类逻辑升级
-   - `已完成`：支持 `dedup_linkage=complete|connected`，默认 `complete`。
-4. `P1` 冠军打分升级
-   - `已完成`：Stage-2 使用组合分数 `abs(mean_ic)*max(ir,0)*coverage*stability*capacity_penalty`。
-5. `P2` 可选增强
-   - 对最终候选做小规模残差化复检（仅 Top-M），进一步降低共线暴露。
-
-### 2.3 只看过滤结果（不跑回测）
-
-用于快速确认“当前过滤系统最后会剩多少因子”：
-
-```bash
-BACKTEST_MIN_QUALITY=high ./scripts/run_backtest_safe.sh \
-  --factors-filter \
-  --library data/factorlib/all_factors_library_prod_dedup_v1.json
-```
-
-输出会打印：
-
-1. `experiment`
-2. `quality_range`
-3. `final_selected`
-
-并在 `data/factorlib/selected/` 生成：
-
-1. 带参数快照：`<experiment>_factors_filter_q<quality>_n<count>_<timestamp>.json`
-2. 稳定别名：`<experiment>_factors_filter_latest.json`
-
-### 2.4 回测记录（过滤后 + 全量对照）
-
-用于在项目内快速追溯“过滤后因子池”与“未过滤全量因子池”的离线回测结果（以落盘产物为准）。
-
-#### 过滤后因子池（factors_filter_latest，正确）
-
-输入因子库：
-
-- `data/factorlib/selected/all_factors_library_paper_repro_23r2_factors_filter_latest.json`
-
-回测产物（2026-03-03 09:10:35 → 09:16:18，Asia/Shanghai）：
-
-- metrics: `data/results/backtest_v2_results/all_factors_library_paper_repro_23r2_factors_filter_latest_n147_20260303_091602_backtest_metrics.json`
-- num_factors: `147`
-- annualized_return: `0.0583299303`，information_ratio: `0.8639698829`，max_drawdown: `-0.1007734248`
+1. `1) [LIST]`：查看历史 `all_factors_library*.json` 概览
+2. `3) [MERGE]`：按 id 合并（支持 `1+2`、`all`）
+3. `4) [CACHE]`：按 id 做缓存修复（dry-run + apply）
 
 备注：
 
-- 2026-03-03 08:12:58 的上一轮复跑指标与本轮一致，故不重复记录。
-
-#### 未过滤全量（time_first350，暂不准）
-
-输入因子库：
-
-- `data/factorlib/selected/all_factors_library_paper_repro_23r2_time_first350_20260303_094011.json`
-
-回测产物（2026-03-03 11:58:08 → 12:11:49，Asia/Shanghai）：
-
-- metrics: `data/results/backtest_v2_results/all_factors_library_paper_repro_23r2_time_first350_20260303_094011_n350_20260303_121128_backtest_metrics.json`
-- num_factors（名义）: `350`
-- annualized_return: `0.0443788186`，information_ratio: `0.6943032461`，max_drawdown: `-0.1024480379`
-
-备注：
-
-- 该 350 因子回测由于 `factor_name` 重名覆盖问题，实际回测使用因子数可能小于 350，暂不作为严谨对比结论；细节与修复项见 [`todo-fix.md`](todo-fix.md)。
+- `FILTER（stage0→stage3）` 目前尚未整合进 `run_factors.sh`（后续会加），当前请直接调用：
+  - `scripts/factor_filtering/select_factors.py`
+  - 或使用 `scripts/run_backtest_safe.sh --factors-filter`（项目已有交互入口）
 
 ---
 
-## 3. 当前项目的三层去重链路（实际生效）
+## 3. 功能到 Python 脚本映射
 
-### Layer A：生成阶段 AST 去重（结构去重）
+### 3.1 合并（`3) [MERGE]`）
 
-生效位置：
+- 交互入口：`scripts/run_factors.sh`
+- 实际脚本：`scripts/factor_filtering/merge_factor_libraries.py`
+- 作用：
+  1. 多库聚合为一个 pool
+  2. 生成 Zoo（`norm` / `ast` / `both`）
+  3. 输出文件名自动带 `n + timestamp`
 
-- `quantaalpha/factors/proposal.py`
-- `quantaalpha/factors/coder/evaluators.py`
-- `quantaalpha/factors/regulator/factor_regulator.py`
+### 3.2 过滤流水线（未整合入 `run_factors.sh`）
 
-机制：
+- 交互入口：暂无（后续计划整合到 `scripts/run_factors.sh`）
+- 实际脚本：`scripts/factor_filtering/select_factors.py`
+- 作用：执行 `stage0→stage3` 并可选择输出某个 stage 或 all
+- 默认参数以 `select_factors.py` 的 CLI / `run_backtest_safe.sh` 的封装为准。
 
-1. 对表达式做 AST 匹配（`match_alphazoo`），计算 `duplicated_subtree_size`。
-2. 结合复杂度约束一起判定可接受性：
-   - duplication threshold
-   - free args ratio
-   - unique vars ratio
-   - symbol length
-   - base features count
-3. 若不通过，构造阶段要求模型重生表达式；编码评估阶段也会拒绝不合格表达式。
+### 3.3 缓存修复（`4) [CACHE]`）
 
-关键前提：
-
-- 要启用“跨历史因子库”的新颖性对比，必须提供 `factor_zoo.csv`。
-- 推荐通过 `run.sh --zoo-dedup` 自动设置：
-  - `FACTOR_CoSTEER_FACTOR_ZOO_PATH=data/factorlib/factor_zoo.csv`
-
----
-
-### Layer B：计算前 exact 去重（工程去重，避免重复算）
-
-生效位置：
-
-- `quantaalpha/pipeline/loop.py` 的 `_apply_precalc_quality_gate`
-
-机制：
-
-1. 在 `factor_calculate` 前加载“已见表达式集合”：
-   - 同后缀因子库 `data/factorlib/all_factors_library_<suffix>.json`
-   - 当前实验轨迹池 `trajectory_pool.json`
-2. 对候选表达式做标准化后 exact match。
-3. 重复表达式直接跳过（`duplicate_exact`），不进入 calculate/backtest。
-
-开关状态：
-
-- 由 `quality_gate.cheap_filter_enabled` 控制。
-- 当前主配置 `configs/experiment.yaml` 默认是 `false`（默认不开启）。
+- 交互入口：`scripts/run_factors.sh`
+- 实际脚本：`scripts/factor_filtering/repair_factor_cache.py`
+- 作用：
+  1. 扫描无效/缺失缓存
+  2. dry-run 预览
+  3. apply 时可删除坏缓存并重算
 
 ---
 
-### Layer C：回测前两阶段去重（Stage-1 粗筛 + Stage-2 精筛）
+## 4. 过滤流水线定义（可观测 0→3）
 
-生效入口：
+### Stage0：全量池
 
-- `scripts/run_backtest_safe.sh --corr-dedup`
-- 实际执行 `scripts/factor_filtering/select_factors.py`
+输入可以是：
 
-机制（当前实现）：
+1. 单个因子库
+2. 多库 ids（会先聚合成总池）
 
-1. Stage-1：从缓存/计算结果读取每个因子的暴露序列（采样 `date×instrument` 面板），做 Spearman 相关粗筛。
-   - 仅做“同簇压缩”，不做全局 TopN 截断（避免过早损失多样性）。
-2. Stage-2：对 Stage-1 候选计算日度 RankIC 序列，再做 IC 序列相关精筛。
-3. 聚类默认使用 complete-linkage（可切到 connected），降低链式连边误杀。
-4. 冠军评分在 Stage-2 使用组合分数：`abs(mean_ic)*max(ir,0)*coverage*stability*capacity_penalty`。
-5. 最终 TopN（`--dedup-topn`）仅在 Stage-2 之后执行。
+输出：`*_stage0.json`
 
-注意：
+### Stage1：公式去重
 
-- 默认 `--dedup-method two_stage`：Stage-1 暴露相关粗筛 + Stage-2 IC 序列相关精筛。
-- 仅支持 `--factor-source custom`。
-- 聚类支持 `complete|connected`，默认 `complete`。
-- 默认采样口径 `train_valid`（优先避免 test 泄漏）；可选 `full`。
+对表达式做指纹去重（当前默认 `ast`），同指纹只保留一条。
 
----
+输出：`*_stage1.json`
 
-## 4. 实盘推荐基线（建议直接执行）
+### Stage2：暴露相关去重
 
-### 4.1 首次初始化 Zoo
+对 Stage1 候选做暴露相关聚类压缩。
 
-```bash
-.venv/bin/python scripts/update_factor_zoo.py build
-.venv/bin/python scripts/update_factor_zoo.py status
-```
+算法细节（当前实现）：
 
-### 4.2 挖掘阶段（启用跨轮次去重）
+1. 对每个因子构建暴露向量（采样 `date×instrument` 面板）。
+2. 计算两两 Spearman 相关矩阵。
+3. 按阈值建边：`|corr| >= threshold` 才认为“同簇候选”。
+4. 采用 `complete` linkage（`run_factors.sh` 入口固定）做簇压缩。
+5. 每簇保留冠军（当前固定 `per_cluster=1`）。
 
-```bash
-./run.sh --low-disk --relay --zoo-dedup "价量因子挖掘" "prod_dedup_v1"
-```
+当前默认参数（`run_factors.sh` 选项 5 固定）：
 
-建议：
+1. `corr_threshold = 0.8`
+2. `sample_size = 12000`
+3. `sample_split = train_valid`
+4. `cluster_linkage = complete`
 
-1. 生产前固定 `EXPERIMENT_ID` + `library suffix` 命名规范，避免因子库串线。
-2. 若重复表达式密度高，再开启 `quality_gate.cheap_filter_enabled=true` 做计算前 exact 去重。
+输出：`*_stage2.json`
 
----
+### Stage3：IC 序列相关去重（最终）
 
-## 5. 参数建议（量化基金实盘口径）
+对 Stage2 候选做 IC 序列相关聚类压缩，得到最终集合。
 
-### 挖掘阶段
+算法细节（当前实现）：
 
-1. 必开：`--zoo-dedup`（跨轮次表达式去重）。
-2. 选开：`quality_gate.cheap_filter_enabled=true`（候选爆量时启用）。
-3. 严格化建议（通过环境变量）：
-   - `FACTOR_CoSTEER_DUPLICATION_THRESHOLD=5`（默认代码值是 8，更严格）
-   - 视策略风格可进一步收紧 symbol/base-feature 阈值。
+1. 对 Stage2 每个候选计算日度 RankIC 序列。
+2. 基于 IC 序列计算因子间 Spearman 相关。
+3. 按阈值建边并做相关簇压缩（同样使用 `complete` linkage）。
+4. 簇内按综合分数选优：`abs(mean_ic) * max(ir, 0) * coverage * stability * capacity_penalty`。
+5. 当前 `run_factors.sh` 默认 `topn=all`（即不再额外截断）。
 
-### 回测筛选阶段
+当前默认参数（`run_factors.sh` 选项 5 固定）：
 
-1. 当前版本必开：`--corr-dedup`。
-2. 当前版本实盘建议：`--dedup-per-cluster 1`。
-3. 当前版本中性起点：`--dedup-corr-threshold 0.8`，按拥挤度再调到 `0.75` 或 `0.85`。
-4. 当前版本建议开启：`--dedup-compute-missing`（减少样本选择偏差）。
-5. 推荐参数：
-   - `--dedup-method two_stage`（暴露相关 + IC相关）
-   - `--dedup-linkage complete`（防链式并簇）
-- `--dedup-stage2-corr-threshold 0.8`（Stage-2 IC 序列相关阈值）
+1. `stage2_ic_corr_threshold = 0.8`
+2. `per_cluster = 1`
+3. `topn = all`
+
+补充说明：
+
+- 你提到的“默认值 > 0.8”在当前入口不是这样；当前固定就是 `0.8`（不是大于 0.8）。
+
+输出：`*_stage3.json`
 
 ---
 
-## 6. 监控指标（判断去重是否“真有效”）
+## 5. 产物命名与 manifest
 
-建议在每次实验记录以下指标：
+`run_factors.sh` 选项 5 产物命名：
 
-1. Zoo 命中率：本轮候选中命中历史表达式的比例。
-2. 计算前 exact 去重率（若开启 cheap filter）。
-3. 相关性去重压缩率：`final_selected / usable_candidates`。
-4. 簇集中度：最大簇占比（越高说明同质化越严重）。
-5. 去重前后组合表现变化：IR、换手、最大回撤、行业暴露稳定性。
-6. 泄漏检查：去重相关性估计样本是否仅来自 train+valid。
-7. 二阶段收益：Stage-1 到 Stage-2 的“同质因子再压缩率”。
+1. `..._n<count>_<YYYYMMDD_HHMMSS>_stage0.json`
+2. `..._n<count>_<YYYYMMDD_HHMMSS>_stage1.json`
+3. `..._n<count>_<YYYYMMDD_HHMMSS>_stage2.json`
+4. `..._n<count>_<YYYYMMDD_HHMMSS>_stage3.json`
+5. `..._n<count>_<YYYYMMDD_HHMMSS>_manifest.json`
+
+`manifest.json` 记录每阶段：
+
+1. `input`
+2. `kept`
+3. `dropped`
+4. `reasons`
+5. `path`
+
+用于横向对比阶段压缩效果与问题定位。
 
 ---
 
-## 7. 当前已知差距（务实说明）
+## 6. 推荐操作顺序
 
-1. `quality_gate.cheap_filter_enabled` 默认关闭，需要按负载场景手动开启。
-2. Stage-2 IC 序列计算会增加时延，且依赖可用缓存/补算能力。
-3. complete-linkage 需要 `scipy`；若运行环境缺失，会自动回退到 connected 模式。
-4. `factor.duplication.*` 在 `experiment.yaml` 中有配置项，但运行时核心阈值实际由 `FACTOR_CoSTEER_*` 设置/默认值驱动，生产环境建议显式导出环境变量，避免口径漂移。
+### 场景 A：多实验合池再过滤
+
+1. `3) [MERGE]`（选 `all` 或指定 ids）
+2. `5) [FILTER]`（后续计划；当前请直接运行 `select_factors.py` 或 `run_backtest_safe.sh --factors-filter`）
+3. 需要时 `4) [CACHE]` 补齐/修复缓存
+
+### 场景 B：单库快速过滤
+
+1. `5) [FILTER]`（后续计划；当前请直接运行 `select_factors.py` 或 `run_backtest_safe.sh --factors-filter`）
+2. 只想对照可选 `all stages + manifest`
+3. 只要最终集合可选 `stage3`
 
 ---
 
-## 8. 最小执行清单（Production Ready）
+## 7. 相关文件清单
 
-1. 初始化并检查 Zoo：`build + status`。
-2. 挖掘统一使用：`run.sh --zoo-dedup`。
-3. 回测统一使用：`run_backtest_safe.sh --corr-dedup --dedup-per-cluster 1 --dedup-compute-missing`。
-4. 固化阈值到运行环境（至少 duplication threshold）。
-5. 每轮沉淀去重指标到周报，跟踪拥挤度与收益退化。
-6. 下一迭代优先实现：Stage-2 小规模残差化复检（降低共线暴露）。
+1. 交互入口：`scripts/run_factors.sh`
+2. 合并脚本：`scripts/factor_filtering/merge_factor_libraries.py`
+3. 过滤脚本：`scripts/factor_filtering/select_factors.py`
+4. 缓存修复：`scripts/factor_filtering/repair_factor_cache.py`
+
+---
+
+## 8. TODO-FIX（后续清理/弃用）
+
+以下是当前“新逻辑与旧逻辑并存”的冲突点，建议后续分阶段收敛：
+
+1. 过滤入口未统一（优先级最高）
+   - 当前入口：`scripts/run_backtest_safe.sh --factors-filter` 或直接运行 `scripts/factor_filtering/select_factors.py`
+   - 计划入口：`scripts/run_factors.sh` 后续整合 `FILTER（stage0→stage3）`
+   - 问题：参数默认值、输出命名、稳定别名策略不一致，容易造成结果口径混乱。
+   - 建议：先把 `FILTER` 整合进 `run_factors.sh`，再考虑对旧入口加 deprecation 提示并计划移除。
+
+2. 缓存修复脚本重复
+   - 候选 A：`scripts/fix_missing_factors.py`
+   - 候选 B：`scripts/factor_filtering/repair_factor_cache.py`
+   - 问题：能力重叠，维护成本高；B 的能力更完整（invalid_read/invalid_index/delete/recompute）。
+   - 建议：保留 `repair_factor_cache.py`，逐步弃用 `fix_missing_factors.py`。
+
+3. 结果查看入口重复（次优先）
+   - 入口 A：`scripts/view_results.sh`（包装器）
+   - 入口 B：`scripts/run_backtest_safe.sh --view-results`
+   - 问题：功能重叠，用户不清楚应走哪个入口。
+   - 建议：二选一作为唯一入口，另一侧仅保留跳转或弃用提示。
+
+4. 文档口径待统一
+   - 风险：README / SPECS / 本文档若同时描述两套入口，容易出现“文档先后不一致”。
+   - 建议：完成上述 1~3 收敛后，同步统一文档口径，只保留最终入口。
+
+5. AST 公式去重的“误杀”兜底复核（后续考虑）
+   - 背景：`expr_dedup_method=ast`（Stage-0/Stage-1）可能在极少数表达式上产生误杀风险（parser/canonicalize 边界）。
+   - 想法：对“被公式去重丢弃”的因子做保底审计：
+     1) 优先做数值一致性复核（cache 可用时直接比对/抽样比对）。
+     2) 数值复核不可用时再用 LLM 兜底判断等价性，输出误杀报告（默认不自动捞回）。
