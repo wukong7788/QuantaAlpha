@@ -12,6 +12,9 @@
    - `docs/*.md`
    - `CHANGELOG.md` / `CHANGELOG_CN.md`
 3. 文档更新完成后，再同步全部待提交文件（而不是只提文档）：
+   - 提交前执行测试门禁（默认最小集）：
+     - `uv run pytest -q tests/backtest/test_custom_factor_calculator_duplicate_factor_name.py tests/backtest/test_factor_calculator_duplicate_factor_name.py`
+     - 若测试失败：停止提交并输出失败摘要。
    - `git add -A`
    - `git commit -m "<type>: sync docs and code for current branch"`
 4. 推送到当前分支：
