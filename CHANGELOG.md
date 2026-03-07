@@ -10,6 +10,10 @@ Each change entry starts with tags: `[area][impact]` (optionally severity `[P0|P
   - Replace the truthy regex gate for `QUANTA_SUBTREE_BLACKLIST_ENABLED` with a `case`-based helper to avoid runtime parse issues near blacklist summary output.
   - Add regression coverage to verify valid blacklist runs print raw/usable counts before entering mining.
 
+### Docs
+- [docs][docs] Record repo governance for sync discipline:
+  - `AGENTS.md` now requires a pre-push doc-sync check before direct GitHub sync so behavior-affecting changes must be reflected in `SPECS.md`, `CHANGELOG.md`, and relevant user-facing docs before `git push`.
+
 ## 2026-03-04
 
 ### Added

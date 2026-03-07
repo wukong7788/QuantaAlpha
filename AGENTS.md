@@ -61,6 +61,10 @@ Use short labels for multi-round discussion, optimization, or paper-reproduction
   - Update `SPECS.md` plus user-facing docs (`README.md`/`README_CN.md`/`docs/PAPER_REPRODUCTION_GUIDE.md`) and `CHANGELOG.md` in the same task.
   - Run a keyword grep for changed flags/terms (e.g. `--relay`, `--resume`, `BOB`, `low-disk`) to catch stale wording.
   - If intentionally skipping doc updates, explicitly state why (internal-only change) in the final summary.
+- Mandatory pre-push gate:
+  - Before `git push` / direct GitHub sync, verify that all behavior-affecting changes in the outgoing commit are already reflected in `SPECS.md`, `CHANGELOG.md`, and the relevant user-facing docs.
+  - If the push includes mixed code+docs changes, do this verification before pushing instead of treating docs as optional follow-up.
+  - If a push already happened without the required doc sync, immediately add a follow-up docs/governance commit and state the gap explicitly in the next summary.
 
 ## Agent Execution Principles
 
