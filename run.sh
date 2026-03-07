@@ -8,6 +8,7 @@
 #   ./run.sh --no-low-disk "initial direction" "suffix" # disable low-disk mode
 #   ./run.sh --relay "initial direction" "suffix"   # relay mode (auto chunk, true resume across restarts)
 #   ./run.sh --resume "initial direction" "suffix"  # resume mode (continue to max_rounds)
+#   ./run.sh --blacklist-file data/factorlib/subtree_blacklist.json "initial direction" "suffix"
 #   CONFIG=configs/experiment.yaml ./run.sh "direction"
 #
 # Examples:
@@ -27,6 +28,7 @@ LOW_DISK_MODE=true
 ZOO_DEDUP_MODE=false
 RELAY_MODE=false
 RESUME_MODE=false
+BLACKLIST_FILE=""
 ROUNDS_OVERRIDE=""
 POSITIONAL_ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -51,13 +53,21 @@ while [[ $# -gt 0 ]]; do
             ZOO_DEDUP_MODE=true
             shift
             ;;
+        --blacklist-file)
+            if [ -z "${2:-}" ] || [[ "${2}" == --* ]]; then
+                echo "Error: --blacklist-file requires a file path."
+                exit 1
+            fi
+            BLACKLIST_FILE="$2"
+            shift 2
+            ;;
         --rounds)
             ROUNDS_OVERRIDE="$2"
             shift 2
             ;;
         -h|--help)
             echo "Usage:"
-            echo "  ./run.sh [--low-disk|--no-low-disk] [--relay|--resume] [--zoo-dedup] [--rounds N] \"initial direction\" [library_suffix]"
+            echo "  ./run.sh [--low-disk|--no-low-disk] [--relay|--resume] [--zoo-dedup] [--blacklist-file PATH] [--rounds N] \"initial direction\" [library_suffix]"
             echo ""
             echo "Options:"
             echo "  --low-disk    Enable low-disk mode (default: ON)."
@@ -70,14 +80,20 @@ while [[ $# -gt 0 ]]; do
             echo "                remaining rounds up to evolution.max_rounds from config."
             echo "  --resume      Resume mode: continue from saved state directly to max_rounds."
             echo "  --zoo-dedup   Zoo dedup mode: skip factor expressions already explored in any"
-            echo "                previous run. Sets factor_zoo_path to data/factorlib/factor_zoo.json"
+            echo "                previous run. Sets factor_zoo_path to data/factorlib/factor_zoo.csv"
             echo "                and auto-updates the zoo when the experiment finishes."
+            echo "  --blacklist-file PATH"
+            echo "                Subtree blacklist mode: reject expressions matching blacklisted"
+            echo "                AST subtree patterns from a JSON file."
             echo "  --rounds N    Override evolution.max_rounds (e.g. --rounds 23 for full paper reproduction)."
             echo "                Creates a temporary config with max_rounds replaced; original config is unchanged."
             echo ""
             echo "Environment override:"
             echo "  QUANTA_RELAY_CHUNK_ROUNDS=N   first relay leg rounds (overrides config value)"
-            echo "  QUANTA_FACTOR_ZOO_PATH=...    override zoo path (default: data/factorlib/factor_zoo.json)"
+            echo "  QUANTA_FACTOR_ZOO_PATH=...    override zoo path (default: data/factorlib/factor_zoo.csv)"
+            echo "  QUANTA_SUBTREE_BLACKLIST_PATH=... override blacklist file path"
+            echo "  QUANTA_SUBTREE_BLACKLIST_MAX_PATTERNS=N"
+            echo "  QUANTA_SUBTREE_BLACKLIST_MIN_NODES=N"
             exit 0
             ;;
         *)
@@ -95,7 +111,7 @@ fi
 
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
     echo "Error: invalid arguments."
-    echo "Usage: ./run.sh [--low-disk|--no-low-disk] [--relay|--resume] \"initial direction\" [library_suffix]"
+    echo "Usage: ./run.sh [--low-disk|--no-low-disk] [--relay|--resume] [--zoo-dedup] [--blacklist-file PATH] \"initial direction\" [library_suffix]"
     exit 1
 fi
 
@@ -175,6 +191,66 @@ if [ ! -x "${QA_BIN}" ]; then
     exit 1
 fi
 
+validate_subtree_blacklist_or_die() {
+    local blacklist_path="$1"
+    local max_patterns="$2"
+    local min_nodes="$3"
+    local output=""
+    if ! output="$("${PYTHON_BIN}" - "${blacklist_path}" "${max_patterns}" "${min_nodes}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from quantaalpha.factors.regulator.subtree_blacklist import SubtreeBlacklist
+
+path = Path(sys.argv[1])
+max_patterns = int(sys.argv[2])
+min_nodes = int(sys.argv[3])
+
+if not path.exists():
+    print(f"Error: subtree blacklist file not found: {path}", file=sys.stderr)
+    raise SystemExit(2)
+
+try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+except Exception as exc:
+    print(f"Error: failed to parse subtree blacklist JSON: {path} ({exc})", file=sys.stderr)
+    raise SystemExit(3)
+
+if isinstance(payload, list):
+    raw_count = len(payload)
+elif isinstance(payload, dict) and isinstance(payload.get("patterns"), list):
+    raw_count = len(payload["patterns"])
+else:
+    print(
+        "Error: subtree blacklist JSON must be a list or an object with a 'patterns' list.",
+        file=sys.stderr,
+    )
+    raise SystemExit(4)
+
+if raw_count <= 0:
+    print(f"Error: subtree blacklist JSON contains no raw patterns: {path}", file=sys.stderr)
+    raise SystemExit(5)
+
+blacklist = SubtreeBlacklist(str(path), max_patterns=max_patterns, min_nodes=min_nodes)
+if blacklist.size <= 0:
+    print(
+        "Error: subtree blacklist produced 0 usable patterns after validation "
+        f"(path={path}, raw={raw_count}, min_nodes={min_nodes}, max_patterns={max_patterns}).",
+        file=sys.stderr,
+    )
+    raise SystemExit(6)
+
+print(f"{raw_count}:{blacklist.size}")
+PY
+    )"; then
+        return 1
+    fi
+    BLACKLIST_COUNT_RAW="${output%%:*}"
+    BLACKLIST_COUNT_USABLE="${output##*:}"
+    return 0
+}
+
 echo "Python: $("${PYTHON_BIN}" --version)"
 echo "QuantaAlpha: ${QA_BIN}"
 echo ""
@@ -198,8 +274,33 @@ if [ -n "${ROUNDS_OVERRIDE}" ]; then
         echo "Error: --rounds must be a positive integer (got '${ROUNDS_OVERRIDE}')."
         exit 1
     fi
-    _TEMP_CONFIG="$(mktemp /tmp/quanta_config_rounds_XXXXXX.yaml)"
-    sed "s/max_rounds:[ ]*[0-9]\+/max_rounds: ${ROUNDS_OVERRIDE}/" "${CONFIG_PATH}" > "${_TEMP_CONFIG}"
+    _TEMP_CONFIG="$(mktemp "${TMPDIR:-/tmp}/quanta_config_rounds_XXXXXX")"
+    if [ -z "${_TEMP_CONFIG}" ] || [ ! -f "${_TEMP_CONFIG}" ]; then
+        echo "Error: failed to allocate temporary config file for --rounds override."
+        exit 1
+    fi
+    if ! "${PYTHON_BIN}" - "${CONFIG_PATH}" "${_TEMP_CONFIG}" "${ROUNDS_OVERRIDE}" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+src = Path(sys.argv[1])
+dst = Path(sys.argv[2])
+rounds = sys.argv[3]
+text = src.read_text(encoding="utf-8")
+
+pattern = re.compile(r"^(\s*max_rounds:\s*)\d+(\s*(?:#.*)?)$", flags=re.MULTILINE)
+new_text, replaced = pattern.subn(rf"\g<1>{rounds}\g<2>", text, count=1)
+if replaced == 0:
+    raise RuntimeError("Could not locate 'max_rounds' in config.")
+
+dst.write_text(new_text, encoding="utf-8")
+PY
+    then
+        echo "Error: failed to create temp config for --rounds override."
+        [ -f "${_TEMP_CONFIG}" ] && rm -f "${_TEMP_CONFIG}"
+        exit 1
+    fi
     echo "Rounds override: max_rounds=${ROUNDS_OVERRIDE} (temp config: ${_TEMP_CONFIG})"
     CONFIG_PATH="${_TEMP_CONFIG}"
 fi
@@ -408,6 +509,38 @@ if [ "${ZOO_DEDUP_MODE}" = true ]; then
     else
         echo "  Zoo CSV not found — will be created after first run. Run:"
         echo "    ${PYTHON_BIN} scripts/update_factor_zoo.py build"
+    fi
+    echo "----------------------------------------"
+fi
+
+if [ -n "${BLACKLIST_FILE}" ]; then
+    export QUANTA_SUBTREE_BLACKLIST_ENABLED=1
+    export QUANTA_SUBTREE_BLACKLIST_PATH="${BLACKLIST_FILE}"
+    export QUANTA_SUBTREE_BLACKLIST_MAX_PATTERNS="${QUANTA_SUBTREE_BLACKLIST_MAX_PATTERNS:-200}"
+    export QUANTA_SUBTREE_BLACKLIST_MIN_NODES="${QUANTA_SUBTREE_BLACKLIST_MIN_NODES:-1}"
+    if ! validate_subtree_blacklist_or_die \
+        "${QUANTA_SUBTREE_BLACKLIST_PATH}" \
+        "${QUANTA_SUBTREE_BLACKLIST_MAX_PATTERNS}" \
+        "${QUANTA_SUBTREE_BLACKLIST_MIN_NODES}"; then
+        exit 1
+    fi
+fi
+
+if [[ "${QUANTA_SUBTREE_BLACKLIST_ENABLED:-0}" =~ ^(1|true|yes|on)$ ]]; then
+    BLACKLIST_PATH="${QUANTA_SUBTREE_BLACKLIST_PATH:-}"
+    echo "Subtree blacklist mode: ON"
+    echo "  Blacklist JSON: ${BLACKLIST_PATH}"
+    echo "  QUANTA_SUBTREE_BLACKLIST_MAX_PATTERNS=${QUANTA_SUBTREE_BLACKLIST_MAX_PATTERNS:-200}"
+    echo "  QUANTA_SUBTREE_BLACKLIST_MIN_NODES=${QUANTA_SUBTREE_BLACKLIST_MIN_NODES:-1}"
+    if [ -n "${BLACKLIST_PATH}" ] && [ -f "${BLACKLIST_PATH}" ]; then
+        if [ -n "${BLACKLIST_COUNT_RAW:-}" ]; then
+            echo "  Blacklist entries (raw): ${BLACKLIST_COUNT_RAW}"
+            echo "  Blacklist entries (usable): ${BLACKLIST_COUNT_USABLE}"
+        else
+            echo "  Blacklist file found via env override; validation deferred to runtime config."
+        fi
+    else
+        echo "  Blacklist file not found yet; the run will continue without subtree matches."
     fi
     echo "----------------------------------------"
 fi
