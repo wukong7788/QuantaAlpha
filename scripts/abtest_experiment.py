@@ -29,6 +29,7 @@ import re
 import subprocess
 import sys
 import time
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -37,6 +38,19 @@ import yaml
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+QUALITY_METRIC_KEYS: List[str] = [
+    "Rank IC",
+    "Rank ICIR",
+    "IC",
+    "ICIR",
+    "1day.excess_return_with_cost.information_ratio",
+    "1day.excess_return_with_cost.annualized_return",
+    "1day.excess_return_with_cost.max_drawdown",
+]
+
+# Default KPI for "best factor" selection (higher is better).
+TOP_FACTOR_METRIC_KEY = "1day.excess_return_with_cost.information_ratio"
 
 
 def _utc_ts() -> str:
@@ -151,12 +165,24 @@ def _extract_metrics_from_run_log(run_log: Path) -> Dict[str, Any]:
         "json_boundary_missing": _count_any("json boundary missing", "json_boundary_missing"),
     }
 
+    # Whether the subtree blacklist actually rejected candidates (if enabled).
+    sb_rejected_total = 0
+    sb_rejected_events = 0
+    for m in re.finditer(r"Subtree blacklist rejected factors:\s*(\d+)/(\d+)", text):
+        try:
+            sb_rejected_total += int(m.group(1))
+            sb_rejected_events += 1
+        except Exception:
+            continue
+
     return {
         "step_time_s": step_time_s,
         "step_time_p90_s": step_time_p90_s,
         "json_fail_counts": json_fail_counts,
         "llm_connection_error_count": lowered.count("connection error"),
         "llm_retry_line_count": len(re.findall(r"retrying \d+th time", lowered)),
+        "subtree_blacklist_rejected_total": sb_rejected_total,
+        "subtree_blacklist_rejected_events": sb_rejected_events,
     }
 
 def _median(xs: List[float]) -> float:
@@ -168,6 +194,92 @@ def _median(xs: List[float]) -> float:
     if n % 2 == 1:
         return float(ys[mid])
     return float((ys[mid - 1] + ys[mid]) / 2.0)
+
+def _mean(xs: List[float]) -> float:
+    if not xs:
+        return 0.0
+    return float(sum(xs) / float(len(xs)))
+
+def _extract_quality_from_factor_library(library_path: Path) -> Dict[str, Any]:
+    """
+    Parse `data/factorlib/all_factors_library_<suffix>.json` and summarize per-factor backtest quality.
+
+    Returns:
+      - factor_count
+      - expr_unique_count
+      - metrics_median / metrics_mean / metrics_best for QUALITY_METRIC_KEYS
+      - top_factor_by: best factor_name by TOP_FACTOR_METRIC_KEY
+    """
+    if not library_path.exists():
+        return {"factor_count": 0, "expr_unique_count": 0}
+
+    try:
+        payload = json.loads(library_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"factor_count": 0, "expr_unique_count": 0}
+
+    factors = payload.get("factors") if isinstance(payload, dict) else None
+    if not isinstance(factors, dict):
+        return {"factor_count": 0, "expr_unique_count": 0}
+
+    # Expression uniqueness.
+    exprs: List[str] = []
+    for item in factors.values():
+        if not isinstance(item, dict):
+            continue
+        expr = str(item.get("factor_expression", "") or "").strip()
+        expr = " ".join(expr.split())
+        if expr:
+            exprs.append(expr)
+
+    metric_vals: Dict[str, List[float]] = {k: [] for k in QUALITY_METRIC_KEYS}
+    top_factor: Dict[str, Any] | None = None
+    for item in factors.values():
+        if not isinstance(item, dict):
+            continue
+        br = item.get("backtest_results") or {}
+        if isinstance(br, dict):
+            for k in QUALITY_METRIC_KEYS:
+                v = br.get(k)
+                if isinstance(v, (int, float)) and not (isinstance(v, float) and math.isnan(v)):
+                    metric_vals[k].append(float(v))
+
+        # Best factor by TOP_FACTOR_METRIC_KEY.
+        v_top = None
+        if isinstance(br, dict):
+            v_top = br.get(TOP_FACTOR_METRIC_KEY)
+        if isinstance(v_top, (int, float)) and not (isinstance(v_top, float) and math.isnan(v_top)):
+            if top_factor is None or float(v_top) > float(top_factor["value"]):
+                top_factor = {
+                    "metric": TOP_FACTOR_METRIC_KEY,
+                    "factor_name": str(item.get("factor_name", "") or ""),
+                    "value": float(v_top),
+                }
+
+    metrics_median: Dict[str, float] = {}
+    metrics_mean: Dict[str, float] = {}
+    metrics_best: Dict[str, float] = {}
+    metrics_n: Dict[str, int] = {}
+    for k, vs in metric_vals.items():
+        if not vs:
+            continue
+        metrics_median[k] = round(_median(vs), 8)
+        metrics_mean[k] = round(_mean(vs), 8)
+        metrics_best[k] = round(max(vs), 8)
+        metrics_n[k] = int(len(vs))
+
+    out: Dict[str, Any] = {
+        "factor_count": int(len(factors)),
+        "expr_unique_count": int(len(set(exprs))),
+        "metrics_median": metrics_median,
+        "metrics_mean": metrics_mean,
+        "metrics_best": metrics_best,
+        "metrics_n": metrics_n,
+    }
+    if top_factor is not None:
+        top_factor["value"] = round(float(top_factor["value"]), 8)
+        out["top_factor_by"] = top_factor
+    return out
 
 def _build_config(
     base_cfg: Dict[str, Any],
@@ -221,15 +333,39 @@ def _run_variant_repeats(
         env["DATA_RESULTS_DIR"] = str(data_results_dir)
         env["LOG_TRACE_PATH"] = str(log_root)
 
+        print(
+            f"[ABTEST] start variant={variant} run={i}/{times} run_id={run_id}",
+            flush=True,
+        )
+        print(
+            f"[ABTEST] run_log={run_log} doctor_md={doctor_md} config={generated_config}",
+            flush=True,
+        )
         rc, elapsed_s = _run(["bash", "./run.sh", direction], cwd=PROJECT_ROOT, env=env, stdout_path=run_log)
         if rc != 0:
             any_failed = True
+        print(
+            f"[ABTEST] finished variant={variant} run={i}/{times} "
+            f"run_id={run_id} exit_code={rc} elapsed_s={round(elapsed_s, 3)}",
+            flush=True,
+        )
 
         doctor_rc = 0
         if not skip_doctor:
+            print(
+                f"[ABTEST] doctor start variant={variant} run={i}/{times} run_id={run_id}",
+                flush=True,
+            )
             doctor_rc = _run_doctor(experiment_id, str(log_root), doctor_md, env=env)
+            print(
+                f"[ABTEST] doctor finished variant={variant} run={i}/{times} "
+                f"run_id={run_id} doctor_exit_code={doctor_rc}",
+                flush=True,
+            )
 
         extra_metrics = _extract_metrics_from_run_log(run_log)
+        factor_library_path = PROJECT_ROOT / "data" / "factorlib" / f"all_factors_library_{factor_suffix}.json"
+        factor_quality = _extract_quality_from_factor_library(factor_library_path)
 
         payload: Dict[str, Any] = {
             "name": name,
@@ -237,6 +373,7 @@ def _run_variant_repeats(
             "run_id": run_id,
             "experiment_id": experiment_id,
             "factor_library_suffix": factor_suffix,
+            "factor_library_path": str(factor_library_path),
             "base_config": str(base_config_path),
             "generated_config": str(generated_config),
             "applied_set": [{"key": k, "value": v} for k, v in applied_sets],
@@ -253,19 +390,27 @@ def _run_variant_repeats(
             "data_results_dir": str(data_results_dir),
             "python": sys.version.split()[0],
             "platform": platform.platform(),
+            "factor_quality": factor_quality,
         }
         payload.update(extra_metrics)
         payloads.append(payload)
         print("ABTEST_RESULT=" + json.dumps(payload, ensure_ascii=False))
 
     elapsed_list = [float(p.get("elapsed_s", 0.0)) for p in payloads if isinstance(p.get("elapsed_s"), (int, float))]
+    ok_payloads = [p for p in payloads if int(p.get("exit_code", 1)) == 0]
+    elapsed_ok_list = [
+        float(p.get("elapsed_s", 0.0)) for p in ok_payloads if isinstance(p.get("elapsed_s"), (int, float))
+    ]
     summary: Dict[str, Any] = {
         "name": name,
         "variant": variant,
         "runs": times,
+        "runs_success": int(len(ok_payloads)),
+        "runs_failed": int(times - len(ok_payloads)),
         "elapsed_s_median": round(_median(elapsed_list), 3),
         "elapsed_s_min": round(min(elapsed_list), 3) if elapsed_list else 0.0,
         "elapsed_s_max": round(max(elapsed_list), 3) if elapsed_list else 0.0,
+        "elapsed_s_median_success": round(_median(elapsed_ok_list), 3) if elapsed_ok_list else 0.0,
     }
 
     agg_json: Dict[str, int] = {}
@@ -280,6 +425,68 @@ def _run_variant_repeats(
                 continue
     if agg_json:
         summary["json_fail_counts_sum"] = agg_json
+
+    # Aggregate subtree blacklist activity.
+    sb_rejected_sum = 0
+    sb_rejected_events_sum = 0
+    for p in payloads:
+        try:
+            sb_rejected_sum += int(p.get("subtree_blacklist_rejected_total", 0) or 0)
+            sb_rejected_events_sum += int(p.get("subtree_blacklist_rejected_events", 0) or 0)
+        except Exception:
+            continue
+    summary["subtree_blacklist_rejected_sum"] = int(sb_rejected_sum)
+    summary["subtree_blacklist_rejected_events_sum"] = int(sb_rejected_events_sum)
+
+    # Aggregate factor quality (per-run medians, then median across runs).
+    factor_counts = []
+    expr_unique_counts = []
+    per_run_metric_medians: Dict[str, List[float]] = {k: [] for k in QUALITY_METRIC_KEYS}
+    per_run_metric_bests: Dict[str, List[float]] = {k: [] for k in QUALITY_METRIC_KEYS}
+    for p in ok_payloads:
+        fq = p.get("factor_quality") or {}
+        if not isinstance(fq, dict):
+            continue
+        fc = fq.get("factor_count")
+        ec = fq.get("expr_unique_count")
+        if isinstance(fc, int):
+            factor_counts.append(float(fc))
+        if isinstance(ec, int):
+            expr_unique_counts.append(float(ec))
+
+        mm = fq.get("metrics_median") or {}
+        if isinstance(mm, dict):
+            for k in QUALITY_METRIC_KEYS:
+                v = mm.get(k)
+                if isinstance(v, (int, float)) and not (isinstance(v, float) and math.isnan(v)):
+                    per_run_metric_medians[k].append(float(v))
+
+        mb = fq.get("metrics_best") or {}
+        if isinstance(mb, dict):
+            for k in QUALITY_METRIC_KEYS:
+                v = mb.get(k)
+                if isinstance(v, (int, float)) and not (isinstance(v, float) and math.isnan(v)):
+                    per_run_metric_bests[k].append(float(v))
+
+    summary_quality: Dict[str, Any] = {}
+    if factor_counts:
+        summary_quality["factor_count_median_success"] = int(round(_median(factor_counts)))
+    if expr_unique_counts:
+        summary_quality["expr_unique_count_median_success"] = int(round(_median(expr_unique_counts)))
+
+    med_of_meds: Dict[str, float] = {}
+    best_of_bests: Dict[str, float] = {}
+    for k in QUALITY_METRIC_KEYS:
+        if per_run_metric_medians.get(k):
+            med_of_meds[k] = round(_median(per_run_metric_medians[k]), 8)
+        if per_run_metric_bests.get(k):
+            best_of_bests[k] = round(max(per_run_metric_bests[k]), 8)
+    if med_of_meds:
+        summary_quality["metrics_median_of_medians_success"] = med_of_meds
+    if best_of_bests:
+        summary_quality["metrics_best_of_bests_success"] = best_of_bests
+    if summary_quality:
+        summary["factor_quality_summary"] = summary_quality
 
     print("ABTEST_SUMMARY=" + json.dumps(summary, ensure_ascii=False))
     return payloads, summary, any_failed
@@ -385,6 +592,13 @@ def main(argv: List[str]) -> int:
 
     base_ts = _utc_ts()
     times = max(1, int(args.times))
+    print(
+        f"[ABTEST] compare name={args.name} times={times} "
+        f"base_config={base_config_path} step_n={int(args.step_n)}",
+        flush=True,
+    )
+    print(f"[ABTEST] baseline overrides={baseline_sets}", flush=True)
+    print(f"[ABTEST] optimized overrides={optimized_sets}", flush=True)
 
     _, baseline_summary, baseline_failed = _run_variant_repeats(
         name=args.name,
@@ -419,6 +633,22 @@ def main(argv: List[str]) -> int:
     o_med = float(optimized_summary.get("elapsed_s_median", 0.0) or 0.0)
     delta = round(o_med - b_med, 3)
     pct = round(((delta / b_med) * 100.0), 2) if b_med > 0 else None
+
+    b_ok_med = float(baseline_summary.get("elapsed_s_median_success", 0.0) or 0.0)
+    o_ok_med = float(optimized_summary.get("elapsed_s_median_success", 0.0) or 0.0)
+    delta_ok = round(o_ok_med - b_ok_med, 3)
+    pct_ok = round(((delta_ok / b_ok_med) * 100.0), 2) if b_ok_med > 0 else None
+
+    # Quality deltas (median-of-medians across successful runs).
+    b_q = (baseline_summary.get("factor_quality_summary") or {}).get("metrics_median_of_medians_success") or {}
+    o_q = (optimized_summary.get("factor_quality_summary") or {}).get("metrics_median_of_medians_success") or {}
+    delta_q: Dict[str, float] = {}
+    if isinstance(b_q, dict) and isinstance(o_q, dict):
+        for k in QUALITY_METRIC_KEYS:
+            bv = b_q.get(k)
+            ov = o_q.get(k)
+            if isinstance(bv, (int, float)) and isinstance(ov, (int, float)):
+                delta_q[k] = round(float(ov) - float(bv), 8)
     comparison = {
         "name": args.name,
         "runs_per_variant": times,
@@ -426,6 +656,9 @@ def main(argv: List[str]) -> int:
         "optimized": optimized_summary,
         "delta_elapsed_s_median": delta,
         "delta_elapsed_pct_median": pct,
+        "delta_elapsed_s_median_success": delta_ok,
+        "delta_elapsed_pct_median_success": pct_ok,
+        "delta_quality_metrics_median_success": delta_q,
     }
     print("ABTEST_COMPARISON=" + json.dumps(comparison, ensure_ascii=False))
 

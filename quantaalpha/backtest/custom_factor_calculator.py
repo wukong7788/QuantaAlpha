@@ -123,7 +123,6 @@ class CustomFactorCalculator:
         
         h5_file = Path(result_h5_path)
         if not h5_file.exists():
-            logger.debug(f"Cache file not found: {result_h5_path}")
             return None
         
         try:
@@ -342,10 +341,12 @@ class CustomFactorCalculator:
         fail_count = 0
         cache_hit_count = 0
         cache_location_hit_count = 0
+        cache_location_miss_count = 0
         compute_count = 0
         failed_names: List[str] = []
         total = len(factors)
         need_compute_factors: List[Tuple[int, str, Dict]] = []
+        printed_h5_fallback_note = False
 
         def _validate(series: Optional[pd.Series], name: str) -> Optional[pd.Series]:
             if series is None:
@@ -402,6 +403,11 @@ class CustomFactorCalculator:
             if use_cache and cache_location:
                 h5_path = cache_location.get('result_h5_path', '')
                 if h5_path:
+                    if not Path(h5_path).exists():
+                        cache_location_miss_count += 1
+                        if not printed_h5_fallback_note:
+                            print("  Note: some cache_location result.h5 are missing; fallback to MD5 cache (no recompute if MD5 hit).")
+                            printed_h5_fallback_note = True
                     result = self._load_from_cache_location(cache_location)
                     if result is not None:
                         validated = _validate(result, factor_name)
@@ -516,7 +522,8 @@ class CustomFactorCalculator:
                         print(f" ✗ Failed ({elapsed:.1f}s)")
         
         print(f"Factor load done: success {success_count}, failed {fail_count} | "
-              f"H5 cache {cache_location_hit_count}, MD5 cache {cache_hit_count}, computed {compute_count}")
+              f"H5 cache {cache_location_hit_count}, H5 missing {cache_location_miss_count}, "
+              f"MD5 cache {cache_hit_count}, computed {compute_count}")
         if renamed_duplicates:
             print(f"  Note: renamed {len(renamed_duplicates)} duplicate factor_name(s) to keep columns unique.")
         if failed_names:

@@ -182,8 +182,7 @@ def main() -> int:
     scan_t0 = time.perf_counter()
     total_factors = len(factor_items)
     progress_every = int(args.progress_every) if int(args.progress_every) > 0 else 0
-
-    for i, (factor_id, info) in enumerate(factor_items, start=1):
+    def _print_scan_progress(i: int) -> None:
         if progress_every and (i == 1 or i % progress_every == 0 or i == total_factors):
             elapsed = time.perf_counter() - scan_t0
             print(
@@ -191,6 +190,8 @@ def main() -> int:
                 f"ok={ok} missing={missing} invalid_read={invalid_read} invalid_index={invalid_index} "
                 f"elapsed_s={elapsed:.1f}"
             )
+
+    for i, (factor_id, info) in enumerate(factor_items, start=1):
         name = str(info.get("factor_name") or factor_id)
         expr = str(info.get("factor_expression") or "").strip()
         if not expr:
@@ -206,6 +207,7 @@ def main() -> int:
                     reason="empty factor_expression",
                 )
             )
+            _print_scan_progress(i)
             continue
 
         key = _md5(expr)
@@ -224,6 +226,7 @@ def main() -> int:
                     status="missing",
                 )
             )
+            _print_scan_progress(i)
             continue
 
         series = read_factor_cache(cache_dir, key, config=calculator._llm_cache_config)  # type: ignore[attr-defined]
@@ -240,6 +243,7 @@ def main() -> int:
                     reason="read_factor_cache returned None (corrupt/unsupported)",
                 )
             )
+            _print_scan_progress(i)
             continue
 
         validated = calculator._validate_and_align_result(series, name, target_index)  # type: ignore[attr-defined]
@@ -256,6 +260,7 @@ def main() -> int:
                     reason="index mismatch vs target index (will recompute)",
                 )
             )
+            _print_scan_progress(i)
             continue
 
         ok += 1
@@ -269,6 +274,7 @@ def main() -> int:
                 status="ok",
             )
         )
+        _print_scan_progress(i)
 
     print(
         "[Scan] "

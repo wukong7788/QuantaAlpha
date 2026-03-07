@@ -251,6 +251,17 @@ PY
     return 0
 }
 
+is_truthy_flag() {
+    case "${1:-}" in
+        1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn])
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 echo "Python: $("${PYTHON_BIN}" --version)"
 echo "QuantaAlpha: ${QA_BIN}"
 echo ""
@@ -526,7 +537,7 @@ if [ -n "${BLACKLIST_FILE}" ]; then
     fi
 fi
 
-if [[ "${QUANTA_SUBTREE_BLACKLIST_ENABLED:-0}" =~ ^(1|true|yes|on)$ ]]; then
+if is_truthy_flag "${QUANTA_SUBTREE_BLACKLIST_ENABLED:-0}"; then
     BLACKLIST_PATH="${QUANTA_SUBTREE_BLACKLIST_PATH:-}"
     echo "Subtree blacklist mode: ON"
     echo "  Blacklist JSON: ${BLACKLIST_PATH}"

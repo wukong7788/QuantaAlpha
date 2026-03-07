@@ -202,6 +202,10 @@ EXPERIMENT_ID="paper_repro_r2" ./run.sh --relay "价量因子挖掘" "paper_repr
 
 # 示例：严格续跑模式（必须已有接力状态）
 EXPERIMENT_ID="paper_repro_r2" ./run.sh --resume "价量因子挖掘" "paper_reproduction_r2"
+
+# 示例：可选 subtree blacklist 模式（JSON 黑名单）
+./run.sh --zoo-dedup --blacklist-file data/factorlib/subtree_blacklist.json \
+  "价量因子挖掘" "exp_blacklist"
 ```
 
 `run.sh` 现在默认开启 low-disk 模式。如需关闭，请显式加 `--no-low-disk`。
@@ -212,6 +216,8 @@ EXPERIMENT_ID="paper_repro_r2" ./run.sh --resume "价量因子挖掘" "paper_rep
 - 全新一轮实验时，`EXPERIMENT_ID` 与因子库后缀必须一起换（例如 `paper_repro_r2` + `paper_reproduction_r2`）。
 - 复用同一个 `EXPERIMENT_ID` 表示继续同一条 workspace/cache/log 轨迹。
 - 复用同一个后缀会继续写入同一个 `data/factorlib/all_factors_library_<suffix>.json`，可能混入历史因子。
+- `suffix` 只控制因子库文件名，不控制 relay/resume 续跑 lineage；如果 `--relay/--resume` 未显式设置 `EXPERIMENT_ID`，`run.sh` 会默认使用 `relay_shared`。
+- 实操上，接力/续跑前必须先看启动输出里的 `EXPERIMENT_ID`、`LOG_TRACE_PATH`、`WORKSPACE_PATH`，确认绑定到预期实验后再离开。
 
 受控并行建议（8 核笔记本）：
 
@@ -224,6 +230,8 @@ EXPERIMENT_ID="paper_repro_r2" ./run.sh --resume "价量因子挖掘" "paper_rep
 
 - `quality_gate.cheap_filter_enabled: false`：默认关闭（`STEP_N=3` 的 A/B 显示耗时负优化）。
 - `quality_gate.cheap_filter_require_acceptable: false`：默认关闭；仅建议在特定负载下配合 `cheap_filter_enabled=true` 复测后启用。
+- `quality_gate.subtree_blacklist_enabled: false`：默认关闭；开启后会拦截命中黑名单 AST 子树的表达式（即使 `cheap_filter_enabled=false` 也生效）。
+- `quality_gate.subtree_blacklist_path: null`：默认不设置；也可通过 `run.sh --blacklist-file ...` 注入。
 - `quality_gate.max_construct_failures_per_branch: 2`：限制分支连续构造失败预算。
 - `quality_gate.max_json_parse_failures_per_branch: 2`：限制分支 JSON 解析失败预算。
 
@@ -231,7 +239,7 @@ LLM 运行时稳态（优化新增选项，不是原始基线默认项）：
 
 - `llm.json_mode_response_format: json_object`：在 `json_mode=true` 调用启用协议层 JSON 输出约束。
 - `llm.json_mode_json_schema: ""`：可按 provider 能力配置 JSON Schema 字符串。
-- 默认保持 `llm.json_mode_temperature: 0.5` 与 `llm.freeform_temperature: 0.5` 一致；温度分层建议在目标用例做 A/B 后再启用。
+- 默认保持 `llm.json_mode_temperature: 0.7` 与 `llm.freeform_temperature: 0.7` 一致；温度分层建议在目标用例做 A/B 后再启用。
 - `llm.request_timeout_s: 60.0`、`llm.retry_backoff: exponential`、`llm.retry_jitter: true`、`llm.retry_max_wait_seconds: 30.0`：降低尾延迟与卡顿空耗。
 - `llm.failover_base_urls: []`：可选备用链路，在连续失败时切换 endpoint。
 
@@ -263,6 +271,7 @@ LLM 运行时稳态（优化新增选项，不是原始基线默认项）：
 
 - 首段按 `QUANTA_RELAY_CHUNK_ROUNDS`（默认取配置里的 `evolution.relay_chunk_rounds`，当前主配置为 6）运行
 - 后续再次执行 `--relay` 会自动补齐到 `max_rounds`
+- 可选 `--rounds N` 可在接力调度前稳定覆盖 `evolution.max_rounds`（通过临时配置补丁）
 
 ```bash
 # 首段接力（当前主配置默认先跑 6 轮）
@@ -341,6 +350,7 @@ QUANTA_FORCE_RELAY_RESUME=1 EXPERIMENT_ID="paper_repro_r2" ./run.sh --relay "价
 - `2` 按 id 删除（支持 `1+3+5`）。
 - `3` 按 id 合并（支持 `1+2` 和 `all`），可选 `zoo-method=ast|norm|both|none`，输出文件自动命名为 `<prefix>_n<count>_<timestamp>.json`，完成后打印合并库汇总（`n`、`H/M/L`）和 `FACTOR_CoSTEER_FACTOR_ZOO_PATH` 导出提示。
 - `5` 按 id 执行可观测过滤流水线（`stage0→stage3`，支持 `all`），可选导出 `stage0|stage1|stage2|stage3|all`，产物文件名带 `n + 时间戳 + stage` 后缀，并生成 `manifest.json` 便于阶段对比。固定默认：`expr_dedup=ast`、`stage3_topn=all`、输出前缀 `data/factorlib/selected/<source>_filter_pipeline`（不再额外交互）。
+- `6` 从 Stage1/合并 JSON 或 Zoo CSV 导出 subtree blacklist JSON（默认 `data/factorlib/subtree_blacklist.json`），可直接用于 `run.sh --blacklist-file`。
 
 ### 5. 独立回测
 

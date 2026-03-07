@@ -158,6 +158,19 @@ def _apply_runtime_llm_settings(llm_cfg: dict[str, Any] | None) -> None:
         f"failover_base_urls={LLM_SETTINGS.failover_base_urls}"
     )
 
+    # Keep environment-driven backends (e.g. RD-Agent/LiteLLM) aligned with run-config.
+    # Many components load chat temperature from env only (CHAT_TEMPERATURE), so we export the
+    # effective freeform temperature when available (fallback to chat_temperature).
+    try:
+        effective_chat_temperature = (
+            LLM_SETTINGS.freeform_temperature
+            if LLM_SETTINGS.freeform_temperature is not None
+            else LLM_SETTINGS.chat_temperature
+        )
+        os.environ["CHAT_TEMPERATURE"] = str(effective_chat_temperature)
+    except Exception:
+        pass
+
 
 
 

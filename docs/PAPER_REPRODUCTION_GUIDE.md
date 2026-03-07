@@ -25,6 +25,7 @@
 - `2` 按 id 删除（支持 `1+3+5`）
 - `3` 按 id 合并（支持 `1+2` 或 `all`；可选 `zoo-method=ast|norm|both|none`，输出文件自动带 `n` 和时间戳，并输出 `FACTOR_CoSTEER_FACTOR_ZOO_PATH` 导出提示）
 - `5` 按 id 执行可观测过滤流水线（`stage0→stage3`；可选只导出某个 stage 或 all，输出带 stage 后缀，并生成 `manifest.json`；默认固定 `expr_dedup=ast`、`stage3_topn=all` 与标准输出前缀）
+- `6` 从 Stage1/merge JSON 或 Zoo CSV 导出 subtree blacklist JSON（用于 `run.sh --blacklist-file`）
 
 ### 脚本 0：冒烟测试 — 优先跑这一步（`minirun.sh`）
 
@@ -53,6 +54,7 @@
 > 1. 强制走 `--low-disk` 模式，算完因子自动清理几十 GB 的缓存文件。
 > 2. 强制走 `--relay` 接力模式（默认每 6 轮存盘并退出，第二次启动同一命令自动补齐剩余轮次）。
 > 3. 已指定专用配置文件（清理庞大演化历史废料，因子假设=3）。
+> 4. 如需临时改总轮次，使用 `--rounds N`（会在运行前生成临时配置并覆盖 `evolution.max_rounds`）。
 
 ```bash
 # 接力模式机制说明：
@@ -67,6 +69,11 @@
 # 前置步骤：首次需先初始化 Zoo（仅首次，此后每轮实验自动更新）：
 #   .venv/bin/python scripts/update_factor_zoo.py build
 ./run.sh --low-disk --relay --zoo-dedup "Price-Volume Factor Mining" "deepseek_v3_11r"
+
+# 安全模式 + Zoo 去重 + subtree blacklist（可选，对坏结构做更激进拦截）
+./run.sh --low-disk --relay --zoo-dedup \
+  --blacklist-file data/factorlib/subtree_blacklist.json \
+  "Price-Volume Factor Mining" "deepseek_v3_11r_blacklist"
 ```
 
 > **Zoo 去重说明**：
@@ -77,6 +84,7 @@
 >   .venv/bin/python scripts/update_factor_zoo.py build    # 全量重建（首次）
 >   .venv/bin/python scripts/update_factor_zoo.py status   # 查看 Zoo 统计
 >   ```
+> - `--blacklist-file` 读取 JSON 子树黑名单（`patterns` 列表），命中后会在 calculate/backtest 前拦截该表达式。
 
 ---
 
@@ -185,8 +193,8 @@ python scripts/preflight_check.py experiment --config configs/experiment.yaml
 llm:
   # [Optimization Added, not original baseline defaults]
   json_mode_strict: true
-  json_mode_temperature: 0.5
-  freeform_temperature: 0.5
+  json_mode_temperature: 0.7
+  freeform_temperature: 0.7
   json_mode_response_format: json_object
   json_mode_json_schema: ""
   request_timeout_s: 60.0
@@ -195,6 +203,9 @@ llm:
   retry_max_wait_seconds: 30.0
   failover_base_urls: []
 ```
+
+注：从当前版本起，`configs/experiment*.yaml -> llm.freeform_temperature` 会在启动时同步到环境变量 `CHAT_TEMPERATURE`，
+用于避免 QuantaAlpha 与 RD-Agent/LiteLLM 两套 backend 在温度配置上出现双源漂移。
 
 ### 2.3 优化 A/B 测试（推荐流程，先验证再启用）
 

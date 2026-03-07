@@ -40,6 +40,10 @@ quality_gate:
   # NOTE: Disabled by default (A/B under STEP_N=3 showed negative wall-time impact).
   cheap_filter_enabled: false
   cheap_filter_require_acceptable: false
+  subtree_blacklist_enabled: false
+  subtree_blacklist_path: null
+  subtree_blacklist_max_patterns: 200
+  subtree_blacklist_min_nodes: 1
   max_construct_failures_per_branch: 2
   max_json_parse_failures_per_branch: 2
 
@@ -67,8 +71,8 @@ llm:
   max_retries: 3
   retry_delay: 1.0
   json_mode_strict: true
-  json_mode_temperature: 0.5
-  freeform_temperature: 0.5
+  json_mode_temperature: 0.7
+  freeform_temperature: 0.7
   json_mode_response_format: json_object
   json_mode_json_schema: ""
   request_timeout_s: 60.0

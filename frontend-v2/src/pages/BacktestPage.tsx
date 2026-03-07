@@ -196,7 +196,10 @@ export const BacktestPage: React.FC = () => {
     })();
     (async () => {
       try {
-        const resp = await listOfflineBacktestRuns(selectedLibrary);
+        // Show all offline runs instead of filtering by selected library stem.
+        // This avoids missing valid results generated from filtered/derived libraries
+        // whose metrics filename prefix differs from the currently selected factor library.
+        const resp = await listOfflineBacktestRuns();
         if (resp.success && resp.data) {
           setOfflineRuns(resp.data.runs || []);
           setSelectedOfflineMetricsFile('');

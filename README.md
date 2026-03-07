@@ -212,6 +212,10 @@ EXPERIMENT_ID="paper_repro_r2" ./run.sh --relay "Price-Volume Factor Mining" "pa
 
 # Example: strict resume mode (requires existing relay state)
 EXPERIMENT_ID="paper_repro_r2" ./run.sh --resume "Price-Volume Factor Mining" "paper_reproduction_r2"
+
+# Example: optional subtree blacklist mode (JSON patterns)
+./run.sh --zoo-dedup --blacklist-file data/factorlib/subtree_blacklist.json \
+  "Price-Volume Factor Mining" "exp_blacklist"
 ```
 
 `run.sh` now enables low-disk mode by default. Use `--no-low-disk` to disable it explicitly.
@@ -222,6 +226,8 @@ Naming safety (important):
 - For a brand-new run, change both `EXPERIMENT_ID` and library suffix together (e.g. `paper_repro_r2` + `paper_reproduction_r2`).
 - Reusing `EXPERIMENT_ID` means you continue the same workspace/cache/log lineage.
 - Reusing library suffix writes to the same `data/factorlib/all_factors_library_<suffix>.json`, which can mix with old factors.
+- The trailing `suffix` only controls the factor-library filename; it does not select the relay/resume lineage.
+- If `--relay` or `--resume` is used without explicitly setting `EXPERIMENT_ID`, `run.sh` defaults to `relay_shared`, which can resume the wrong lineage while still writing into the suffix-matched factor library.
 
 Controlled parallelism (recommended on 8-core laptop):
 
@@ -234,6 +240,8 @@ Pre-calc cheap gate + construct stop-loss:
 
 - `quality_gate.cheap_filter_enabled: false` by default (A/B under `STEP_N=3` showed negative wall-time impact).
 - `quality_gate.cheap_filter_require_acceptable: false` by default; enable with `cheap_filter_enabled=true` only for workload-specific re-tests.
+- `quality_gate.subtree_blacklist_enabled: false` by default; when enabled, rejects expressions containing blacklisted AST subtrees (works even if `cheap_filter_enabled=false`).
+- `quality_gate.subtree_blacklist_path: null` by default; can also be injected with `--blacklist-file ...` in `run.sh`.
 - `quality_gate.max_construct_failures_per_branch: 2` caps repeated construct failures.
 - `quality_gate.max_json_parse_failures_per_branch: 2` caps repeated JSON parse failures in construct.
 
@@ -241,7 +249,7 @@ LLM runtime hardening (optimization-added options, not original baseline default
 
 - `llm.json_mode_response_format: json_object` enables protocol-level JSON output in `json_mode=true`.
 - `llm.json_mode_json_schema: ""` can be set to a JSON Schema string when provider supports schema mode.
-- Default keeps `llm.json_mode_temperature: 0.5` aligned with `llm.freeform_temperature: 0.5`; split temperatures should be enabled only after case-specific A/B.
+- Default keeps `llm.json_mode_temperature: 0.7` aligned with `llm.freeform_temperature: 0.7`; split temperatures should be enabled only after case-specific A/B.
 - `llm.request_timeout_s: 60.0`, `llm.retry_backoff: exponential`, `llm.retry_jitter: true`, `llm.retry_max_wait_seconds: 30.0` stabilize tail latency.
 - `llm.failover_base_urls: []` enables optional endpoint failover for consecutive failures.
 
@@ -273,6 +281,7 @@ Use `--relay` for chunked relay execution:
 
 - first leg runs `QUANTA_RELAY_CHUNK_ROUNDS` (default follows `evolution.relay_chunk_rounds` in config; main config is 6)
 - next `--relay` run auto-completes to `max_rounds`
+- optional `--rounds N` reliably overrides `evolution.max_rounds` via a temp config patch before relay scheduling
 
 ```bash
 # first relay leg (default first 6 rounds with current main config)
@@ -349,6 +358,7 @@ Interactive options:
 - `2` delete libraries by id (supports `1+3+5`).
 - `3` merge libraries by id (supports `1+2` and `all`), choose `zoo-method=ast|norm|both|none`, output file auto-named as `<prefix>_n<count>_<timestamp>.json`, then print merged summary (`n`, `H/M/L`) and export hint for `FACTOR_CoSTEER_FACTOR_ZOO_PATH`.
 - `5` run observable filter pipeline (`stage0→stage3`) by ids (supports `all`), choose output stage (`stage0|stage1|stage2|stage3|all`), save files with `n + timestamp + stage` suffix, and generate `manifest.json` for per-stage comparison. Defaults are fixed to `expr_dedup=ast`, `stage3_topn=all`, and output prefix `data/factorlib/selected/<source>_filter_pipeline`.
+- `6` export subtree blacklist JSON from a Stage1/merged JSON or Zoo CSV (default output `data/factorlib/subtree_blacklist.json`) for `run.sh --blacklist-file`.
 
 ### 5. Independent Backtesting
 

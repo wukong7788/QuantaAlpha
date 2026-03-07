@@ -1,7 +1,7 @@
 # SPECS.md
 
 > QuantaAlpha 单一执行文档（Single Source of Truth）  
-> 最后更新：2026-03-03
+> 最后更新：2026-03-04
 
 ## 1. 当前目标（Active Goals）
 
@@ -81,6 +81,12 @@ STEP_N=5 ./minirun.sh
 ./run.sh --low-disk "价量因子挖掘" "pv_v1_ds"
 ./run.sh --relay "价量因子挖掘" "pv_v1_ds"
 ./run.sh --resume "价量因子挖掘" "pv_v1_ds"
+./run.sh --zoo-dedup --blacklist-file data/factorlib/subtree_blacklist.json "价量因子挖掘" "pv_v1_ds"
+
+# 重要：suffix 只决定因子库文件名，不决定 relay/resume 续跑 lineage
+# 如果没有显式设置 EXPERIMENT_ID，--relay/--resume 会默认落到 relay_shared
+EXPERIMENT_ID="pv_v1_ds" ./run.sh --relay "价量因子挖掘" "pv_v1_ds"
+EXPERIMENT_ID="pv_v1_ds" ./run.sh --resume "价量因子挖掘" "pv_v1_ds"
 
 # 运行进度查看（round/step/factors）
 ./scripts/run_doctor.sh
@@ -93,7 +99,7 @@ STEP_N=5 ./minirun.sh
 # 交互选项：
 # - 1: 列表（显示 n + H/M/L + ARR(p50)）
 # - 2: 按 id 删除（支持 1+3+5）
-# - 3: 按 id 合并（支持 1+2 或 all；可选 zoo-method=ast|norm|both|none）
+# - 3: 按 id 合并（支持 1+2 或 all；可选 zoo-method=ast|norm|both|none；可选导出 Stage1 expr-dedup pool）
 #   合并输出文件自动带因子数+时间戳：<prefix>_n<count>_<YYYYMMDD_HHMMSS>.json
 #   合并后会输出 merged 库摘要（n + H/M/L），并打印可直接 export 的 Zoo 路径。
 #   FACTOR_CoSTEER_FACTOR_ZOO_PATH 用于指向去重基准 Zoo CSV（FactorRegulator 读取该文件做跨轮次表达式去重）。
@@ -103,6 +109,9 @@ STEP_N=5 ./minirun.sh
 #   - 固定默认：Stage1 expr dedup = ast，Stage3 topn = all，输出前缀 = data/factorlib/selected/<source>_filter_pipeline（交互不再单独询问这三项）
 #   - 可选仅导出某个 stage 或 all；产物文件名带 n + 时间戳 + stage 后缀
 #   - 同时产出 manifest.json，记录每阶段 input/kept/dropped/reasons/path 便于横向对照
+# - 6: 导出 subtree blacklist JSON（来源支持 Stage1/merge JSON 或 Zoo CSV）
+#   - 默认输出 data/factorlib/subtree_blacklist.json
+#   - 产物可直接用于 run.sh --blacklist-file 做 blacklist 模式 A/B
 
 # 可控并行（建议 8 核机器先用 2）
 # configs/experiment.yaml
@@ -114,12 +123,18 @@ STEP_N=5 ./minirun.sh
 # quality_gate.cheap_filter_enabled: false  # 默认关闭（A/B（STEP_N=3）为负优化）
 # quality_gate.max_construct_failures_per_branch: 2
 # quality_gate.max_json_parse_failures_per_branch: 2
+# quality_gate.subtree_blacklist_enabled: false
+# quality_gate.subtree_blacklist_path: null
+# quality_gate.subtree_blacklist_max_patterns: 200
+# quality_gate.subtree_blacklist_min_nodes: 1
 
 # LLM 运行时稳态（优化新增选项，非原始基线默认）
 # llm.json_mode_response_format: json_object
 # llm.json_mode_json_schema: ""
-# llm.json_mode_temperature: 0.5  # 默认与 freeform 保持一致；温度分层需单独 A/B 再启用
-# llm.freeform_temperature: 0.5
+# llm.json_mode_temperature: 0.7  # 默认与 freeform 保持一致；温度分层需单独 A/B 再启用
+# llm.freeform_temperature: 0.7
+# NOTE: 为避免 QuantaAlpha 与 RD-Agent/LiteLLM 的 env-only 设置漂移，
+#       llm.freeform_temperature 会在启动时同步到环境变量 CHAT_TEMPERATURE。
 # llm.request_timeout_s: 60.0
 # llm.retry_backoff: exponential
 # llm.retry_jitter: true
@@ -131,6 +146,9 @@ STEP_N=5 ./minirun.sh
 ./scripts/run_backtest_safe.sh --library all_factors_library_xxx.json --threads 6 --max-factors 80 --corr-dedup --dedup-method two_stage --dedup-linkage complete --dedup-sample-split train_valid --dedup-per-cluster 1
 ./scripts/run_backtest_safe.sh --interactive   # 选择单库后可一键启用实盘去重预设
 ./scripts/run_backtest_safe.sh --factors-filter --library all_factors_library_xxx.json   # 仅执行过滤并输出最终剩余因子数
+# 交互第 1 步支持 FILTER+BT：先过滤再回测，并可选择 stage1/stage2/stage3 做对比
+# FILTER+BT 交互可选是否补算 uncached（默认跳过；选 y 等价 --no-skip-uncached）
+# 日志里 result.h5 miss 仅代表 cache_location 未命中，会自动回退 MD5 cache；MD5 命中不重算
 ./scripts/run_backtest_safe.sh --bob --bob-libraries "data/factorlib/all_factors_library_*.json" --bob-top 80
 
 # Factor Zoo 管理
@@ -168,6 +186,8 @@ EXPERIMENT_ID="paper_repro_23r" QUANTA_RELAY_CHUNK_ROUNDS=6 ./run.sh --rounds 23
 
 # 实验流程 A/B（baseline/optimized；可重复 times 次并输出对比汇总）
 .venv/bin/python scripts/abtest_experiment.py compare --name opt2_json_protocol --base-config configs/experiment_smoke.yaml --direction "价量因子挖掘" --step-n 3 --times 3 --set-baseline llm.json_mode_response_format=none --set-optimized llm.json_mode_response_format=json_object
+# 脚本会实时打印 [ABTEST] 进度（start/finished/doctor + run_log 路径），避免长跑期间“无输出”误判。
+# `ABTEST_RESULT`/`ABTEST_SUMMARY` 还会附带基于 `data/factorlib/all_factors_library_<suffix>.json` 提取的 `factor_quality` 汇总（每个因子的 `backtest_results` 指标中位数/最优值），以及 `subtree_blacklist` 是否命中（从 run.log 统计 rejected 次数）。
 
 # 横向对比（不重算，直接读结果文件）
 ./scripts/run_backtest_safe.sh --view-results
@@ -175,6 +195,10 @@ EXPERIMENT_ID="paper_repro_23r" QUANTA_RELAY_CHUNK_ROUNDS=6 ./run.sh --rounds 23
 ```
 
 ## 7. 会话变更日志（Session Log）
+
+- 2026-03-07:
+  - 文档补充 relay/resume 误用陷阱：`suffix` 仅控制 `all_factors_library_<suffix>.json`，不控制续跑 lineage。
+  - 明确 `run.sh` 在 `--relay/--resume` 且未显式设置 `EXPERIMENT_ID` 时会默认使用 `relay_shared`，可能导致“接错实验但仍写入目标 suffix 因子库”。
 
 - 2026-02-26:
   - 修复 `~/.codex/scripts/notify-telegram.sh`
@@ -214,7 +238,7 @@ EXPERIMENT_ID="paper_repro_23r" QUANTA_RELAY_CHUNK_ROUNDS=6 ./run.sh --rounds 23
 - 2026-02-28 (第二批):
   - **Factor Zoo 跨轮次去重流水线**：新增 `scripts/update_factor_zoo.py`（`build / update / status`），同时输出 JSON（元数据）+ CSV（`factor_zoo.csv`，供 `FactorRegulator` `pd.read_csv` 加载）。
   - **`run.sh --zoo-dedup`**：新 flag，导出 `FACTOR_CoSTEER_FACTOR_ZOO_PATH`，实验结束后自动调用 `update_factor_zoo.py update`。
-  - **`run.sh --rounds N`**：新 flag，遍历 `experiment.yaml` 创建临时配置（`max_rounds` 覆盖），运行结束后自动清理临时文件。
+  - **`run.sh --rounds N`**：新 flag，创建临时配置覆盖 `evolution.max_rounds`（基于 Python 文本替换，避免不同 `sed` 实现导致覆盖失效），运行结束后自动清理临时文件。
   - **`minirun.sh --low-disk / --zoo-dedup`**：新增 flag 解析，透传给内部 `run.sh`。
   - **`configs/backtest_2021_validate.yaml`**：新增，回测区间对齐 2021-01-01 ~ 2021-12-31（与挖掘期内打分口径一致）。
   - **`PAPER_REPRODUCTION_GUIDE.md` 脚本区重构**：脚本 0（minirun）、脚本 1（安全模式 + zoo-dedup）、脚本 2（土豪 23 轮，化简为 2 步）。

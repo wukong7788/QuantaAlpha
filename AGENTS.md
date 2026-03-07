@@ -31,6 +31,20 @@ These terms are easy to mix up during paper reproduction and performance optimiz
 5. Step: the fixed 5-step loop inside a task: `factor_propose -> factor_construct -> factor_calculate -> factor_backtest -> feedback`.
 6. Attempt: empty-factor retry count for a task (count = `evolution.max_empty_retries` + 1 attempts total).
 
+## Session Labels (a01 / a02 / b01)
+
+Use short labels for multi-round discussion, optimization, or paper-reproduction planning so later conversations can refer back to one concrete variant unambiguously.
+
+- Format: `<session_letter><two_digits>`
+- Examples: `a01`, `a02`, `b01`, `b02`
+- Interpretation:
+  - `a01`, `a02` = first session/thread, variant 1/2
+  - `b01`, `b02` = second session/thread, variant 1/2
+- Preferred usage:
+  - When proposing multiple ideas, give each one a stable label plus a 1-line objective.
+  - The user can later reply with instructions such as `按照 a02 优化` or `对比 a01 和 b02`.
+  - Keep labels stable inside the same topic; do not silently rename them mid-discussion.
+
 ## Specs Sync Policy
 
 - Contract/spec source: `SPECS.md` (project behavior contract, not just notes).
@@ -56,6 +70,7 @@ These terms are easy to mix up during paper reproduction and performance optimiz
 - If requirements are ambiguous, ask the user for clarification before implementing structural changes.
 - If the user is brainstorming or "just want to discuss options", provide a concrete proposal first and do not start modifying code/files until the user explicitly asks to implement.
 - Process lifetime guardrail: only add `timeout` to short-lived diagnostic/probing commands. Do not apply `timeout` by default to long-running experiment/backtest/data jobs unless the user explicitly requests a hard stop.
+- For code review / review findings in this repo, default to Chinese unless the user explicitly asks for another language. Keep file paths, flags, env vars, and code identifiers in their original form.
 
 ## Documentation Hygiene (non-spec docs)
 
@@ -64,6 +79,56 @@ These terms are easy to mix up during paper reproduction and performance optimiz
   - Do **not** blindly append/stack notes ("堆砌") if the new content is large.
   - First propose a clearer structure outline (sections + ordering) to keep the doc readable.
   - Apply the restructure **only after** the user explicitly agrees to the proposed new structure.
+
+### Module Knowledge Docs (`docs/modules/*.md`)
+
+- When one major module accumulates repeated tuning, optimization, or troubleshooting work, prefer one focused Markdown doc for that module instead of mixing everything into a single giant note.
+- Good candidates:
+  - `docs/modules/factor_generation.md`
+  - `docs/modules/factor_calculation.md`
+  - `docs/modules/backtest.md`
+  - `docs/modules/data_pipeline.md`
+  - `docs/modules/frontend.md`
+  - `docs/modules/experiment_orchestration.md`
+- These docs should store durable, high-value knowledge:
+  - validated optimization ideas
+  - rejected ideas and why they failed
+  - historical pitfalls
+  - tuning notes
+  - measurement summaries
+  - follow-up questions / next candidates
+- Separation of roles:
+  - `SPECS.md` = behavior contract / source of truth
+  - `docs/modules/*.md` = experience, experiments, optimization notes, and review context
+
+### Readability First
+
+- Readability is more important than raw accumulation.
+- Prefer one focused doc per module, stable headings, and short summaries before raw details.
+- Explicitly separate `validated`, `rejected`, and `to-verify` content when that improves scanability.
+- If a module doc becomes too long or hard to scan, recommend restructuring before adding more:
+  - split by workflow stage
+  - split by experiment family
+  - move stale details into a history appendix
+  - rewrite the outline first, then continue appending
+- Avoid turning docs into append-only dumps.
+
+### Evidence Format
+
+- When documenting validation results, prefer horizontally comparable Markdown tables over scattered prose whenever the data fits naturally into rows/columns.
+- Typical columns:
+  - variant / label
+  - hypothesis
+  - dataset / market / date range
+  - factor count / sample size
+  - key metrics
+  - conclusion
+- Use tables especially for:
+  - A/B comparisons
+  - before/after optimization results
+  - parameter sweeps
+  - competing implementation choices
+  - accepted vs rejected variants
 
 ### Changelog Policy (`CHANGELOG.md`)
 
@@ -130,6 +195,7 @@ Scope: human-facing entry scripts used in day-to-day operation.
 5. Round terminology: `evolution.max_rounds` uses **phase-round** (each phase completion increments `round`), not “epoch=original+mutation+crossover”.
 6. Fine-grained resume: on restart via `--relay/--resume`, each task directory will resume from the latest `__session__` snapshot and continue from the next unfinished step (within the 5-step loop). If the task enters an “empty-factor retry attempt”, it will re-run fresh (not resume the previous attempt).
 7. Naming safety: change both `EXPERIMENT_ID` and suffix for a new run; reusing suffix appends to same `all_factors_library_<suffix>.json`.
+8. Relay/resume identity trap: the trailing `suffix` only controls `all_factors_library_<suffix>.json`; it does **not** choose relay lineage. If `--relay/--resume` is used without explicitly setting `EXPERIMENT_ID`, `run.sh` defaults to `EXPERIMENT_ID=relay_shared`, which can accidentally resume the wrong log/workspace while still writing into the suffix-matched factor library. Always check the printed `EXPERIMENT_ID`, `LOG_TRACE_PATH`, and `WORKSPACE_PATH` before leaving a long run unattended.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -297,6 +363,11 @@ Managing the zoo:
 4. `minirun.sh` stability
    - End-time/unbound handling fixed.
 
+5. macOS shell portability (`mktemp` / `sed`) in runner scripts
+   - Avoid `mktemp /tmp/foo_XXXXXX.yaml` (BSD `mktemp` requires suffix-free template ending in `XXXXXX`).
+   - Prefer `mktemp "${TMPDIR:-/tmp}/foo_XXXXXX"` and then write content into that path.
+   - Avoid GNU-only `sed` regex (`\+`, `-r`) for critical config patching; prefer Python patching for deterministic behavior across macOS/Linux.
+
 ## Telegram Notification
 
 Used in local automation:
@@ -312,3 +383,9 @@ Used in local automation:
 3. **土豪模式（23 轮）**：  
    `./scripts/safe_cleanup.sh` → `EXPERIMENT_ID="paper_repro_23r" ./run.sh --rounds 23 --low-disk --relay --zoo-dedup "价量因子挖掘" "paper_repro_23r"`
 4. **独立回测**：`./scripts/run_backtest_safe.sh --interactive`
+
+## Changelog Date Hygiene
+
+- When updating `CHANGELOG.md`, always put entries under the actual current date of the run.
+- Do not place today's changes into a previous date section.
+- If today's section does not exist, create it first, then add entries.

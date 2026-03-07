@@ -2,6 +2,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUN_SH = REPO_ROOT / "run.sh"
@@ -45,3 +47,25 @@ def test_run_sh_fails_fast_when_blacklist_has_no_patterns(tmp_path):
 
     assert result.returncode != 0
     assert "contains no raw patterns" in result.stderr
+
+
+def test_run_sh_prints_blacklist_summary_before_mining(tmp_path):
+    valid_path = tmp_path / "valid_blacklist.json"
+    valid_path.write_text(json.dumps({"patterns": ["ts_sum($close, 5)"]}), encoding="utf-8")
+
+    with pytest.raises(subprocess.TimeoutExpired) as exc_info:
+        subprocess.run(
+            ["bash", str(RUN_SH), "--blacklist-file", str(valid_path), "test direction"],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+
+    stdout = exc_info.value.stdout or ""
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode("utf-8", errors="replace")
+    assert "Subtree blacklist mode: ON" in stdout
+    assert "Blacklist entries (raw): 1" in stdout
+    assert "Blacklist entries (usable): 1" in stdout

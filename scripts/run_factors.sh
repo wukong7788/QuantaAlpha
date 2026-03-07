@@ -521,6 +521,18 @@ merge_factor_libraries_by_ids() {
     skip_unparsable="$(echo "${skip_unparsable:-y}" | tr '[:upper:]' '[:lower:]' | xargs)"
   fi
 
+  echo
+  echo "Note:"
+  echo "  - Zoo (norm/ast) is for novelty filtering and does NOT change pooled factor count."
+  echo "  - If you want a strict 'one expression -> one factor' pool, also export Stage1 output (expr dedup)."
+  local export_stage1
+  read -r -p "Also write Stage1 expr-dedup pool (ast)? [Y/n]: " export_stage1
+  export_stage1="$(echo "${export_stage1:-y}" | tr '[:upper:]' '[:lower:]' | xargs)"
+  local enable_stage1="false"
+  if [[ "$export_stage1" != "n" && "$export_stage1" != "no" ]]; then
+    enable_stage1="true"
+  fi
+
   local merge_ts
   merge_ts="$(date "+%Y%m%d_%H%M%S")"
 
@@ -528,6 +540,15 @@ merge_factor_libraries_by_ids() {
   local tmp_out_abs="$tmp_out_path"
   if [[ "$tmp_out_abs" != /* ]]; then
     tmp_out_abs="$PROJECT_ROOT/$tmp_out_abs"
+  fi
+
+  local tmp_stage1_path="" tmp_stage1_abs=""
+  if [[ "$enable_stage1" == "true" ]]; then
+    tmp_stage1_path="${out_prefix}_tmp_${merge_ts}_stage1.json"
+    tmp_stage1_abs="$tmp_stage1_path"
+    if [[ "$tmp_stage1_abs" != /* ]]; then
+      tmp_stage1_abs="$PROJECT_ROOT/$tmp_stage1_abs"
+    fi
   fi
 
   local libraries_spec
@@ -543,6 +564,9 @@ merge_factor_libraries_by_ids() {
     if [[ "$skip_unparsable" != "n" && "$skip_unparsable" != "no" ]]; then
       cmd+=("--skip-unparsable")
     fi
+  fi
+  if [[ "$enable_stage1" == "true" ]]; then
+    cmd+=("--out-stage1" "$tmp_stage1_path" "--stage1-expr-dedup-method" "ast")
   fi
 
   echo
@@ -583,6 +607,29 @@ PY
 
   mv "$tmp_out_abs" "$final_out_abs"
 
+  local stage1_n="" final_stage1_path="" final_stage1_abs=""
+  if [[ "$enable_stage1" == "true" ]]; then
+    stage1_n="$("$PYTHON_BIN" - "$tmp_stage1_abs" <<'PY'
+import json, sys
+p = sys.argv[1]
+with open(p, "r", encoding="utf-8") as f:
+    data = json.load(f) or {}
+factors = data.get("factors") if isinstance(data, dict) else {}
+print(len(factors) if isinstance(factors, dict) else 0)
+PY
+)"
+    if [[ ! "$stage1_n" =~ ^[0-9]+$ ]]; then
+      echo "Error: failed to read stage1 factor count."
+      return 1
+    fi
+    final_stage1_path="${out_prefix}_n${stage1_n}_${merge_ts}_stage1.json"
+    final_stage1_abs="$final_stage1_path"
+    if [[ "$final_stage1_abs" != /* ]]; then
+      final_stage1_abs="$PROJECT_ROOT/$final_stage1_abs"
+    fi
+    mv "$tmp_stage1_abs" "$final_stage1_abs"
+  fi
+
   local final_ast_csv="" final_norm_csv=""
   if [[ "$zoo_method" == "ast" ]]; then
     local tmp_csv="${tmp_out_abs%.json}_zoo.csv"
@@ -620,10 +667,23 @@ PY
     final_rel="${final_out_abs#"$PROJECT_ROOT"/}"
   fi
   echo "  $final_rel"
+  if [[ -n "${final_stage1_abs:-}" && -f "$final_stage1_abs" ]]; then
+    local stage1_rel="$final_stage1_abs"
+    if [[ "$final_stage1_abs" == "$PROJECT_ROOT/"* ]]; then
+      stage1_rel="${final_stage1_abs#"$PROJECT_ROOT"/}"
+    fi
+    echo "Stage1 expr-dedup pool:"
+    echo "  $stage1_rel"
+  fi
 
   echo
   echo "Merged output summary:"
   run_factor_library_inspector list "$final_out_abs"
+  if [[ -n "${final_stage1_abs:-}" && -f "$final_stage1_abs" ]]; then
+    echo
+    echo "Stage1 output summary:"
+    run_factor_library_inspector list "$final_stage1_abs"
+  fi
 
   echo
   if [[ -n "$final_ast_csv" ]]; then
@@ -1035,6 +1095,12 @@ PY
 
   echo
   echo "Running stage pipeline (0->3)..."
+  local stop_after_stage="none"
+  case "$output_stage" in
+    stage1) stop_after_stage="stage1" ;;
+    stage2) stop_after_stage="stage2" ;;
+    *) stop_after_stage="none" ;;
+  esac
   "$PYTHON_BIN" scripts/factor_filtering/select_factors.py \
     --library "$source_pool_path" \
     --config "$config_abs" \
@@ -1042,6 +1108,7 @@ PY
     --out-stage1 "$tmp_stage1" \
     --out-stage2 "$tmp_stage2" \
     --out "$tmp_stage3" \
+    --stop-after-stage "$stop_after_stage" \
     --dedup-method two_stage \
     --cluster-linkage complete \
     --topn "$topn_val" \
@@ -1053,17 +1120,35 @@ PY
     --compute-missing \
     --report "$tmp_report"
 
+  local manifest_stage2_path="$tmp_stage2"
+  local manifest_stage3_path="$tmp_stage3"
+  case "$output_stage" in
+    stage1)
+      manifest_stage2_path="${tmp_stage2}.missing"
+      manifest_stage3_path="${tmp_stage3}.missing"
+      ;;
+    stage2)
+      manifest_stage3_path="${tmp_stage3}.missing"
+      ;;
+  esac
+
   local n0 n1 n2 n3
   n0="$(count_factors_in_library "$source_pool_path")"
   n1="$(count_factors_in_library "$tmp_stage1")"
-  n2="$(count_factors_in_library "$tmp_stage2")"
-  n3="$(count_factors_in_library "$tmp_stage3")"
+  n2="$(count_factors_in_library "$manifest_stage2_path")"
+  n3="$(count_factors_in_library "$manifest_stage3_path")"
+
+  local manifest_count="$n3"
+  case "$output_stage" in
+    stage1) manifest_count="$n1" ;;
+    stage2) manifest_count="$n2" ;;
+  esac
 
   local out_stage0="${out_prefix}_n${n0}_${run_ts}_stage0.json"
   local out_stage1="${out_prefix}_n${n1}_${run_ts}_stage1.json"
   local out_stage2="${out_prefix}_n${n2}_${run_ts}_stage2.json"
   local out_stage3="${out_prefix}_n${n3}_${run_ts}_stage3.json"
-  local out_manifest="${out_prefix}_n${n3}_${run_ts}_manifest.json"
+  local out_manifest="${out_prefix}_n${manifest_count}_${run_ts}_manifest.json"
 
   local copy_stage0="false" copy_stage1="false" copy_stage2="false" copy_stage3="false"
   case "$output_stage" in
@@ -1084,7 +1169,7 @@ PY
   [[ "$copy_stage2" == "true" ]] && cp "$tmp_stage2" "$out_stage2"
   [[ "$copy_stage3" == "true" ]] && cp "$tmp_stage3" "$out_stage3"
 
-  "$PYTHON_BIN" - "$source_pool_path" "$tmp_stage1" "$tmp_stage2" "$tmp_stage3" "$tmp_report" "$out_manifest" "$run_ts" "$expr_method" "$config_abs" <<'PY'
+  "$PYTHON_BIN" - "$source_pool_path" "$tmp_stage1" "$manifest_stage2_path" "$manifest_stage3_path" "$tmp_report" "$out_manifest" "$run_ts" "$expr_method" "$config_abs" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -1188,6 +1273,307 @@ PY
   [[ -n "$tmp_merged" && -f "$tmp_merged" ]] && rm -f "$tmp_merged" 2>/dev/null || true
 }
 
+export_subtree_blacklist() {
+  echo "Blacklist source formats:"
+  echo "  - Stage1/merged factor library JSON (factors.*.factor_expression)  [Recommended]"
+  echo "  - Zoo CSV (factor_expression column)"
+  echo "  - Existing blacklist JSON (patterns/list)"
+  echo
+
+  local source_kind_pick source_kind default_label
+  echo "Select source type:"
+  echo "  1) Stage1 JSON (Recommended)"
+  echo "  2) Zoo CSV"
+  echo "  3) Existing blacklist JSON"
+  echo "  4) Custom path"
+  read -r -p "Select [1]: " source_kind_pick
+  source_kind_pick="$(echo "${source_kind_pick:-1}" | tr '[:upper:]' '[:lower:]' | xargs)"
+  case "$source_kind_pick" in
+    1|stage1) source_kind="stage1"; default_label="stage1_export" ;;
+    2|zoo|csv) source_kind="zoo"; default_label="zoo_export" ;;
+    3|blacklist|json) source_kind="blacklist"; default_label="blacklist_repack" ;;
+    4|custom) source_kind="custom"; default_label="custom_export" ;;
+    *)
+      echo "Error: invalid source type '$source_kind_pick'."
+      return 2
+      ;;
+  esac
+
+  local source_path=""
+  if [[ "$source_kind" == "custom" ]]; then
+    read -r -p "Source file path: " source_path
+    source_path="$(echo "${source_path:-}" | xargs)"
+  else
+    local -a candidates=()
+    local cand
+    while IFS= read -r cand; do
+      [[ -n "$cand" ]] && candidates+=("$cand")
+    done < <("$PYTHON_BIN" - "$PROJECT_ROOT" "$source_kind" <<'PY'
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+kind = str(sys.argv[2]).strip().lower()
+
+if kind == "stage1":
+    patterns = [
+        "data/factorlib/merged/*_stage1.json",
+        "data/factorlib/selected/*_stage1.json",
+        "data/factorlib/**/*_stage1.json",
+    ]
+elif kind == "zoo":
+    patterns = [
+        "data/factorlib/factor_zoo.csv",
+        "data/factorlib/merged/*_zoo*.csv",
+        "data/factorlib/selected/*_zoo*.csv",
+        "data/factorlib/**/*_zoo*.csv",
+    ]
+else:
+    patterns = [
+        "data/factorlib/*blacklist*.json",
+        "data/factorlib/**/*blacklist*.json",
+    ]
+
+found: dict[str, Path] = {}
+for pat in patterns:
+    for p in root.glob(pat):
+        if p.is_file():
+            found[str(p.resolve())] = p.resolve()
+
+items = sorted(found.values(), key=lambda p: p.stat().st_mtime, reverse=True)
+for p in items[:30]:
+    try:
+        print(str(p.relative_to(root)))
+    except Exception:
+        print(str(p))
+PY
+)
+
+    if [[ "${#candidates[@]}" -gt 0 ]]; then
+      echo
+      echo "Detected ${#candidates[@]} candidate files:"
+      local i c
+      for i in "${!candidates[@]}"; do
+        c="${candidates[$i]}"
+        printf "  %2d) %s\n" "$((i + 1))" "$c"
+      done
+      local source_pick
+      read -r -p "Select id [1] or input custom path: " source_pick
+      source_pick="$(echo "${source_pick:-1}" | xargs)"
+      if [[ "$source_pick" =~ ^[0-9]+$ ]]; then
+        if (( source_pick >= 1 && source_pick <= ${#candidates[@]} )); then
+          source_path="${candidates[$((source_pick - 1))]}"
+        else
+          echo "Error: invalid id '$source_pick'."
+          return 2
+        fi
+      elif [[ -n "$source_pick" ]]; then
+        source_path="$source_pick"
+      else
+        source_path="${candidates[0]}"
+      fi
+    else
+      echo
+      echo "No candidate files found for source type '$source_kind'."
+      read -r -p "Source file path: " source_path
+      source_path="$(echo "${source_path:-}" | xargs)"
+    fi
+  fi
+
+  if [[ -z "$source_path" ]]; then
+    echo "Error: empty source path."
+    return 2
+  fi
+  local source_abs="$source_path"
+  if [[ "$source_abs" != /* ]]; then
+    source_abs="$PROJECT_ROOT/$source_abs"
+  fi
+  if [[ ! -f "$source_abs" ]]; then
+    echo "Error: source file not found: $source_path"
+    return 2
+  fi
+
+  local out_path
+  read -r -p "Output blacklist path [data/factorlib/subtree_blacklist.json]: " out_path
+  out_path="$(echo "${out_path:-data/factorlib/subtree_blacklist.json}" | xargs)"
+  if [[ -z "$out_path" ]]; then
+    echo "Error: empty output path."
+    return 2
+  fi
+
+  local label
+  read -r -p "Pattern label [${default_label}]: " label
+  label="$(echo "${label:-$default_label}" | xargs)"
+
+  local max_patterns
+  read -r -p "Max patterns to keep (0=all) [0]: " max_patterns
+  max_patterns="$(echo "${max_patterns:-0}" | xargs)"
+  if ! [[ "$max_patterns" =~ ^[0-9]+$ ]]; then
+    echo "Error: max patterns must be an integer."
+    return 2
+  fi
+
+  local out_abs="$out_path"
+  if [[ "$out_abs" != /* ]]; then
+    out_abs="$PROJECT_ROOT/$out_abs"
+  fi
+
+  if ! "$PYTHON_BIN" - "$source_abs" "$out_abs" "$label" "$max_patterns" <<'PY'
+import csv
+import json
+import sys
+from io import StringIO
+from pathlib import Path
+
+src = Path(sys.argv[1]).resolve()
+out = Path(sys.argv[2]).resolve()
+label = str(sys.argv[3]).strip()
+max_patterns = int(sys.argv[4])
+
+
+def norm_expr(v: str) -> str:
+    return " ".join(str(v or "").strip().split())
+
+
+def dedup_key(expr: str) -> str:
+    return "".join(str(expr or "").split())
+
+
+def load_from_json(path: Path) -> list[str]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    out_exprs: list[str] = []
+
+    if isinstance(payload, dict):
+        factors = payload.get("factors")
+        if isinstance(factors, dict):
+            for item in factors.values():
+                if not isinstance(item, dict):
+                    continue
+                expr = norm_expr(item.get("factor_expression", ""))
+                if expr:
+                    out_exprs.append(expr)
+            return out_exprs
+
+        patterns = payload.get("patterns")
+        if isinstance(patterns, list):
+            for item in patterns:
+                if isinstance(item, str):
+                    expr = norm_expr(item)
+                elif isinstance(item, dict):
+                    expr = norm_expr(item.get("expr", item.get("expression", "")))
+                else:
+                    expr = ""
+                if expr:
+                    out_exprs.append(expr)
+            return out_exprs
+
+    if isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, str):
+                expr = norm_expr(item)
+            elif isinstance(item, dict):
+                expr = norm_expr(item.get("expr", item.get("expression", "")))
+            else:
+                expr = ""
+            if expr:
+                out_exprs.append(expr)
+        return out_exprs
+
+    return out_exprs
+
+
+def load_from_csv(path: Path) -> list[str]:
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    if not text.strip():
+        return []
+
+    rows = list(csv.reader(StringIO(text)))
+    if not rows:
+        return []
+
+    header = [str(x).strip().lower() for x in rows[0]]
+    expr_idx = -1
+    data_rows = rows
+    if "factor_expression" in header:
+        expr_idx = header.index("factor_expression")
+        data_rows = rows[1:]
+    elif "expression" in header:
+        expr_idx = header.index("expression")
+        data_rows = rows[1:]
+
+    out_exprs: list[str] = []
+    for row in data_rows:
+        if not row:
+            continue
+        if expr_idx >= 0 and expr_idx < len(row):
+            expr = norm_expr(",".join(row[expr_idx:]))
+        else:
+            expr = norm_expr(row[-1])
+        if expr:
+            out_exprs.append(expr)
+    return out_exprs
+
+
+if src.suffix.lower() == ".csv":
+    raw_exprs = load_from_csv(src)
+elif src.suffix.lower() == ".json":
+    raw_exprs = load_from_json(src)
+else:
+    raise SystemExit(f"Unsupported source type: {src.suffix}. Use .json or .csv")
+
+deduped: list[str] = []
+seen: set[str] = set()
+for expr in raw_exprs:
+    key = dedup_key(expr)
+    if not key:
+        continue
+    if key in seen:
+        continue
+    seen.add(key)
+    deduped.append(expr)
+
+if max_patterns > 0:
+    deduped = deduped[:max_patterns]
+
+patterns = []
+for expr in deduped:
+    item = {"expr": expr}
+    if label:
+        item["label"] = label
+    patterns.append(item)
+
+payload = {
+    "metadata": {
+        "source": str(src),
+        "source_count_raw": len(raw_exprs),
+        "source_count_unique": len(seen),
+        "exported_count": len(deduped),
+        "format": "subtree_blacklist_v1",
+    },
+    "patterns": patterns,
+}
+
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+print(f"[Blacklist] source={src}")
+print(f"[Blacklist] raw={len(raw_exprs)} unique={len(seen)} exported={len(deduped)}")
+print(f"[Blacklist] wrote={out}")
+PY
+  then
+    echo "Error: failed to export blacklist from source."
+    return 1
+  fi
+
+  local out_rel="$out_abs"
+  if [[ "$out_abs" == "$PROJECT_ROOT/"* ]]; then
+    out_rel="${out_abs#"$PROJECT_ROOT"/}"
+  fi
+  echo
+  echo "Run with blacklist mode:"
+  echo "  ./run.sh --low-disk --zoo-dedup --blacklist-file \"$out_rel\" \"价量因子挖掘\" \"ab_warmstart_b\""
+}
+
 usage() {
   cat <<'USAGE'
 Usage:
@@ -1199,6 +1585,7 @@ Interactive options:
   3) Merge libraries by id (supports `+` and `all`)
   4) Repair factor cache by id (dry-run + apply)
   5) Filter pipeline (stage0->3 + manifest)
+  6) Export subtree blacklist JSON (from Stage1 JSON / Zoo CSV)
   0) Exit
 USAGE
 }
@@ -1215,6 +1602,7 @@ while true; do
   echo "  3) [MERGE] merge libraries by id"
   echo "  4) [CACHE] repair factor cache by id"
   echo "  5) [FILTER] run observable filter pipeline by id"
+  echo "  6) [BLACKLIST] export subtree blacklist JSON"
   echo "  0) [EXIT]"
   read -r -p "Select [1]: " pick
   pick="${pick:-1}"
@@ -1251,6 +1639,13 @@ while true; do
     5|filter|FILTER)
       if ! filter_factor_libraries_by_ids; then
         echo "Error: filter pipeline failed."
+      fi
+      echo
+      read -r -p "Press Enter to go back: " _
+      ;;
+    6|blacklist|BLACKLIST|export-blacklist)
+      if ! export_subtree_blacklist; then
+        echo "Error: blacklist export failed."
       fi
       echo
       read -r -p "Press Enter to go back: " _

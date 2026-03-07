@@ -548,6 +548,12 @@ def main() -> int:
         default="",
         help="Optional output library after exposure corr stage (before IC-series stage)",
     )
+    parser.add_argument(
+        "--stop-after-stage",
+        choices=("none", "stage1", "stage2", "stage3"),
+        default="none",
+        help="Optional short-circuit: stop after writing selected stage output.",
+    )
 
     parser.add_argument(
         "--topn",
@@ -669,23 +675,12 @@ def main() -> int:
             f"duplicates_removed={expr_stats.duplicates_removed} ast_parse_failed={expr_stats.ast_parse_failed}"
         )
 
-    sample_start, sample_end, sample_window_source = _resolve_sample_window(config, args.sample_split)
-    full_index = _load_base_index(config, start_time=sample_start, end_time=sample_end)
-    sample_idx = _sample_index(full_index, args.sample_size, args.seed)
-    print(
-        "[Sample] "
-        f"split={args.sample_split} "
-        f"window={sample_start}~{sample_end} "
-        f"source={sample_window_source} "
-        f"size={len(sample_idx)} (from base_index={len(full_index)}) seed={args.seed}"
-    )
-
     if args.dry_run:
         print("[DryRun] exit (no selection performed)")
         return 0
 
+    stage1_factors = {fid: info for fid, info in factor_items if isinstance(info, dict)}
     if args.out_stage1:
-        stage1_factors = {fid: info for fid, info in factor_items if isinstance(info, dict)}
         _write_factor_library_json(
             Path(args.out_stage1),
             base_meta=(data.get("metadata") or {}) if isinstance(data.get("metadata"), dict) else {},
@@ -698,7 +693,50 @@ def main() -> int:
         )
         print(f"[Stage1] wrote {len(stage1_factors)} factors -> {args.out_stage1}")
 
+    if args.stop_after_stage == "stage1":
+        _write_factor_library_json(
+            Path(args.out),
+            base_meta=(data.get("metadata") or {}) if isinstance(data.get("metadata"), dict) else {},
+            factors=stage1_factors,
+            extra_meta={
+                "selection_stage": "stage1_expression_dedup",
+                "expr_dedup": expr_stats.__dict__,
+                "source_library": str(library_path),
+                "stop_after_stage": "stage1",
+            },
+        )
+        print(f"[Output] stop-after-stage=stage1 wrote {len(stage1_factors)} factors -> {args.out}")
+        if args.report:
+            report_payload = {
+                "selection": {
+                    "method": "stage1_expression_dedup_only",
+                    "dedup_method": args.dedup_method,
+                    "expr_dedup": expr_stats.__dict__,
+                    "input_library": str(library_path),
+                    "config": str(config_path),
+                    "final_selected": len(stage1_factors),
+                    "stop_after_stage": "stage1",
+                },
+                "final_ranked": [],
+            }
+            report_path = Path(args.report)
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(json.dumps(report_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"[Report] wrote -> {report_path}")
+        return 0
+
     from quantaalpha.backtest.custom_factor_calculator import CustomFactorCalculator
+
+    sample_start, sample_end, sample_window_source = _resolve_sample_window(config, args.sample_split)
+    full_index = _load_base_index(config, start_time=sample_start, end_time=sample_end)
+    sample_idx = _sample_index(full_index, args.sample_size, args.seed)
+    print(
+        "[Sample] "
+        f"split={args.sample_split} "
+        f"window={sample_start}~{sample_end} "
+        f"source={sample_window_source} "
+        f"size={len(sample_idx)} (from base_index={len(full_index)}) seed={args.seed}"
+    )
 
     cache_dir = Path(args.cache_dir) if args.cache_dir else None
     calc = CustomFactorCalculator(data_df=None, config=config, auto_extract_cache=True, cache_dir=cache_dir)
@@ -749,7 +787,10 @@ def main() -> int:
         if i % 20 == 0 or i == 1 or i == len(factor_items):
             print(f"[Load] {i}/{len(factor_items)} kept={len(candidates)} dropped_missing={dropped_missing}")
 
-    min_required = max(5, args.topn) if args.topn > 0 else 5
+    if args.stop_after_stage == "stage2":
+        min_required = 1
+    else:
+        min_required = max(5, args.topn) if args.topn > 0 else 5
     if len(candidates) < min_required:
         raise SystemExit(f"Too few usable factors after cache/missing filtering: kept={len(candidates)}")
 
@@ -788,6 +829,59 @@ def main() -> int:
             },
         )
         print(f"[Stage2] wrote {len(stage2_factors)} factors -> {args.out_stage2}")
+
+    if args.stop_after_stage == "stage2":
+        stage2_factors = {c.factor_id: c.factor_info for c in exposure_pool}
+        _write_factor_library_json(
+            Path(args.out),
+            base_meta=(data.get("metadata") or {}) if isinstance(data.get("metadata"), dict) else {},
+            factors=stage2_factors,
+            extra_meta={
+                "selection_stage": "stage2_exposure_corr",
+                "expr_dedup": expr_stats.__dict__,
+                "source_library": str(library_path),
+                "stop_after_stage": "stage2",
+                "selection_snapshot": {
+                    "cluster_linkage_used": linkage_used_stage1,
+                    "corr_threshold": args.corr_threshold,
+                    "per_cluster": args.per_cluster,
+                    "candidates_total": len(factor_items),
+                    "kept_usable": len(candidates),
+                    "dropped_missing_or_low_coverage": dropped_missing,
+                    "clusters": len(clusters_stage1),
+                    "selected": len(exposure_pool),
+                },
+            },
+        )
+        print(f"[Output] stop-after-stage=stage2 wrote {len(stage2_factors)} factors -> {args.out}")
+        if args.report:
+            report_payload = {
+                "selection": {
+                    "method": "stage2_exposure_corr_only",
+                    "dedup_method": args.dedup_method,
+                    "expr_dedup": expr_stats.__dict__,
+                    "input_library": str(library_path),
+                    "config": str(config_path),
+                    "final_selected": len(stage2_factors),
+                    "stop_after_stage": "stage2",
+                },
+                "final_ranked": [
+                    {
+                        "rank": i + 1,
+                        "factor_id": c.factor_id,
+                        "factor_name": c.factor_name,
+                        "stage1_score": c.stage1_score,
+                        "stage2_score": c.stage2_score,
+                        "stage2_metrics": c.stage2_metrics,
+                    }
+                    for i, c in enumerate(exposure_pool)
+                ],
+            }
+            report_path = Path(args.report)
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(json.dumps(report_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"[Report] wrote -> {report_path}")
+        return 0
 
     # ----------------------
     # Stage-2: IC series corr

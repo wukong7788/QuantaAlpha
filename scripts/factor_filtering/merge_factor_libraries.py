@@ -8,6 +8,8 @@ Design goals:
 2) Preserve all factors; handle factor_id key collisions safely.
 3) Zoo output supports both whitespace-normalized ("norm") and AST-canonicalized ("ast") dedup
    for A/B testing.
+4) Optional Stage-1 expression dedup output is supported as a *separate artifact* (to keep
+   merge semantics intact): keep one best-scoring factor per expression fingerprint group.
 """
 
 from __future__ import annotations
@@ -192,6 +194,18 @@ class ZooBuildStats:
     ast_parse_failed: int
 
 
+@dataclass
+class Stage1ExprDedupStats:
+    method: str
+    score_key: str
+    input_total: int
+    kept_unique: int
+    duplicates_removed: int
+    dropped_empty_expr: int
+    ast_parse_failed: int
+    skipped_unparsable: int
+
+
 def _build_zoo(
     factors: Dict[str, Dict[str, Any]],
     *,
@@ -261,6 +275,82 @@ def _build_zoo(
     return zoo_factors, csv_rows, stats
 
 
+def _dedup_pool_stage1_by_expression(
+    factors: Dict[str, Dict[str, Any]],
+    *,
+    method: str,
+    score_key: str,
+    skip_unparsable: bool,
+) -> Tuple[Dict[str, Dict[str, Any]], Stage1ExprDedupStats]:
+    """
+    Stage-1 style expression dedup on a pooled factor dict:
+      - group by expression fingerprint (norm / AST-canonical)
+      - keep one best-scoring representative per group
+      - tie-breaker: keep earliest occurrence (stable)
+    """
+    if method not in {"norm", "ast"}:
+        raise ValueError(f"Invalid stage1 expr dedup method: {method}")
+
+    from quantaalpha.utils.expression_fingerprint import expression_fingerprint, try_ast_canonical_expression
+
+    best_by_fp: Dict[str, Tuple[int, float, str, Dict[str, Any]]] = {}
+    # fp -> (first_idx, score, factor_id, finfo)
+
+    dropped_empty = 0
+    ast_failed = 0
+    skipped = 0
+
+    for idx, (fid, finfo) in enumerate(factors.items()):
+        if not isinstance(finfo, dict):
+            continue
+        expr = str(finfo.get("factor_expression") or "").strip()
+        if not expr:
+            dropped_empty += 1
+            continue
+
+        if method == "ast":
+            res = try_ast_canonical_expression(expr)
+            if not res.ok:
+                ast_failed += 1
+                if skip_unparsable:
+                    skipped += 1
+                    continue
+            fp = res.canonical
+        else:
+            fp = expression_fingerprint(expr, "norm")
+
+        bt = finfo.get("backtest_results") if isinstance(finfo.get("backtest_results"), dict) else {}
+        score = _score_for_dedup(bt, score_key)
+
+        cur = best_by_fp.get(fp)
+        if cur is None:
+            best_by_fp[fp] = (idx, float(score), str(fid), finfo)
+            continue
+
+        cur_idx, cur_score, _, _ = cur
+        if float(score) > float(cur_score):
+            best_by_fp[fp] = (idx, float(score), str(fid), finfo)
+        elif float(score) == float(cur_score) and idx < cur_idx:
+            best_by_fp[fp] = (idx, float(score), str(fid), finfo)
+
+    picked = [(fid, finfo) for (idx, score, fid, finfo) in sorted(best_by_fp.values(), key=lambda x: x[0])]
+    out: Dict[str, Dict[str, Any]] = {}
+    for fid, finfo in picked:
+        out[str(fid)] = finfo
+
+    stats = Stage1ExprDedupStats(
+        method=method,
+        score_key=score_key,
+        input_total=len(factors),
+        kept_unique=len(out),
+        duplicates_removed=max(0, len(factors) - dropped_empty - skipped - len(out)),
+        dropped_empty_expr=dropped_empty,
+        ast_parse_failed=ast_failed,
+        skipped_unparsable=skipped,
+    )
+    return out, stats
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Merge factor libraries into one pool; optionally build Zoo.")
     p.add_argument(
@@ -270,6 +360,27 @@ def main() -> int:
     )
     p.add_argument("--out", required=True, help="Output pooled factor library JSON path")
     p.add_argument("--report", default="", help="Optional report JSON path")
+    p.add_argument(
+        "--out-stage1",
+        default="",
+        help="Optional Stage1 output library path (expression dedup on pooled factors).",
+    )
+    p.add_argument(
+        "--stage1-expr-dedup-method",
+        choices=("norm", "ast"),
+        default="ast",
+        help="Stage1 expression dedup method for --out-stage1 (default: ast).",
+    )
+    p.add_argument(
+        "--stage1-score-key",
+        default="1day.excess_return_with_cost.information_ratio",
+        help="Stage1 keep-best score key used for --out-stage1 dedup.",
+    )
+    p.add_argument(
+        "--stage1-skip-unparsable",
+        action="store_true",
+        help="Skip unparsable expressions when building Stage1 AST output (drops those factors).",
+    )
 
     p.add_argument(
         "--zoo-method",
@@ -377,6 +488,57 @@ def main() -> int:
     _safe_json_dump(out_path, out_payload)
     print(f"[Merge] wrote pooled library: {out_path} factors={len(merged)}")
 
+    stage1_output: Optional[dict] = None
+    if args.out_stage1:
+        stage1_method = str(args.stage1_expr_dedup_method or "ast").strip().lower()
+        stage1_factors, stage1_stats = _dedup_pool_stage1_by_expression(
+            merged,
+            method=stage1_method,
+            score_key=str(args.stage1_score_key),
+            skip_unparsable=bool(args.stage1_skip_unparsable) if stage1_method == "ast" else False,
+        )
+        stage1_out_path = Path(args.out_stage1)
+        stage1_payload = {
+            "metadata": {
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "last_updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "version": "1.0",
+                "type": "merged_factor_pool_stage1",
+                "input_libraries": [str(p) for p in lib_paths],
+                "input_library_count": len(lib_paths),
+                "total_factors": len(stage1_factors),
+                "merge_stats": out_payload["metadata"]["merge_stats"],
+                "stage0_total_factors": len(merged),
+                "stage1_expr_dedup": {
+                    "method": stage1_stats.method,
+                    "score_key": stage1_stats.score_key,
+                    "skip_unparsable": bool(args.stage1_skip_unparsable) if stage1_stats.method == "ast" else False,
+                    "input_total": stage1_stats.input_total,
+                    "kept_unique": stage1_stats.kept_unique,
+                    "duplicates_removed": stage1_stats.duplicates_removed,
+                    "dropped_empty_expr": stage1_stats.dropped_empty_expr,
+                    "ast_parse_failed": stage1_stats.ast_parse_failed,
+                    "skipped_unparsable": stage1_stats.skipped_unparsable,
+                },
+            },
+            "factors": stage1_factors,
+        }
+        _safe_json_dump(stage1_out_path, stage1_payload)
+        print(
+            f"[Stage1] method={stage1_stats.method} kept={stage1_stats.kept_unique} "
+            f"duplicates_removed={stage1_stats.duplicates_removed} ast_parse_failed={stage1_stats.ast_parse_failed} "
+            f"wrote={stage1_out_path}"
+        )
+        stage1_output = {
+            "path": str(stage1_out_path),
+            "method": stage1_stats.method,
+            "score_key": stage1_stats.score_key,
+            "kept_unique": stage1_stats.kept_unique,
+            "duplicates_removed": stage1_stats.duplicates_removed,
+            "ast_parse_failed": stage1_stats.ast_parse_failed,
+            "skipped_unparsable": stage1_stats.skipped_unparsable,
+        }
+
     zoo_outputs: List[dict] = []
 
     def _default_zoo_base() -> Path:
@@ -448,6 +610,7 @@ def main() -> int:
             "input_libraries": [str(p) for p in lib_paths],
             "pooled_total_factors": len(merged),
             "merge_stats": out_payload["metadata"]["merge_stats"],
+            "stage1_output": stage1_output,
             "zoo_outputs": zoo_outputs,
         }
         _safe_json_dump(report_path, report_payload)
@@ -458,4 +621,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

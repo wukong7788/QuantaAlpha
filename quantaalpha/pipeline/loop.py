@@ -37,6 +37,7 @@ from tqdm.auto import tqdm
 from quantaalpha.core.exception import CoderError
 from quantaalpha.log import logger
 from functools import wraps
+from quantaalpha.factors.regulator.subtree_blacklist import SubtreeBlacklist
 
 # Decorator: check stop_event before invoking the function
 
@@ -111,12 +112,70 @@ class AlphaAgentLoop(LoopBase, metaclass=LoopMeta):
                 "max_json_parse_failures_per_branch",
                 2,
             )
+            subtree_blacklist_enabled = self.quality_gate_config.get("subtree_blacklist_enabled", False)
+            subtree_blacklist_path = str(self.quality_gate_config.get("subtree_blacklist_path", "") or "").strip()
+            subtree_blacklist_max_patterns = self.quality_gate_config.get("subtree_blacklist_max_patterns", 200)
+            subtree_blacklist_min_nodes = self.quality_gate_config.get("subtree_blacklist_min_nodes", 1)
+
+            env_blacklist_enabled = os.getenv("QUANTA_SUBTREE_BLACKLIST_ENABLED")
+            env_blacklist_path = str(os.getenv("QUANTA_SUBTREE_BLACKLIST_PATH", "") or "").strip()
+            env_blacklist_max_patterns = os.getenv("QUANTA_SUBTREE_BLACKLIST_MAX_PATTERNS")
+            env_blacklist_min_nodes = os.getenv("QUANTA_SUBTREE_BLACKLIST_MIN_NODES")
+
+            if env_blacklist_enabled is not None:
+                subtree_blacklist_enabled = str(env_blacklist_enabled).strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "y",
+                    "on",
+                }
+            if env_blacklist_path:
+                subtree_blacklist_path = env_blacklist_path
+            if env_blacklist_max_patterns is not None:
+                try:
+                    subtree_blacklist_max_patterns = int(env_blacklist_max_patterns)
+                except Exception:
+                    logger.warning(
+                        "Invalid QUANTA_SUBTREE_BLACKLIST_MAX_PATTERNS="
+                        f"{env_blacklist_max_patterns!r}; fallback to {subtree_blacklist_max_patterns}"
+                    )
+            if env_blacklist_min_nodes is not None:
+                try:
+                    subtree_blacklist_min_nodes = int(env_blacklist_min_nodes)
+                except Exception:
+                    logger.warning(
+                        "Invalid QUANTA_SUBTREE_BLACKLIST_MIN_NODES="
+                        f"{env_blacklist_min_nodes!r}; fallback to {subtree_blacklist_min_nodes}"
+                    )
+
             self.cheap_filter_enabled = bool(cheap_filter_enabled)
             self.cheap_filter_require_acceptable = bool(cheap_filter_require_acceptable)
+            self.subtree_blacklist_enabled = bool(subtree_blacklist_enabled)
+            self.subtree_blacklist_path = subtree_blacklist_path
+            self.subtree_blacklist = None
+            if self.subtree_blacklist_enabled:
+                if not subtree_blacklist_path:
+                    logger.warning(
+                        "Subtree blacklist is enabled but no blacklist path is set; disable subtree blacklist."
+                    )
+                    self.subtree_blacklist_enabled = False
+                else:
+                    self.subtree_blacklist = SubtreeBlacklist(
+                        subtree_blacklist_path,
+                        max_patterns=max(1, int(subtree_blacklist_max_patterns)),
+                        min_nodes=max(1, int(subtree_blacklist_min_nodes)),
+                    )
             logger.info(f"Quality gate: consistency={'on' if consistency_enabled else 'off'}, "
                        f"complexity={'on' if complexity_enabled else 'off'}, "
                        f"redundancy={'on' if redundancy_enabled else 'off'}, "
-                       f"cheap_filter={'on' if self.cheap_filter_enabled else 'off'}")
+                       f"cheap_filter={'on' if self.cheap_filter_enabled else 'off'}, "
+                       f"subtree_blacklist={'on' if self.subtree_blacklist_enabled else 'off'}")
+            if self.subtree_blacklist is not None:
+                logger.info(
+                    "Subtree blacklist loaded: "
+                    f"path={self.subtree_blacklist.path}, patterns={self.subtree_blacklist.size}"
+                )
                 
             scen: Scenario = import_class(PROP_SETTING.scen)(use_local=use_local)
             logger.log_object(scen, tag="scenario")
@@ -279,18 +338,53 @@ class AlphaAgentLoop(LoopBase, metaclass=LoopMeta):
         return set(seen)
 
     def _apply_precalc_quality_gate(self, experiment: Any) -> Any:
-        if not self.cheap_filter_enabled:
-            return experiment
-
-        regulator = getattr(self.factor_constructor, "factor_regulator", None)
-        if regulator is None:
-            logger.warning("Cheap filter enabled but no factor_regulator found; skipping pre-calc quality gate.")
+        subtree_blacklist = getattr(self, "subtree_blacklist", None)
+        if not self.cheap_filter_enabled and subtree_blacklist is None:
             return experiment
 
         tasks = self._collect_factor_tasks(experiment)
         if not tasks:
             self._last_skip_reason = "cheap_filter_empty_tasks"
             raise FactorEmptyError("Cheap filter: no factor tasks to evaluate.")
+
+        if not self.cheap_filter_enabled and subtree_blacklist is not None:
+            valid_tasks: list[Any] = []
+            rejected_reasons: list[str] = []
+            for task in tasks:
+                factor_name = getattr(task, "factor_name", "unknown")
+                expr = getattr(task, "factor_expression", "")
+                if not isinstance(expr, str) or not expr.strip():
+                    valid_tasks.append(task)
+                    continue
+                subtree_hit = subtree_blacklist.match(expr)
+                if subtree_hit is None:
+                    valid_tasks.append(task)
+                    continue
+                reject_tag = subtree_hit.pattern_label or subtree_hit.pattern_expression
+                rejected_reasons.append(f"{factor_name}:subtree_blacklist:{reject_tag}")
+
+            if rejected_reasons:
+                logger.warning(
+                    "Subtree blacklist rejected factors: "
+                    f"{len(rejected_reasons)}/{len(tasks)}. "
+                    f"samples={rejected_reasons[:3]}"
+                )
+            if not valid_tasks:
+                self._last_skip_reason = "subtree_blacklist"
+                raise FactorEmptyError(
+                    "Subtree blacklist removed all candidate factors before calculate/backtest."
+                )
+            if len(valid_tasks) < len(tasks):
+                logger.info(
+                    f"Subtree blacklist retained {len(valid_tasks)}/{len(tasks)} factors for calculation."
+                )
+                self._assign_factor_tasks(experiment, valid_tasks)
+            return experiment
+
+        regulator = getattr(self.factor_constructor, "factor_regulator", None)
+        if regulator is None:
+            logger.warning("Cheap filter enabled but no factor_regulator found; skipping pre-calc quality gate.")
+            return experiment
 
         seen_expressions = self._load_seen_expressions()
         accepted_expressions: set[str] = set()
@@ -307,6 +401,12 @@ class AlphaAgentLoop(LoopBase, metaclass=LoopMeta):
             if normalized_expr in seen_expressions or normalized_expr in accepted_expressions:
                 rejected_reasons.append(f"{factor_name}:duplicate_exact")
                 continue
+            if subtree_blacklist is not None:
+                subtree_hit = subtree_blacklist.match(expr)
+                if subtree_hit is not None:
+                    reject_tag = subtree_hit.pattern_label or subtree_hit.pattern_expression
+                    rejected_reasons.append(f"{factor_name}:subtree_blacklist:{reject_tag}")
+                    continue
 
             style_ok, style_feedback = regulator.validate_expression_style(expr)
             if not style_ok:
@@ -341,6 +441,11 @@ class AlphaAgentLoop(LoopBase, metaclass=LoopMeta):
                 self._last_skip_reason = "duplicate_exact"
                 raise FactorEmptyError(
                     "Cheap filter removed all candidate factors before calculate/backtest (duplicate_exact)."
+                )
+            if rejected_reasons and all(":subtree_blacklist:" in r for r in rejected_reasons):
+                self._last_skip_reason = "subtree_blacklist"
+                raise FactorEmptyError(
+                    "Cheap filter removed all candidate factors before calculate/backtest (subtree_blacklist)."
                 )
             self._last_skip_reason = "cheap_filter_no_valid_factors"
             raise FactorEmptyError("Cheap filter removed all candidate factors before calculate/backtest.")

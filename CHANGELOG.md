@@ -3,6 +3,63 @@
 Format: Sections per date use `Added / Fixed / Performance / Changed / Removed` (plus optional `Highlights / Docs / Internal`).
 Each change entry starts with tags: `[area][impact]` (optionally severity `[P0|P1|P2]`) to make changes greppable.
 
+## 2026-03-07
+
+### Fixed
+- [scripts][behavior] Harden `run.sh --blacklist-file` summary printing on macOS shell environments:
+  - Replace the truthy regex gate for `QUANTA_SUBTREE_BLACKLIST_ENABLED` with a `case`-based helper to avoid runtime parse issues near blacklist summary output.
+  - Add regression coverage to verify valid blacklist runs print raw/usable counts before entering mining.
+
+## 2026-03-04
+
+### Added
+- [pipeline][feature] Add optional subtree-blacklist pre-calc gate in `AlphaAgentLoop`:
+  - New quality-gate keys: `subtree_blacklist_enabled`, `subtree_blacklist_path`, `subtree_blacklist_max_patterns`, `subtree_blacklist_min_nodes`.
+  - When enabled, factors matching blacklisted AST subtrees are rejected before `factor_calculate/factor_backtest`.
+- [scripts][feature] Add `run.sh --blacklist-file <path>`:
+  - Enables subtree blacklist mode without changing default workflow semantics.
+  - Supports env overrides `QUANTA_SUBTREE_BLACKLIST_{PATH,MAX_PATTERNS,MIN_NODES}`.
+- [tests][feature] Add subtree-blacklist regression coverage:
+  - `tests/pipeline/test_loop_subtree_blacklist.py`
+  - `tests/factors/test_subtree_blacklist.py`
+- [scripts][feature] Add `scripts/run_factors.sh` option `6) [BLACKLIST]`:
+  - Export subtree blacklist JSON from Stage1/merged factor library JSON or Zoo CSV.
+  - Output can be used directly with `run.sh --blacklist-file`.
+- [scripts][feature] Improve `scripts/abtest_experiment.py` runtime visibility:
+  - Print real-time `[ABTEST]` progress logs for each run start/finish and doctor stage.
+  - Print run log / doctor report / generated config paths at run start.
+- [scripts][feature] Enhance `scripts/abtest_experiment.py` result payloads:
+  - Extract `factor_quality` from `data/factorlib/all_factors_library_<suffix>.json` (median/best of key `backtest_results` metrics).
+  - Track whether `subtree_blacklist` actually rejected factors (parse run.log) and report success-only deltas in `ABTEST_COMPARISON`.
+- [scripts][feature] `scripts/run_backtest_safe.sh --interactive` adds `FILTER+BT` target:
+  - Runs factors-filter first, then backtests selected stage output (`stage1` / `stage2` / `stage3`) for direct stage comparison.
+- [scripts][feature] Add uncached backtest control in `run_backtest_safe.sh`:
+  - New flag `--no-skip-uncached` to include uncached factors (compute during backtest).
+  - `FILTER+BT` interactive path now prompts whether to include uncached factors.
+- [scripts][feature] Merge can optionally emit Stage1 expr-dedup pool:
+  - `scripts/factor_filtering/merge_factor_libraries.py` adds `--out-stage1` (expression hard-dedup on pooled factors).
+  - `scripts/run_factors.sh` option `3` prompts to export Stage1 pool so “one expression -> one factor” is explicit (Zoo output remains novelty-only).
+
+### Changed
+- [llm][behavior] Restore default run-config temperatures to `0.7` and sync `llm.freeform_temperature` to env `CHAT_TEMPERATURE` at startup to avoid backend drift.
+
+### Fixed
+- [scripts][behavior] Fix stage-selection behavior in filter pipeline:
+  - Selecting `stage1`/`stage2` now short-circuits after the chosen stage output is written, instead of continuing through later stages.
+- [scripts][behavior] Fix `run_backtest_safe.sh` filter dedup defaults:
+  - `FILTER` / `FILTER+BT` modes now pass `--expr-dedup-method ast` explicitly to `select_factors.py` (was implicit `none` before).
+- [scripts][behavior] Fix `FILTER+BT` stage execution scope:
+  - `run_backtest_safe.sh` now passes `--stop-after-stage` based on selected stage so `stage1`/`stage2` no longer run unnecessary later-stage computation.
+- [backtest][output] Clarify cache-loading logs in custom factor compute:
+  - Suppress per-factor `cache_location result.h5` missing debug noise.
+  - Add explicit one-time fallback note and summary field `H5 missing <count>` so users can distinguish fallback hits from real recomputation.
+- [scripts][behavior] Fix `run.sh --rounds N` portability bug on macOS/BSD:
+  - Replace `sed`-based `max_rounds` override with Python-based text patching.
+  - `--rounds 11` now reliably overrides `evolution.max_rounds` before relay scheduling and preflight checks.
+
+### Docs
+- [docs][docs] Sync blacklist mode docs in `SPECS.md`, `README.md`, `README_CN.md`, `docs/PAPER_REPRODUCTION_GUIDE.md`, and `docs/warm-start.md` (including warm-start vs blacklist A/B template commands).
+
 ## 2026-03-03
 
 ### Added

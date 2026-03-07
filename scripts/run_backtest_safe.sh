@@ -52,6 +52,7 @@ Options:
   --dedup-compute-missing       Compute/cache factor values when missing (can be slow)
   --min-free-gb <N>             Minimum free disk GB required (default: 15)
   --warm-cache                  Sync available result.h5 into MD5 cache before run
+  --no-skip-uncached            Include uncached factors (compute during backtest instead of skipping)
   --bob                         Build Best-of-Best (BOB) library from multiple runs, then backtest
   --bob-libraries <spec>        BOB input libraries (comma/glob), e.g.
                                 "all_factors_library_a.json,all_factors_library_b.json"
@@ -94,7 +95,7 @@ MAX_FACTORS_OVERRIDE="default"
 MAX_FACTORS_SET="false"
 MIN_FREE_GB="15"
 WARM_CACHE="false"
-SKIP_UNCACHED="true"  # fixed by design
+SKIP_UNCACHED="true"
 QUALITY_MIN_SOURCE="${BACKTEST_MIN_QUALITY:-off}"  # off|low|medium|high|auto
 QUALITY_MIN="$QUALITY_MIN_SOURCE"
 QUALITY_MIN_LOCKED="false"
@@ -109,6 +110,7 @@ DEDUP_SAMPLE_SPLIT="train_valid"
 DEDUP_METHOD="two_stage"
 DEDUP_LINKAGE="complete"
 DEDUP_COMPUTE_MISSING="false"
+DEDUP_EXPR_METHOD="none"
 BOB_ENABLED="false"
 BOB_LIBRARIES=""
 BOB_TOP="50"
@@ -158,6 +160,17 @@ run_view_results() {
   else
     "$py" "$script"
   fi
+}
+
+mktemp_json_file() {
+  # BSD mktemp on macOS may not expand templates like "..._XXXXXX.json".
+  # Create a unique temp file first, then rename with .json suffix.
+  local prefix="$1"
+  local base
+  base="$(mktemp "/tmp/${prefix}_XXXXXX")"
+  local json_path="${base}.json"
+  mv "$base" "$json_path"
+  echo "$json_path"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -231,6 +244,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --warm-cache)
       WARM_CACHE="true"
+      shift
+      ;;
+    --no-skip-uncached)
+      SKIP_UNCACHED="false"
       shift
       ;;
     --bob)
@@ -421,9 +438,12 @@ elif [[ "$FACTORS_FILTER_ONLY" == "true" ]]; then
   TARGET_MODE="factors_filter"
 fi
 
+FILTER_BACKTEST_ENABLED="false"
+FILTER_BACKTEST_STAGE="stage3"
+
 if [[ "$INTERACTIVE" == "true" ]]; then
   echo "== QuantaAlpha Backtest Quick Start =="
-  echo "Step 1/2: choose target (single experiment library / BOB / VIEW / FILTER)"
+  echo "Step 1/2: choose target (single experiment library / BOB / VIEW / FILTER / FILTER+BACKTEST)"
   echo
 
   shopt -s nullglob
@@ -461,6 +481,8 @@ if [[ "$INTERACTIVE" == "true" ]]; then
   echo "  $view_idx) [VIEW] horizontal compare existing result files"
   filter_idx="$((view_idx + 1))"
   echo "  $filter_idx) [FILTER] run factors-filter only (no backtest)"
+  filter_bt_idx="$((filter_idx + 1))"
+  echo "  $filter_bt_idx) [FILTER+BT] run factors-filter then backtest (choose stage1/2/3)"
   echo
 
   default_pick="$view_idx"
@@ -517,6 +539,71 @@ if [[ "$INTERACTIVE" == "true" ]]; then
         QUALITY_MIN_LOCKED="true"
         ;;
     esac
+  elif [[ "$pick_lc" == "filter+bt" || "$pick_lc" == "filter_backtest" || "$pick_lc" == "fb" || "$pick" == "$filter_bt_idx" ]]; then
+    TARGET_MODE="factors_filter_backtest"
+    FILTER_BACKTEST_ENABLED="true"
+    FACTORS_FILTER_ONLY="false"
+    BOB_ENABLED="false"
+    FACTOR_SOURCE="custom"
+    if [[ "${#LIB_PATHS[@]}" -eq 0 ]]; then
+      echo "Error: no experiment libraries found under data/factorlib/all_factors_library*.json"
+      exit 1
+    fi
+    read -r -p "Experiment index for filter+backtest [1]: " filter_pick
+    filter_pick="${filter_pick:-1}"
+    if [[ "$filter_pick" =~ ^[0-9]+$ ]] && [[ "$filter_pick" -ge 1 ]] && [[ "$filter_pick" -le "${#LIB_PATHS[@]}" ]]; then
+      LIBRARY="${LIB_PATHS[$((filter_pick-1))]}"
+    else
+      echo "Error: invalid experiment index for filter+backtest: '$filter_pick'"
+      exit 1
+    fi
+    echo "Factor quality range:"
+    echo "  1) 高      (high)"
+    echo "  2) 高中    (high+medium)"
+    echo "  3) 高中低  (high+medium+low)"
+    read -r -p "Select quality range [1]: " filter_quality_pick
+    filter_quality_pick="${filter_quality_pick:-1}"
+    case "$(normalize_lower "$filter_quality_pick")" in
+      1|high|h)
+        QUALITY_MIN="high"
+        QUALITY_MIN_LOCKED="true"
+        ;;
+      2|medium|hm|high_medium)
+        QUALITY_MIN="medium"
+        QUALITY_MIN_LOCKED="true"
+        ;;
+      3|low|hml|all|high_medium_low)
+        QUALITY_MIN="low"
+        QUALITY_MIN_LOCKED="true"
+        ;;
+      *)
+        echo "  Invalid quality range, fallback to high."
+        QUALITY_MIN="high"
+        QUALITY_MIN_LOCKED="true"
+        ;;
+    esac
+    echo "Select backtest stage:"
+    echo "  1) stage1 (expr dedup)"
+    echo "  2) stage2 (exposure corr dedup)"
+    echo "  3) stage3 (IC corr final)"
+    read -r -p "Stage [3]: " stage_pick
+    stage_pick="$(normalize_lower "${stage_pick:-3}")"
+    case "$stage_pick" in
+      1|stage1) FILTER_BACKTEST_STAGE="stage1" ;;
+      2|stage2) FILTER_BACKTEST_STAGE="stage2" ;;
+      3|stage3) FILTER_BACKTEST_STAGE="stage3" ;;
+      *)
+        echo "  Invalid stage, fallback to stage3."
+        FILTER_BACKTEST_STAGE="stage3"
+        ;;
+    esac
+    read -r -p "Include uncached factors in backtest (compute if missing)? [y/N]: " uncached_pick
+    uncached_pick="$(normalize_lower "${uncached_pick:-n}")"
+    if [[ "$uncached_pick" == "y" || "$uncached_pick" == "yes" ]]; then
+      SKIP_UNCACHED="false"
+    else
+      SKIP_UNCACHED="true"
+    fi
   elif [[ "$pick_lc" == "bob" || "$pick_lc" == "b" || "$pick" == "$bob_idx" ]]; then
     TARGET_MODE="bob"
     BOB_ENABLED="true"
@@ -537,7 +624,7 @@ if [[ "$INTERACTIVE" == "true" ]]; then
     FACTORS_FILTER_ONLY="false"
     LIBRARY="${LIB_PATHS[$((pick-1))]}"
   else
-    echo "Error: invalid selection '$pick'. Interactive mode only allows listed experiment indexes or BOB/VIEW/FILTER."
+    echo "Error: invalid selection '$pick'. Interactive mode only allows listed experiment indexes or BOB/VIEW/FILTER/FILTER+BT."
     exit 1
   fi
 
@@ -555,9 +642,10 @@ if [[ "$INTERACTIVE" == "true" ]]; then
     MAX_FACTORS_OVERRIDE="default"
   fi
 
-  if [[ "$TARGET_MODE" == "factors_filter" ]]; then
+  if [[ "$TARGET_MODE" == "factors_filter" || "$TARGET_MODE" == "factors_filter_backtest" ]]; then
     # FILTER mode always previews the production dedup path and does not run backtest.
     CORR_DEDUP="true"
+    DEDUP_EXPR_METHOD="ast"
     DEDUP_TOPN="all"
     if [[ "$DEDUP_PER_CLUSTER" == "3" ]]; then
       DEDUP_PER_CLUSTER="1"
@@ -617,6 +705,16 @@ if [[ "$INTERACTIVE" == "true" ]]; then
     echo "  experiment=$SOURCE_STEM"
     echo "  quality_range=$QUALITY_MIN"
     echo "  final_selected=(run to see result)"
+  elif [[ "$TARGET_MODE" == "factors_filter_backtest" ]]; then
+    SOURCE_BASE="$(basename "$LIBRARY")"
+    SOURCE_STEM="${SOURCE_BASE%.json}"
+    echo "  target=factors_filter_backtest"
+    echo "  experiment=$SOURCE_STEM"
+    echo "  quality_range=$QUALITY_MIN"
+    echo "  backtest_stage=$FILTER_BACKTEST_STAGE"
+    echo "  factor_source=custom"
+    echo "  max_factors=$MAX_FACTORS_OVERRIDE"
+    echo "  skip_uncached=$SKIP_UNCACHED"
   else
     echo "  target=$TARGET_MODE"
     echo "  library=$LIBRARY"
@@ -629,6 +727,7 @@ if [[ "$INTERACTIVE" == "true" ]]; then
     echo "  corr_dedup=$CORR_DEDUP dedup_method=$DEDUP_METHOD dedup_linkage=$DEDUP_LINKAGE dedup_topn_effective=${DEDUP_TOPN_EFFECTIVE:-${DEDUP_TOPN:-auto}} dedup_per_cluster=$DEDUP_PER_CLUSTER dedup_corr_threshold=$DEDUP_CORR_THRESHOLD dedup_stage2_corr_threshold=$DEDUP_STAGE2_CORR_THRESHOLD dedup_sample_size=$DEDUP_SAMPLE_SIZE dedup_sample_split=$DEDUP_SAMPLE_SPLIT compute_missing=$DEDUP_COMPUTE_MISSING"
     echo "  warm_cache=$WARM_CACHE"
     echo "  quality_min=$QUALITY_MIN"
+    echo "  skip_uncached=$SKIP_UNCACHED"
   fi
 fi
 
@@ -636,6 +735,24 @@ if [[ "$FACTORS_FILTER_ONLY" == "true" ]]; then
   TARGET_MODE="factors_filter"
   FACTOR_SOURCE="custom"
   CORR_DEDUP="true"
+  DEDUP_EXPR_METHOD="ast"
+  DEDUP_TOPN="all"
+  if [[ "$DEDUP_PER_CLUSTER" == "3" ]]; then
+    DEDUP_PER_CLUSTER="1"
+  fi
+  if [[ "$DEDUP_SAMPLE_SIZE" == "8000" ]]; then
+    DEDUP_SAMPLE_SIZE="12000"
+  fi
+  if [[ "$DEDUP_COMPUTE_MISSING" != "true" ]]; then
+    DEDUP_COMPUTE_MISSING="true"
+  fi
+fi
+
+if [[ "$FILTER_BACKTEST_ENABLED" == "true" ]]; then
+  TARGET_MODE="factors_filter_backtest"
+  FACTOR_SOURCE="custom"
+  CORR_DEDUP="true"
+  DEDUP_EXPR_METHOD="ast"
   DEDUP_TOPN="all"
   if [[ "$DEDUP_PER_CLUSTER" == "3" ]]; then
     DEDUP_PER_CLUSTER="1"
@@ -767,6 +884,8 @@ TMP_CONFIG_PATH=""
 TMP_FILTERED_LIBRARY_PATH=""
 TMP_DIVERSE_LIBRARY_PATH=""
 TMP_DIVERSE_REPORT_PATH=""
+TMP_DIVERSE_STAGE1_PATH=""
+TMP_DIVERSE_STAGE2_PATH=""
 TMP_BOB_LIBRARY_PATH=""
 TMP_BOB_REPORT_PATH=""
 CMD_PID=""
@@ -789,6 +908,12 @@ cleanup_runtime() {
   fi
   if [[ -n "$TMP_DIVERSE_REPORT_PATH" && -f "$TMP_DIVERSE_REPORT_PATH" ]]; then
     rm -f "$TMP_DIVERSE_REPORT_PATH" 2>/dev/null || true
+  fi
+  if [[ -n "$TMP_DIVERSE_STAGE1_PATH" && -f "$TMP_DIVERSE_STAGE1_PATH" ]]; then
+    rm -f "$TMP_DIVERSE_STAGE1_PATH" 2>/dev/null || true
+  fi
+  if [[ -n "$TMP_DIVERSE_STAGE2_PATH" && -f "$TMP_DIVERSE_STAGE2_PATH" ]]; then
+    rm -f "$TMP_DIVERSE_STAGE2_PATH" 2>/dev/null || true
   fi
   if [[ -n "$TMP_BOB_LIBRARY_PATH" && -f "$TMP_BOB_LIBRARY_PATH" ]]; then
     rm -f "$TMP_BOB_LIBRARY_PATH" 2>/dev/null || true
@@ -1533,12 +1658,17 @@ PY
     exit 1
   fi
 
-  TMP_DIVERSE_LIBRARY_PATH="$(mktemp "/tmp/quantaalpha_factorlib_diverse_XXXXXX.json")"
-  TMP_DIVERSE_REPORT_PATH="$(mktemp "/tmp/quantaalpha_factorlib_diverse_report_XXXXXX.json")"
+  TMP_DIVERSE_LIBRARY_PATH="$(mktemp_json_file "quantaalpha_factorlib_diverse")"
+  TMP_DIVERSE_REPORT_PATH="$(mktemp_json_file "quantaalpha_factorlib_diverse_report")"
+  if [[ "$FILTER_BACKTEST_ENABLED" == "true" ]]; then
+    TMP_DIVERSE_STAGE1_PATH="$(mktemp_json_file "quantaalpha_factorlib_stage1")"
+    TMP_DIVERSE_STAGE2_PATH="$(mktemp_json_file "quantaalpha_factorlib_stage2")"
+  fi
 
   DEDUP_ARGS=(
     --library "$LIB_PATH"
     --config "$RUN_CONFIG_PATH"
+    --expr-dedup-method "$DEDUP_EXPR_METHOD"
     --out "$TMP_DIVERSE_LIBRARY_PATH"
     --dedup-method "$DEDUP_METHOD"
     --cluster-linkage "$DEDUP_LINKAGE"
@@ -1550,6 +1680,18 @@ PY
     --sample-split "$DEDUP_SAMPLE_SPLIT"
     --report "$TMP_DIVERSE_REPORT_PATH"
   )
+  DEDUP_STOP_STAGE="none"
+  if [[ "$FILTER_BACKTEST_ENABLED" == "true" ]]; then
+    case "$FILTER_BACKTEST_STAGE" in
+      stage1) DEDUP_STOP_STAGE="stage1" ;;
+      stage2) DEDUP_STOP_STAGE="stage2" ;;
+      *) DEDUP_STOP_STAGE="none" ;;
+    esac
+  fi
+  DEDUP_ARGS+=(--stop-after-stage "$DEDUP_STOP_STAGE")
+  if [[ "$FILTER_BACKTEST_ENABLED" == "true" ]]; then
+    DEDUP_ARGS+=(--out-stage1 "$TMP_DIVERSE_STAGE1_PATH" --out-stage2 "$TMP_DIVERSE_STAGE2_PATH")
+  fi
   if [[ "$DEDUP_COMPUTE_MISSING" == "true" ]]; then
     DEDUP_ARGS+=(--compute-missing)
   fi
@@ -1558,12 +1700,31 @@ PY
   if [[ "${DEDUP_TOPN_EFFECTIVE:-}" == "all" ]]; then
     TOPN_LOG="all"
   fi
-  echo "[Diverse] enabled=true method=$DEDUP_METHOD linkage=$DEDUP_LINKAGE topn=$TOPN_LOG per_cluster=$DEDUP_PER_CLUSTER corr_threshold=$DEDUP_CORR_THRESHOLD stage2_corr_threshold=$DEDUP_STAGE2_CORR_THRESHOLD sample_size=$DEDUP_SAMPLE_SIZE sample_split=$DEDUP_SAMPLE_SPLIT compute_missing=$DEDUP_COMPUTE_MISSING"
+  echo "[Diverse] enabled=true expr_dedup_method=$DEDUP_EXPR_METHOD method=$DEDUP_METHOD linkage=$DEDUP_LINKAGE topn=$TOPN_LOG per_cluster=$DEDUP_PER_CLUSTER corr_threshold=$DEDUP_CORR_THRESHOLD stage2_corr_threshold=$DEDUP_STAGE2_CORR_THRESHOLD sample_size=$DEDUP_SAMPLE_SIZE sample_split=$DEDUP_SAMPLE_SPLIT compute_missing=$DEDUP_COMPUTE_MISSING stop_after_stage=$DEDUP_STOP_STAGE"
   echo "[Diverse] input_library=$LIB_PATH"
   "$PYTHON_BIN" "$PROJECT_ROOT/scripts/factor_filtering/select_factors.py" "${DEDUP_ARGS[@]}"
   echo "[Diverse] report=$TMP_DIVERSE_REPORT_PATH"
   echo "[Diverse] output_library=$TMP_DIVERSE_LIBRARY_PATH"
-  LIB_PATH="$TMP_DIVERSE_LIBRARY_PATH"
+  if [[ "$FILTER_BACKTEST_ENABLED" == "true" ]]; then
+    case "$FILTER_BACKTEST_STAGE" in
+      stage1)
+        LIB_PATH="$TMP_DIVERSE_STAGE1_PATH"
+        ;;
+      stage2)
+        LIB_PATH="$TMP_DIVERSE_STAGE2_PATH"
+        ;;
+      *)
+        LIB_PATH="$TMP_DIVERSE_LIBRARY_PATH"
+        ;;
+    esac
+    if [[ ! -f "$LIB_PATH" ]]; then
+      echo "Error: selected filter stage output not found: $LIB_PATH"
+      exit 1
+    fi
+    echo "[Diverse] backtest_stage=$FILTER_BACKTEST_STAGE selected_library=$LIB_PATH"
+  else
+    LIB_PATH="$TMP_DIVERSE_LIBRARY_PATH"
+  fi
 fi
 
 FILTER_FINAL_TOTAL="$(count_factors_in_library "$LIB_PATH")"
@@ -1650,6 +1811,8 @@ fi
 
 if [[ "$SKIP_UNCACHED" == "true" && "$NEED" -gt 0 ]]; then
   echo "[Cache] incomplete: missing=${NEED}. Continue with cached factors only (skip uncached enabled)."
+elif [[ "$SKIP_UNCACHED" != "true" && "$NEED" -gt 0 ]]; then
+  echo "[Cache] incomplete: missing=${NEED}. Will compute uncached factors during backtest (skip uncached disabled)."
 fi
 
 export OMP_NUM_THREADS="$THREADS"
